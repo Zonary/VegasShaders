@@ -2351,7 +2351,8 @@ void Diagnostics::OnFinalPicture(IDirect3DDevice9* device, IDirect3DSurface9* pi
 		Bt.onRead = true;
 		Bt.on = beat;
 		const bool watch = TheSettingManager->GetSettingI("Main.Main.Misc", "HistoryWatch") != 0;	// UNOFFICIAL 2026-11-01 part 5
-		if (Wt.onRead && watch != Wt.on) {
+		if (watch != Wt.on) {
+			// 2026-11-14: off by default now, and the first frames run before this first read: their probes' surfaces are freed here too
 			Logger::Log("HISTORY watch %s ([Main.Main.Misc] HistoryWatch)", watch ? "on" : "off");
 			if (!watch) for (int k = 0; k < Wt.count; k++) WatchRelease(Wt.slots[k]);
 		}

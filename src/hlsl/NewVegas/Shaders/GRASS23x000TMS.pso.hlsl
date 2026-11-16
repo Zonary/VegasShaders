@@ -14,6 +14,9 @@
 // colour, material and normal records (COLOR1-3; see main's end). Without it this shader is exactly as before.
 #if defined(CAPTURED_NORMALS_ON) && CAPTURED_NORMALS_ON >= 3
     #include "includes/CapturedNormals.hlsl"
+    #if defined(FOLIAGE_DEFERRED) && FOLIAGE_DEFERRED && CAPTURED_NORMALS_ON >= 4
+        #include "includes/FoliageDeferred.hlsl"	// UNOFFICIAL 2026-11-14 the deferred record (main's end)
+    #endif
 #endif
 
 uniform sampler2D DiffuseMap : register(s0);
@@ -293,8 +296,46 @@ PixResult main(PixVaryings pa, float2 vpos_s : VPOS) {
     }
     grass_colour = lerp(dot(grass_colour, float3(0.2126f, 0.7152f, 0.0722f)), grass_colour, saturate(TESR_GrassRecord.y)) * TESR_GrassRecord.x;
     pr.capturedPad1 = float4(saturate(grass_colour), grass_written);
-    pr.capturedPad2 = float4(grass_class * grass_written, 0.5f, 0.9f, grass_written);
+    #if CAPTURED_NORMALS_ON >= 4
+        // UNOFFICIAL 2026-11-14 GBufferV2 (Includes/CapturedNormals.hlsl): the grass mark is 4.5 there (g 4 and up: no shading normal; a stays
+        // the written 1 / 0 the grass's blend needs)
+        pr.capturedPad2 = float4(grass_class * grass_written, 4.5f, 0.9f, grass_written);
+    #else
+        pr.capturedPad2 = float4(grass_class * grass_written, 0.5f, 0.9f, grass_written);
+    #endif
     pr.capturedNormal = CapturedFoliageNormal(grass_n, pa.f_shadow_world_pos.xyz, grass_written);
+    #if defined(FOLIAGE_DEFERRED) && FOLIAGE_DEFERRED && CAPTURED_NORMALS_ON >= 4
+    {
+        // UNOFFICIAL 2026-11-14 full deferred renderer, phase 3: the grass's DEFERRED record (FOLIAGE_DEFERRED 1, made by core/DeferredFoliage.h
+        // only with [Main.Main.Quality] DeferredFoliage and GBufferV2 at startup; the model: Includes/FoliageDeferred.hlsl). The same light as
+        // above, the sun's part kept apart and left unshadowed (the shadow lookup above is then unused and compiled away): COLOR0 without the
+        // sun, COLOR2.b the sun's light for DeferredSun (g its keep and highlight: Includes/DeferredPixel.hlsl FDFoliageGrassCode). The flashlight's beam (TESR_GrassSpot) is left to FlashlightDeferred, which lights these
+        // records like any other (the forward grass lit itself by it because nothing else could). The grass's own lamps stay here, as drawn.
+        float3 fdSpec = 0.0f;	// the sun's highlight as above, without the shadow
+        [branch] if (GrassMaterial.z > 0.0f && nvr_vs) {
+            const float3 fdL = normalize(pa.f_sun_dir);
+            const float3 fdH = normalize(fdL - normalize(pa.f_shadow_world_pos.xyz));
+            fdSpec = PBRLight(pa.f_sun.xyz) * (pa.f_amount.z * pow(saturate(dot(normal.xyz, fdH)), GrassMaterial.w) * saturate(dot(normal.xyz, fdL)) * GrassMaterial.z * normal.w);
+        }
+        float3 fdRest = (PBRAmbient(pa.f_ambient.xyz) * pa.f_amount.x + SkyAmbient(shadow_normal, nvr_vs ? sky_scale : 0.0f)) * TESR_GrassBrightness.y;
+        [branch] if (TESR_GrassLightData.x > 0.0f && nvr_vs)
+            fdRest += PBRLight(GrassLamps(pa.f_shadow_world_pos.xyz, normal.xyz));
+        const float3 fdSun = PBRLight(pa.f_sun.xyz) * (sun_base * TESR_GrassBrightness.y);
+        const float3 fdBase = LinColor(base_rgb.rgb);
+        const float fdKeep = FDFoliageGrassKeepQ(1.0f - pa.f_fog.w);	// (2026-11-14 fog: the keep the code holds, so DeferredSun's FDAddFogged is exact)
+        const float3 fdWithout = lerp(LinEncode(fdRest * fdBase * TESR_GrassBrightness.x), pa.f_fog.rgb, 1.0f - fdKeep);
+        const float3 fdWith = lerp(LinEncode(((fdRest + fdSun) * fdBase + fdSpec * TESR_GrassBrightness.y) * TESR_GrassBrightness.x), pa.f_fog.rgb, pa.f_fog.w);
+        // the albedo: the texture x Brightness x the vertex colour's share of the sun (f_sun / f_sun_colour, decoded: exact, the decode is a
+        // power) x the tuft's shade; the sun's hue is the vertex shader's sun colour
+        const float3 fdHue = FoliageHue(PBRLight(pa.f_sun_colour));
+        const float3 fdAlbedo = saturate(fdBase * TESR_GrassBrightness.x * saturate(PBRLight(pa.f_sun.xyz) / max(PBRLight(pa.f_sun_colour), 1.0e-6f)) * grass_shade);
+        pr.f_color.rgb = grass_written > 0.5f ? fdWithout : fdWith;
+        pr.capturedPad1.rgb = grass_written > 0.5f ? fdAlbedo : pr.capturedPad1.rgb;
+        // the sun's light (unshadowed, unfogged) per unit of A x hue, and its highlight (the sun's hue) per unit of hue: least-squares numbers
+        pr.capturedPad2.b = grass_written > 0.5f ? FoliageSunCode(FoliageFit(fdSun * fdBase * TESR_GrassBrightness.x, fdAlbedo * fdHue)) : pr.capturedPad2.b;
+        pr.capturedPad2.g = grass_written > 0.5f ? FDFoliageGrassCode(fdKeep, FoliageHighlightEnc(FoliageFit(fdSpec * (TESR_GrassBrightness.y * TESR_GrassBrightness.x), fdHue))) : pr.capturedPad2.g;
+    }
+    #endif
 #endif
 
     return pr;

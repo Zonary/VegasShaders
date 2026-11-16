@@ -4,6 +4,7 @@
 #include "../../core/DxvkCompute.h"	// UNOFFICIAL 2026-10-25 (NVR DXVK)
 #include "../../core/SunDepthFit.h"	// UNOFFICIAL 2026-10-27 FitToDepth
 #include "../../core/RtSunShadows.h"	// UNOFFICIAL 2026-10-28 RT sun shadows
+#include "../../core/SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the deferred renderer's sun steps)
 
 // UNOFFICIAL 2026-10-16 lamp contact shadows (PointShadows.fx LampContactPS, technique 2; drawn by ShaderManager after the lamp
 // pass): every number the shader needs (see the constants' comments there). Kept out of ShadowsExterior.h (widely included).
@@ -923,11 +924,18 @@ void ShadowsExteriorEffect::RegisterTextures() {
 	// SunSmoothing CrossFade: the copy of the atlas from before a sun step. Only when the setting is on at startup,
 	// which is also when the shaders get the fade compiled in (SUN_CROSSFADE). Forward shadows only (the default): the
 	// deferred lookup in SunShadows.fx has no fade, so without forward shadows the steps keep gliding.
-	if (Settings.SunSmoothing.CrossFade && Settings.Exteriors.ForwardShadows) {
+	// (2026-11-15 fd-smoothsun) Not while the deferred sun pass carries the fade (core/SunFadeDeferred.h): then the name is registered
+	// empty, and the copy is made at the first step that fades (StartDeferredFade), so nothing is spent before the deferred sun runs.
+	if (Settings.SunSmoothing.CrossFade && Settings.Exteriors.ForwardShadows && !SunFadeDeferred::CompiledIn()) {
 		TheTextureManager->InitTexture("TESR_ShadowAtlasOld", &ShadowAtlasOldTexture, &ShadowAtlasOldSurface, atlasSize, atlasSize, Settings.ShadowMaps.Format, false);
 		SunCrossFadeReady = ShadowAtlasOldTexture && ShadowAtlasOldSurface;
 		Logger::Log("UNOFFICIAL sun shadow cross-fade %s (%lux%lu copy of the shadow atlas).", SunCrossFadeReady ? "on" : "FAILED, off",
 			atlasSize, atlasSize);
+	}
+	else if (SunFadeDeferred::CompiledIn()) {
+		TheTextureManager->RegisterTexture("TESR_ShadowAtlasOld", (IDirect3DBaseTexture9**)&ShadowAtlasOldTexture);
+		Logger::Log("UNOFFICIAL deferred sun steps: %.1f degrees, each faded over %.1f s by the deferred sun pass (the %lux%lu copy of the shadow atlas is made at the first step)",
+			SunFadeDeferred::StepDegrees, SunFadeDeferred::FadeSeconds, atlasSize, atlasSize);
 	}
 
 	MakeCascadeSurfaces(*this, cascadeSize, atlasSize);
@@ -1177,6 +1185,14 @@ void ShadowsExteriorEffect::RecreateTextures(bool cascades, bool ortho, bool cub
 			Constants.CrossFade.x = 0.0f;
 			TheShaderManager->Effects.SunShadows->ClearSampler("TESR_ShadowAtlasOld", 19);
 			TheShaderManager->ClearShaderSamplers("TESR_ShadowAtlasOld", 19);
+		}
+		// (2026-11-15 fd-smoothsun) the deferred steps' copy: released, made again at the next step at the new size (DeferredSun::Apply
+		// re-reads the slot at every pass); a fade in progress ends
+		else if (ShadowAtlasOldTexture) {
+			ReleaseAndClear(ShadowAtlasOldSurface);
+			ReleaseAndClear(ShadowAtlasOldTexture);
+			DeferredFading = DeferredHolding = false;
+			Constants.CrossFade.x = 0.0f;
 		}
 
 		MakeCascadeSurfaces(*this, cascadeSize, atlasSize);
@@ -1485,6 +1501,17 @@ D3DXVECTOR3 ShadowsExteriorEffect::CalculateSmoothedSunDir() {
 
 	D3DXVECTOR3 sunDir(TheShaderManager->ShaderConst.SunDir);
 
+	// UNOFFICIAL 2026-11-15 fd-smoothsun (core/SunFadeDeferred.h): while the deferred sun pass draws the sun with the fade compiled in, outdoors,
+	// with SmoothSun on: half-degree steps, each faded by that pass. Otherwise (indoors, a frame drawn forward, DeferredFade off) as before;
+	// a switch between the two jumps.
+	if (Settings.SunSmoothing.SmoothSun && SunFadeDeferred::Live() && TheShaderManager->GameState.isExterior)
+		return CalculateDeferredSunDir(sunDir);
+	SunFadeDeferred::Fading = false;
+	if (DeferredSunValid) {
+		DeferredSunValid = DeferredFading = DeferredHolding = false;
+		Constants.CrossFade = D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);
+	}
+
 	if (quantized) {
 		// Snap yaw and pitch to their steps.
 		float yaw = atan2f(sunDir.y, sunDir.x);
@@ -1568,7 +1595,7 @@ D3DXVECTOR3 ShadowsExteriorEffect::CalculateSmoothedSunDir() {
 * as the last frame left it -- the shadows of the previous sun direction -- with the matrices and centres its
 * cascades were drawn with, and have every cascade redrawn this frame for the new direction.
 */
-bool ShadowsExteriorEffect::StartSunCrossFade() {
+bool ShadowsExteriorEffect::StartSunCrossFade(bool forceAllCascades) {
 	HRESULT copied = TheRenderManager->device->StretchRect(ShadowAtlasSurface, NULL, ShadowAtlasOldSurface, NULL, D3DTEXF_NONE);
 	if (FAILED(copied)) {
 		static bool reported = false;
@@ -1581,7 +1608,7 @@ bool ShadowsExteriorEffect::StartSunCrossFade() {
 		SunFadeCenter[i] = ShadowMaps[i].ShadowMapCascadeCenterRadius;
 		SunFadeCamera[i] = ShadowMaps[i].CameraTranslation;
 	}
-	TheShadowManager->ForceAllCascades = true;
+	if (forceAllCascades) TheShadowManager->ForceAllCascades = true;	// (2026-11-15: the deferred steps wait for the schedule instead)
 	return true;
 }
 
@@ -1601,6 +1628,121 @@ void ShadowsExteriorEffect::UpdateSunCrossFade(float oldWeight) {
 			SunFadeCenter[i].z - moved.z, SunFadeCenter[i].w);
 	}
 	Constants.CrossFade.x = oldWeight;
+}
+
+/*
+* UNOFFICIAL 2026-11-15 fd-smoothsun (core/SunFadeDeferred.h, docs/next/FD-SMOOTHSUN-RESULTS.md): the deferred renderer's sun for the shadow
+* maps. It stands still at DeferredSunHeld and steps to the real sun once that is StepDegrees away and no fade is running; the deferred sun
+* pass then fades from the maps of before the step (kept here: the atlas, its cascades' matrices and centres, the sun they were drawn for in
+* TESR_ShadowCrossFade.yzw) to the new ones over FadeSeconds. The fade's clock starts once every cascade has been redrawn for the new sun
+* (the far ones follow their 4 / 8 frame schedule; nothing is forced), at most MaxHoldFrames frames after the step: until then the old maps
+* alone, so no cascade is seen switching. A move past MaxJumpAngle (waiting, sleeping, fast travel, the sun / moon swap) or the camera put elsewhere (loading),
+* or the sun's shadows faded out (the cascades not drawn) jumps at once. Called before this frame's cascades are drawn.
+*/
+D3DXVECTOR3 ShadowsExteriorEffect::CalculateDeferredSunDir(D3DXVECTOR3 sunDir) {
+	SunGlideValid = false;	// (the forward glide starts over if it takes over again)
+	SunCrossFading = false;
+	const float lengthSq = D3DXVec3LengthSq(&sunDir);
+	if (lengthSq > 1.0e-12f) sunDir /= sqrtf(lengthSq);
+	else sunDir = D3DXVECTOR3(0.0f, 0.0f, 1.0f);
+	const ULONGLONG now = GetTickCount64();
+	const float stepAngle = D3DXToRadian(SunFadeDeferred::StepDegrees);
+	const float jumpLimit = D3DXToRadian(Settings.SunSmoothing.MaxJumpAngle);	// [5-30] degrees
+	const float angle = acosf(std::clamp(D3DXVec3Dot(&sunDir, &DeferredSunHeld), -1.0f, 1.0f));
+	const bool noMaps = SunFaded || TheShadowManager->SunCascadesSkipped;	// nothing drawn to fade from (the sun's shadows faded out)
+	// the camera put somewhere else (loading, fast travel, a door to another worldspace): the kept maps are of another place
+	const D3DXVECTOR3 camera = WorldSceneGraph->camera->m_worldTransform.pos.toD3DXVEC3();
+	const D3DXVECTOR3 cameraMoved = camera - DeferredLastCamera;
+	const bool teleported = DeferredSunValid && D3DXVec3LengthSq(&cameraMoved) > 2048.0f * 2048.0f;
+	DeferredLastCamera = camera;
+
+	static unsigned stepLines = 0, jumpLines = 0;
+	const bool watch = TheSettingManager->GetSettingI("Shaders.CloudShadows.Main", "FlickerWatch") != 0;
+	const bool jump = DeferredSunValid && (angle > jumpLimit || teleported);
+	if (!DeferredSunValid || jump || (noMaps && angle >= stepAngle)) {
+		if (jump) {
+			DeferredJumps++;
+			if (jumpLines < 40 || watch) {
+				jumpLines++;
+				Logger::Log("UNOFFICIAL sun step %.2f degrees at hour %.2f (to %.3f %.3f %.3f): jumps (deferred: %s)", D3DXToDegree(angle),
+					TheShaderManager->ShaderConst.GameTime.y, sunDir.x, sunDir.y, sunDir.z,
+					angle > jumpLimit ? "more than MaxJumpAngle: waiting, sleeping, fast travel, loading or the sun / moon swap" : "the camera was put somewhere else");
+			}
+		}
+		DeferredSunHeld = sunDir;
+		DeferredSunValid = true;
+		DeferredFading = DeferredHolding = false;
+	}
+	else if (angle >= stepAngle && !DeferredFading) {
+		const D3DXVECTOR3 oldSun = DeferredSunHeld;
+		DeferredFading = !noMaps && StartDeferredFade(oldSun);
+		DeferredHolding = DeferredFading;
+		DeferredHoldFrames = 0;
+		DeferredFadeStart = now;
+		DeferredSunHeld = sunDir;
+		DeferredSteps++;
+		if (stepLines < 40 || watch || DeferredSteps % 50 == 0) {
+			stepLines++;
+			Logger::Log("UNOFFICIAL sun step %.2f degrees at hour %.2f (to %.3f %.3f %.3f): %s (deferred step %u, %u jumps so far; the last fade waited %.1f frames for the cascades on average)",
+				D3DXToDegree(angle), TheShaderManager->ShaderConst.GameTime.y, sunDir.x, sunDir.y, sunDir.z,
+				DeferredFading ? "cross-fades" : "jumps (the copy of the shadow atlas failed)", DeferredSteps, DeferredJumps,
+				DeferredSteps > 1 ? DeferredHoldSum / (float)(DeferredSteps - 1) : 0.0f);
+		}
+	}
+
+	if (DeferredFading) {
+		if (DeferredHolding) {
+			// the fade waits until every cascade holds a draw for the new sun (ShadowManager: CascadeRefreshSun, set at each cascade's draw)
+			bool redrawn = true;
+			for (int i = MapNear; i <= MapLod; i++) redrawn = redrawn && D3DXVec3Dot(&TheShadowManager->CascadeRefreshSun[i], &DeferredSunHeld) > 0.999999f;
+			if (redrawn || DeferredHoldFrames >= SunFadeDeferred::MaxHoldFrames) {
+				DeferredHolding = false;
+				DeferredHoldSum += (unsigned)DeferredHoldFrames;
+				DeferredFadeStart = now;
+			}
+			else DeferredHoldFrames++;
+		}
+		const float t = DeferredHolding ? 0.0f : std::clamp((now - DeferredFadeStart) / (1000.0f * SunFadeDeferred::FadeSeconds), 0.0f, 1.0f);
+		if (t < 1.0f) UpdateSunCrossFade(1.0f - t * t * (3.0f - 2.0f * t));	// eased at both ends, as the glide
+		else DeferredFading = false;
+	}
+	if (!DeferredFading) Constants.CrossFade.x = 0.0f;
+	SunFadeDeferred::Fading = DeferredFading;
+
+	Constants.SmoothedSunDir = D3DXVECTOR4(DeferredSunHeld, 0.0f);
+	return DeferredSunHeld;
+}
+
+/*
+* fd-smoothsun: a deferred step. The copy of the atlas is made here at the first step (registered empty at startup: nothing spent before),
+* at the live atlas' size and format; then the atlas as the last frame left it is copied with its cascades (StartSunCrossFade, without
+* forcing a redraw) and the sun it was drawn for goes to TESR_ShadowCrossFade.yzw.
+*/
+bool ShadowsExteriorEffect::StartDeferredFade(const D3DXVECTOR3& oldSun) {
+	if (DeferredFadeFailed || !ShadowAtlasTexture || !ShadowAtlasSurface) return false;
+	if (!ShadowAtlasOldTexture) {
+		D3DSURFACE_DESC desc = {};
+		ShadowAtlasTexture->GetLevelDesc(0, &desc);
+		TheTextureManager->InitTexture("TESR_ShadowAtlasOld", &ShadowAtlasOldTexture, &ShadowAtlasOldSurface, desc.Width, desc.Height, desc.Format, false);
+		D3DSURFACE_DESC made = {};
+		if (ShadowAtlasOldTexture) ShadowAtlasOldTexture->GetLevelDesc(0, &made);
+		if (!ShadowAtlasOldTexture || !ShadowAtlasOldSurface || made.Width != desc.Width || made.Height != desc.Height) {
+			// (out of video memory, most likely; this effect's targets are never parked: TargetParkable is false)
+			Logger::Log("UNOFFICIAL deferred sun steps: the %ux%u copy of the shadow atlas could not be made: no fades this session (the steps jump)", desc.Width, desc.Height);
+			DeferredFadeFailed = true;
+			return false;
+		}
+		Logger::Log("UNOFFICIAL deferred sun steps: the %ux%u copy of the shadow atlas made (%.0f MB)", desc.Width, desc.Height,
+			TextureManager::TargetBytes((int)desc.Width, (int)desc.Height, desc.Format, false) / 1048576.0);
+	}
+	if (!StartSunCrossFade(false)) {
+		DeferredFadeFailed = true;
+		return false;
+	}
+	Constants.CrossFade.y = oldSun.x;
+	Constants.CrossFade.z = oldSun.y;
+	Constants.CrossFade.w = oldSun.z;
+	return true;
 }
 
 

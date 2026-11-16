@@ -388,6 +388,18 @@ float3 getSunLighting(float3 toSun, float3 radiance, float3 toEye, float3 N, flo
     return getSunLighting(toSun, radiance, toEye, N, baseColor, r, 0.0f);
 }
 
+// UNOFFICIAL 2026-11-14 DeferredSun (Shaders/DeferredSun.hlsl): getSunLighting above with its variant chosen per pixel, for a pass that
+// lights pixels of both kinds of record: specular > 0.5 = the SPECULAR variants' PBRSun, else the plain ones' PBRDiffuse (the
+// ONLY_SPECULAR highlight passes have no deferred record). Same scale, saturation and micro-shadow; keep the two in step (tests/fd_sun_math
+// checks them against each other). No template calls it: the templates compile exactly as before.
+float3 getSunLightingModel(float specular, float3 toSun, float3 radiance, float3 toEye, float3 N, float3 baseColor, float r, float metal) {
+    float3 scaled = radiance * LIN_SCALE_LIGHT;
+    float3 graded = lerp(luma(baseColor), baseColor, TESR_PBRExtraData.x);
+    [branch] if (specular > 0.5f)
+        return MICRO_SHADOW(N, toSun) PBRSun(metal, r, graded, N, toEye, toSun, scaled);
+    return MICRO_SHADOW(N, toSun) PBRDiffuse(metal, r, graded, N, toEye, toSun, scaled);
+}
+
 #ifdef NVR_FOLD
 // UNOFFICIAL 2026-10-21 FoldHighlights (ObjectTemplate.hlsl): the lamps' and the sun's light as the one-pass shaders give it (SPECULAR:
 // the PBR diffuse with its highlight, metal), for the light-only and extra-lamp passes, whatever variant they are.

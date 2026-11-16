@@ -1859,6 +1859,10 @@ bool gScreenStale = false, gScreenStaleSure = false, gScreenPerson = false;
 // within `same` of the screen point flipped per pixel and per frame, and the contact march walked over neighbouring blades. A grass
 // pixel always starts from the screen's own point and takes no contact march. Without grass records (the key off): never set.
 bool gScreenGrass = false;
+// (2026-11-14 GBufferV2, core/CapturedNormals.h) a MaterialBuffer class with the layout v2's specular bit (+16) taken off; the old layout's
+// classes (below 16) are as they are
+float PtMatClass(float c) { return c >= 16.0 ? c - 16.0 : c; }
+
 bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 	hit = n = vec3(0.0);
 	s = HitSurface(vec3(0.0));
@@ -1885,7 +1889,7 @@ bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 	// (2026-11-13 PTFlashOwnPixels) a pixel nothing recorded (the albedo's alpha 0; not the land, whose record the light pass lights
 	// whatever its alpha; not a masked pixel: water, grass with its own beam, an uncaptured view model): its distance along the ray
 	if (gScreenDrawnElse && gFlashOwn > 0.5 && nv.a > -0.5 && nv.a < 3.5 && a.a < 1.0e-3 &&
-		!((uint(p.accum.w) & 256u) != 0u && floor(imageLoad(gMaterial, pixel).r + 0.01) == 4.0)) {
+		!((uint(p.accum.w) & 256u) != 0u && PtMatClass(floor(imageLoad(gMaterial, pixel).r + 0.01)) == 4.0)) {
 		const vec2 fuv = (vec2(pixel) + 0.5) * p.size.zw + p.rect.xy;
 		gFlashAt = (p.forward.xyz + p.right.xyz * (2.0 * fuv.x - 1.0) - p.up.xyz * (2.0 * fuv.y - 1.0)) * (d * p.forward.w);
 		gFlashDist = length(gFlashAt);
@@ -1908,10 +1912,10 @@ bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 	if (gAlbedoGamma > 0.0) s.albedo = pow(s.albedo, vec3(gAlbedoGamma));   // (2026-11-12 PTAlbedoGamma)
 	if ((uint(p.accum.w) & 256u) != 0u) {
 		vec4 m = imageLoad(gMaterial, pixel);
-		float cls = floor(m.r);
-		gScreenGrass = cls == 7.0 && m.a > 0.5 && abs(m.g - 0.5) < 0.1;   // (2026-11-12 CapturedGrass)
+		float cls = PtMatClass(floor(m.r));
+		gScreenGrass = cls == 7.0 && m.a > 0.5 && (abs(m.g - 0.5) < 0.1 || abs(m.g - 4.5) < 0.1);   // (2026-11-12 CapturedGrass; 4.5: GBufferV2's mark)
 		if (cls >= 1.0) {
-			s.metal = clamp((m.r - cls) / 0.49, 0.0, 1.0);
+			s.metal = clamp(fract(m.r) / 0.49, 0.0, 1.0);   // (2026-11-14: fract, the class may carry GBufferV2's specular bit)
 			s.rough = m.b >= 0.0 ? clamp(m.b, 0.05, 1.0) : cls == 4.0 || cls == 5.0 ? 0.95 : 0.7;
 			// (2026-11-12 ptbump) PTMatteNoHighlight: a record the game draws with no highlight (b = -2 - the shader's roughness, objects
 			// only: class 1-3; the land's b, -8 .. -6, is its bump below): matte with the key, else the roughness as before the code

@@ -72,6 +72,10 @@ public:
 	bool	weatherFilterWasActive; // edge-detect for the animator, mirrors RainAnimator.switched
 	// UNOFFICIAL 2026-10-30 GameFogFloor ([Shaders.VolumetricFog.Main] GameFogFloor, [Shaders.VolumetricFog.Night] GameFogFloorScale; UpdateConstants)
 	float	gameFogFloor = 0.0f, gameFogFloorNight = 1.0f;
+	// UNOFFICIAL 2026-11-15 FogWall ([Shaders.VolumetricFog.Interiors] GameFogFloor, default 1; docs/next/FOG-WALL.md): indoors the same
+	// constants (Sun.z the strength, Sun.w the cell's raw fog near) drive the fade into the cell's fog before its clip distance.
+	// fogWallCell / fogWallFrames: the player's cell and the frames spent in it, for the diagnostic line (UpdateConstants).
+	const void* fogWallCell = nullptr; UInt32 fogWallFrames = 0;
 	float	layerOn = 0.0f, layerBase = 0.0f, layerThickness = 2000.0f; bool layerFollowsCamera = false;	// UNOFFICIAL 2026-11-01 HeightLayer (UpdateSettings)
 	float	shapeFalloff = 50.0f, shapeMaxHeight = 3.0f;	// HeightFalloff / MaxHeight as set (Shape.xy carry the layer while it is on: ApplyLayer)
 	void	ApplyLayer();

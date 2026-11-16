@@ -197,7 +197,9 @@ bool TAAEffect::WorldDrawnSmall(UINT& renderWidth, UINT& renderHeight, D3DXVECTO
 	return true;
 }
 
+extern bool NvrFirstPersonNativeNow;	// UNOFFICIAL 2026-11-13 Hooks/Render.cpp FirstPersonNative: this first-person pass draws into a full-size layer
 void TAAEffect::NoteWorldDraw(bool firstPerson) {
+	if (firstPerson && NvrFirstPersonNativeNow) return;	// (its viewport is the whole layer on purpose)
 	TAAEffect* taa = TheShaderManager ? TheShaderManager->Effects.TAA : nullptr;
 	// UNOFFICIAL 2026-10-27 RenderScale v2: first-person passes while the frame waits for its upscale (the weapon into the same rect).
 	if (!taa || !(firstPerson ? taa->Up.Deferred : taa->Up.Active)) return;

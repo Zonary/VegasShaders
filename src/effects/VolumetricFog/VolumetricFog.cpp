@@ -112,15 +112,51 @@ void VolumetricFogEffect::UpdateConstants() {
 	// with it (TESR_FogData.x holds 0.17 x far when the weather's near is negative, as most clear ones are: -10).
 	ApplyLayer();	// UNOFFICIAL 2026-11-01 HeightLayer: every frame (the camera moves)
 
-	if (TheShaderManager->GameState.isExterior && gameFogFloor > 0.0f) {
-		const float t = std::clamp((TheShaderManager->ShaderConst.SunAmount.x - 0.4f) / 0.4f, 0.0f, 1.0f);
-		const float night = 1.0f - t * t * (3.0f - 2.0f * t);
-		Constants.Sun.z = gameFogFloor * (1.0f + (gameFogFloorNight - 1.0f) * night);
+	// UNOFFICIAL 2026-11-15 FogWall ([Shaders.VolumetricFog.Interiors] GameFogFloor, read by UpdateSettings; docs/next/FOG-WALL.md):
+	// indoors the camera's far plane is the cell's clip distance (nothing is drawn past it: those pixels keep the cleared background),
+	// and the game's own fog, which the cell's lighting makes full by its fog far (at or before the clip in vanilla cells), hid the cut.
+	// With this effect on the game's fog is off (Render.cpp ShadowSceneNode__GetFogPropertyEx) and the mod's indoor fog is about 0.06 %
+	// at 2000 units, so the cut showed as a flat wall. Indoors the shader fades into the cell's fog colour along the cell's own curve
+	// (ending at min(fog far, clip)) over the outer half of the way from its fog near to there, times this (no night scale indoors).
+	// Not in an interior that behaves like an exterior (a real sky drawn past its walls: the fade would paint that sky the fog colour).
+	const TESObjectCELL* cell = Player ? Player->parentCell : nullptr;
+	const bool skyIndoors = !TheShaderManager->GameState.isExterior && cell && (cell->flags0 & TESObjectCELL::kFlags0_BehaveLikeExterior);
+	if (gameFogFloor > 0.0f && !skyIndoors) {
+		float scale = gameFogFloor;
+		if (TheShaderManager->GameState.isExterior) {
+			const float t = std::clamp((TheShaderManager->ShaderConst.SunAmount.x - 0.4f) / 0.4f, 0.0f, 1.0f);
+			const float night = 1.0f - t * t * (3.0f - 2.0f * t);
+			scale *= 1.0f + (gameFogFloorNight - 1.0f) * night;
+		}
+		Constants.Sun.z = scale;
 		Constants.Sun.w = Tes->sky->fogNearPlane;
 	}
 	else {
 		Constants.Sun.z = 0.0f;
 		Constants.Sun.w = 0.0f;
+	}
+	// Indoors Sun.x (SunGlow outdoors, 0 indoors before) carries 1 / (min(fog far, clip) - fog near): the shader's curve ends at the nearer
+	// of the cell's fog far and its clip, and its fade runs over the outer half of that (a constant expression in the shader would take
+	// a preshader register the composite passes do not have). 0 for a cell without fog distances (no fade, as the game).
+	if (!TheShaderManager->GameState.isExterior) {
+		const float fogEnd = (std::min)(TheShaderManager->ShaderConst.fogData.y, TheRenderManager->CameraData.y);
+		const float range = fogEnd - Constants.Sun.w;
+		Constants.Sun.x = (TheShaderManager->ShaderConst.fogData.y > Constants.Sun.w + 1.0f && range > 1.0f) ? 1.0f / range : 0.0f;
+	}
+
+	// FogWall diagnostic, once per interior cell: what the indoor fade is built from (the clip as the camera's far plane, the sky's fog
+	// values the shaders get, and the world's fog property the game would have drawn with), 120 frames after arriving (settled values).
+	if (cell != fogWallCell) { fogWallCell = cell; fogWallFrames = 0; }
+	if (!TheShaderManager->GameState.isExterior && cell && ++fogWallFrames == 120) {
+		const Sky* sky = Tes->sky;
+		const ShadowSceneNode* worldNode = BSShaderManager::GetShadowSceneNode(0);
+		const BSFogProperty* fog = worldNode ? worldNode->fogProperty : nullptr;
+		const D3DXVECTOR4& data = TheShaderManager->ShaderConst.fogData;
+		Logger::Log("UNOFFICIAL FogWall: interior %08X: far plane (clip) %.0f; the sky's fog near %.0f, far %.0f, power %.2f, colour %.3f %.3f %.3f; "
+			"TESR_FogData near %.0f, far %.0f, power %.2f; the world's fog property start %.0f, end %.0f, power %.2f, colour %.3f %.3f %.3f; GameFogFloor %.2f",
+			cell->refID, TheRenderManager->CameraData.y, sky->fogNearPlane, sky->fogFarPlane, sky->fogPower, sky->fogColor.r, sky->fogColor.g, sky->fogColor.b,
+			data.x, data.y, data.w, fog ? fog->fStartDistance : 0.0f, fog ? fog->fEndDistance : 0.0f, fog ? fog->fPower : 0.0f,
+			fog ? fog->m_kColor.r : 0.0f, fog ? fog->m_kColor.g : 0.0f, fog ? fog->m_kColor.b : 0.0f, Constants.Sun.z);
 	}
 }
 
@@ -240,7 +276,10 @@ void VolumetricFogEffect::UpdateSettings(){
 		Constants.Scatter.y = 0.0f;
 		Constants.Sun.x = 0.0f;
 		Constants.Sun.y = 0.0f;	// (the fog's sky colour indoors is the cell's fog colour already)
-		gameFogFloor = 0.0f;	// UNOFFICIAL 2026-10-30 GameFogFloor: outdoors only
+		// UNOFFICIAL 2026-11-15 FogWall: indoors GameFogFloor is the fade into the cell's fog before its clip distance (UpdateConstants;
+		// missing key, an older toml = 1, on). 0 = as before: the cut at the clip distance shows.
+		SettingManager::Configuration::ConfigNode fogWallNode;
+		gameFogFloor = TheSettingManager->Config.FillNode(&fogWallNode, SettingCategory, "GameFogFloor") ? std::clamp(fogWallNode.FloatValue, 0.0f, 2.0f) : 1.0f;
 		layerOn = 0.0f;	// UNOFFICIAL 2026-11-01 HeightLayer: outdoors only
 
 		Constants.Aerial = D3DXVECTOR4(0, 0, 0, 0);

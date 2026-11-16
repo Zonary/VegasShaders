@@ -4,6 +4,7 @@
 #include "SessionLog.h"
 #include "imgui.h"	// the screen size for the report
 #include <algorithm>
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: a release zip leaves out BloodFlow's three textures
 #if __has_include("NvrBuildCommit.h")
 #include "NvrBuildCommit.h"	// written by the project's pre-build step: #define NVR_BUILD_COMMIT "<git commit>[-dirty] <branch>"
 #endif
@@ -21,7 +22,11 @@ namespace {
 	// The textures the effects load from loose files (TextureManager reads them with D3DX: a BSA does not count). The release zip's
 	// Textures folder (resource\Textures) has exactly these; missing ones mean the Textures folder was not copied into Data.
 	const char* const kTextures[] = {
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: BloodDrops, BloodRuns and BloodSpatterSmall are BloodFlow's alone (not in a release zip)
 		"Effects\\BloodDrops.dds", "Effects\\bloodlens.dds", "Effects\\BloodRuns.dds", "Effects\\BloodSpatterSmall.dds", "Effects\\bluenoise256.dds",
+#else
+		"Effects\\bloodlens.dds", "Effects\\bluenoise256.dds",
+#endif
 		"Effects\\CloudDetail.dds", "Effects\\CloudShape.dds", "Effects\\CloudWeather.dds", "Effects\\noise.dds", "Effects\\NoiseVolume.dds",
 		"Effects\\SMAA_AreaTex.dds", "Effects\\SMAA_SearchTex.dds", "Effects\\Snownoise256.dds", "Effects\\water_NRM_lens.dds",
 		"Precipitations\\puddles.dds", "Precipitations\\ripples.dds", "Precipitations\\snow.dds", "Precipitations\\snow_NRM.dds",

@@ -10,6 +10,7 @@
 #include "CapturedNormals.h"
 #include "LinearScene.h"
 #include "ShaderRecord.h"
+#include "LightFreeRecords.h"
 namespace FlashlightDeferred {
 	inline ShaderRecordPixel* Pass = nullptr;
 	inline bool PassFailed = false;
@@ -30,7 +31,12 @@ namespace FlashlightDeferred {
 
 	inline bool EnsurePass() {
 		if (Pass || PassFailed) return Pass != nullptr;
-		static D3DXMACRO overrides[] = { { "INTERIOR_SHADOWS", "0" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { NULL, NULL } };
+		// (UNOFFICIAL 2026-11-14 DeferredSun: FD_LIGHT_FREE while the lighting-free records are made: the keep decoded from their COLOR1.a code)
+		static D3DXMACRO overrides[] = { { "INTERIOR_SHADOWS", "0" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { NULL, NULL }, { NULL, NULL }, { NULL, NULL } };
+		int next = 4;
+		if (LightFreeRecords::WantedAtStartup()) overrides[next++] = { "FD_LIGHT_FREE", "1" };
+		// UNOFFICIAL 2026-11-14 foliage (core/DeferredFoliage.h): a leaf / grass deferred record's COLOR2.b is its sun weight (2 + w): taken as rough
+		if (TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredFoliage") != 0 && CapturedNormals::V2CompiledIn()) overrides[next++] = { "FD_FOLIAGE", "1" };
 		ShaderTemplate tmpl = {};
 		tmpl.Name = "FlashlightDeferred";
 		Pass = (ShaderRecordPixel*)ShaderRecord::LoadShader("FlashlightDeferred.pso", NULL, tmpl, "Deferred\\Flashlight\\", overrides);

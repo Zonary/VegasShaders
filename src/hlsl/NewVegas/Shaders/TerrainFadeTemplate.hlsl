@@ -148,7 +148,16 @@ PS_OUTPUT main(PS_INPUT pin) {
 #else
     const float3 groundColor = LinColor(albedo);
 #endif
+    // UNOFFICIAL 2026-11-15 (DeferredSun, bench batch 5: a bright band across the ground where the near land hands over to the far land, in
+    // every mid-distance view) the lighting-free record (LAMPS_DEFERRED 2, the deferred renderer's mode 2 with DeferredDistant): this band is
+    // drawn blended over land whose deferred record has its sun taken out and marked for DeferredSun, which adds the whole sun under it, so the
+    // band's own sun came on top (the forward band blends lit over lit). Here the band blends its ambient only; the pass's sun of the land
+    // under it lights the whole pixel. Without LAMPS_DEFERRED 2 nothing changes.
+#if defined(LAMPS_DEFERRED) && LAMPS_DEFERRED >= 2
+    float3 lit = getSunLighting(pin.sunDir.xyz, (0.0f).xxx, viewDir, nrm.xyz, LinColor(AmbientColor.rgb), groundColor, nrm.a, LandLODSpec.x, 1.0, sunShadow, geoNormal);
+#else
     float3 lit = getSunLighting(pin.sunDir.xyz, LinColor(PSLightColor.rgb), viewDir, nrm.xyz, LinColor(AmbientColor.rgb), groundColor, nrm.a, LandLODSpec.x, 1.0, sunShadow, geoNormal);
+#endif
 
     float3 col = LinEncode(lit);	// UNOFFICIAL linear lighting: back to the stored (gamma) space, before the fog
     col = lerp(col, col * (noiseSample * fNoiseScale + fNoiseOffset), saturate(TESR_TerrainExtraData.z)); // Apply noise.

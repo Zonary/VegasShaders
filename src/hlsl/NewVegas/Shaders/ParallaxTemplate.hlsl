@@ -133,6 +133,24 @@
     #define PAR_PT3
 #endif
 #define PAR_SELF_SHADOW (TESR_ParallaxData.y)	// [Shaders.POM] parallax shadows (and the PBR path) on
+// UNOFFICIAL 2026-11-14 full deferred renderer, phase 0 (ObjectTemplate.hlsl NVR_LIGHT_DEFERRED, docs/next/FD-RECORDS-RESULTS.md): LAMPS_DEFERRED 2 =
+// the lighting-free record: no sun (nor its cascades, cloud shadow or the height map's self-shadow), no lamp; ambient, glow, fog and the
+// G-buffer kept, COLOR1.a = 1 - fog. Without it nothing below changes.
+#if defined(LAMPS_DEFERRED) && LAMPS_DEFERRED == 2
+    #define NVR_LIGHT_DEFERRED
+#endif
+#if defined(LAMPS_DEFERRED) && LAMPS_DEFERRED
+    #include "includes/DeferredPixel.hlsl"	// UNOFFICIAL 2026-11-14 DeferredSun: the deferred records' codes in COLOR1.a (values 1, 2, 3: see the outputs)
+#endif
+// UNOFFICIAL 2026-11-14 full deferred renderer, phase 2 (ObjectTemplate.hlsl NVR_LAMPS_OUT, docs/next/FD-INTERIORS-RESULTS.md): LAMPS_DEFERRED 3 =
+// the lamps-deferred record: the lamps (lights 1-9) compiled out, the sun slot kept; with 2 and 3 the record writes the deferred mark for
+// the lamp pass (COLOR2.g / .a). Without it nothing below changes.
+#if defined(LAMPS_DEFERRED) && LAMPS_DEFERRED == 3
+    #define NVR_LAMPS_OUT
+#endif
+#if defined(LAMPS_DEFERRED) && LAMPS_DEFERRED >= 2
+    #define NVR_GBUFFER_LIT
+#endif
 
 #include "includes/Helpers.hlsl"	// shared code
 #include "includes/Parallax.hlsl"	// shared code
@@ -630,6 +648,18 @@ PS_OUTPUT main(PS_INPUT pin)
         AmbientColor = float4(LinColor(AmbientColorIn.rgb), AmbientColorIn.a);
     #endif
 #endif
+#if defined(NVR_LIGHT_DEFERRED) && !defined(NO_LIGHT)
+    // UNOFFICIAL 2026-11-14 the lighting-free record: every light colour of the draw a compile-time 0 from here on (as ObjectTemplate.hlsl),
+    // so the sun's and the lamps' terms and the shadows that only scale them leave the compiled shader. .a stays the game's.
+    float4 nvrNoDirect[10];
+    [unroll] for (int nvrLight = 0; nvrLight < 10; nvrLight++) nvrNoDirect[nvrLight] = float4(0.0f, 0.0f, 0.0f, PSLightColor[nvrLight].a);
+    #define PSLightColor nvrNoDirect
+#elif defined(NVR_LAMPS_OUT) && !defined(NO_LIGHT)
+    // UNOFFICIAL 2026-11-14 the lamps-deferred record (LAMPS_DEFERRED 3): the lamps' colours (lights 1-9) a compile-time 0, the sun kept
+    float4 nvrNoLamps[10];
+    [unroll] for (int nvrLamp = 0; nvrLamp < 10; nvrLamp++) nvrNoLamps[nvrLamp] = float4(nvrLamp < 1 ? PSLightColor[nvrLamp].rgb : (0.0f).xxx, PSLightColor[nvrLamp].a);
+    #define PSLightColor nvrNoLamps
+#endif
     
     #ifdef PAR_FULL
         float texAlpha = tex2D(BaseMap, pin.texc.xy).a;
@@ -715,7 +745,7 @@ PS_OUTPUT main(PS_INPUT pin)
     float shadowWorldPosValid = PAR_WP_PRESENT(pin.shadowWorldPos.w) ? 1.0f : 0.0f;
 
     #if defined(PAR_LIT) && !defined(PAR_LAMP_FIRST)
-        #if FORWARD_SHADOWS	// NVR sun shadows in the object pass
+        #if FORWARD_SHADOWS && !defined(NVR_LIGHT_DEFERRED)	// NVR sun shadows in the object pass (the lighting-free record: no sun)
         sunAndProj *= shadowWorldPosValid
                           ? GetSunShadow(pin.shadowWorldPos.xyz, sunShadowNormal)
                           : 1.0f;
@@ -740,6 +770,11 @@ PS_OUTPUT main(PS_INPUT pin)
         #endif
         float rough = HudRainRoughness(getRoughness(nmap.a));	// UNOFFICIAL: wet under the rain drops
         SetDiffuseEnergyKeep(nmap.xyz, pin.viewDir.xyz, rough);	// UNOFFICIAL 2026-10-16 EnergySplit (Includes/PBR.hlsl): once per pixel, every lamp reuses it
+        #if CAPTURED_NORMALS_ON >= 4 && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)
+            // UNOFFICIAL 2026-11-14 GBufferV2 (Includes/CapturedNormals.hlsl): the normal-mapped normal in world axes through the screen-derivative
+            // frame of the unshifted uv about the facing normal (top level: ddx / ddy); 0 (none) where a vanilla vertex shader ran
+            const float3 gbShadingNormal = shadowWorldPosValid > 0.0f ? CapturedDerivNormal(pin.shadowWorldPos.xyz, pin.texc.xy, sunShadowNormal, nmap.xyz) : 0.0f;
+        #endif
 
         #ifdef PARALLAX_WETNESS	// UNOFFICIAL 2026-11-04 Wetness Effects: the albedo darkened before any light sees it (as ObjectTemplate.hlsl)
             Wetness wet = (Wetness)0;
@@ -887,12 +922,57 @@ PS_OUTPUT main(PS_INPUT pin)
     #else
         po.capturedPad2 = CapturedMaterialOutNoHighlight(rough);	// UNOFFICIAL 2026-10-31: the rough it was lit with (no metal path here); 2026-11-12 ptbump: coded where the game draws the mesh with no highlight (Includes/CapturedNormals.hlsl)
     #endif
+    #if CAPTURED_NORMALS_ON >= 4 && defined(PAR_LIT) && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)
+        po.capturedPad2 = CapturedShadingNormal(po.capturedPad2, gbShadingNormal);	// UNOFFICIAL 2026-11-14 GBufferV2: g / a
+    #endif
     // UNOFFICIAL 2026-10-28 CapturedNormals: the smooth vertex nmap, before the nmap map and the parallax offset. The displacement
     // layout (NVR DXVK object tessellation) has no channel for it (uv.zw is the object nmap there): none, the depth-rebuilt nmap stays.
     #if defined(DISPLACE_LAYOUT) || defined(DIFFUSE) || defined(ONLY_SPECULAR)
         po.capturedNormal = CAPTURED_NORMAL_INVALID;
     #else
         po.capturedNormal = CapturedNormalOut(PAR_SMOOTH_NORMAL, pin.shadowWorldPos.xyz);
+    #endif
+    #if defined(NVR_LIGHT_DEFERRED) && CAPTURED_NORMALS_ON >= 3 && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)
+        // UNOFFICIAL 2026-11-14 the lighting-free record's COLOR1.a, its one writer (Includes/DeferredPixel.hlsl FD_LF_CODE, both layouts): 1 - the
+        // fog factor the colour above was lerped with, whether the record had a sun term, and (without GBufferV2) its sun model
+        #if defined(PAR_FOG) && defined(PAR_TOGGLES)
+            #define FD_LF_KEEP (useFog <= 0.0 ? 1.0f : 1.0f - pin.fogColor.a)
+        #elif defined(PAR_FOG)
+            #define FD_LF_KEEP (1.0f - pin.fogColor.a)
+        #else
+            #define FD_LF_KEEP 1.0f
+        #endif
+        #if defined(PAR_LAMP_FIRST) || !defined(PAR_LIT)
+            po.capturedPad1.a = FD_LF_CODE(FD_LF_NOSUN, FD_LF_KEEP);
+        #elif defined(SPECULAR)
+            po.capturedPad1.a = FD_LF_CODE(FD_LF_SPEC, FD_LF_KEEP);
+        #else
+            po.capturedPad1.a = FD_LF_CODE(FD_LF_MATTE, FD_LF_KEEP);
+        #endif
+        #undef FD_LF_KEEP
+    #elif defined(NVR_LAMPS_OUT) && CAPTURED_NORMALS_ON >= 3 && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)
+        // UNOFFICIAL 2026-11-14 the lamps-deferred record (LAMPS_DEFERRED 3): the "sun kept" code (ObjectTemplate.hlsl, Includes/DeferredPixel.hlsl)
+        #if defined(PAR_FOG) && defined(PAR_TOGGLES)
+            #define FD_LD_KEEP (useFog <= 0.0 ? 1.0f : 1.0f - pin.fogColor.a)
+        #elif defined(PAR_FOG)
+            #define FD_LD_KEEP (1.0f - pin.fogColor.a)
+        #else
+            #define FD_LD_KEEP 1.0f
+        #endif
+        #if FD_GBUFFER_V2
+            po.capturedPad1.a = po.capturedPad1.a > 0.5f ? FD_LAMPS_CODE(FD_LD_KEEP) : 0.0f;
+        #else
+            po.capturedPad1.a *= FD_LD_KEEP;
+        #endif
+        #undef FD_LD_KEEP
+    #endif
+    #if defined(NVR_LAMPS_OUT) && CAPTURED_NORMALS_ON == 3 && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)	// (G-buffer v2, CAPTURED_NORMALS_ON 4: its own mark, COLOR1.a in (1, 2])
+        // UNOFFICIAL 2026-11-14 (LAMPS_DEFERRED 2 / 3) the deferred mark (ObjectTemplate.hlsl): COLOR2.g / .a = the recorded normal, a in
+        // 1.01..1.99. FD_SHADING_NORMAL hook: G-buffer v2's shading normal (claude/fd-gbuffer) replaces the smooth one here.
+        [flatten] if (po.capturedNormal.a > 0.5f) {
+            po.capturedPad2.g = po.capturedNormal.r;
+            po.capturedPad2.a = 1.01f + 0.49f * (po.capturedNormal.g + 1.0f);
+        }
     #endif
     // UNOFFICIAL 2026-11-12 CapturedCoverage (Includes/CapturedNormals.hlsl): a blended draw records only where its own alpha is 0.5 or
     // more; below, alpha 0 = the texels stay as they were. An opaque draw: x 1, as before.

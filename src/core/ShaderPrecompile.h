@@ -42,7 +42,7 @@ namespace ShaderPrecompile {
 	inline void Paths(const char* Name, const char* SubPath, const char* CacheSubPath, const char* TemplateName, Job* job) {
 		std::string base = ShadersPath, cache = std::string(ShadersPath) + "Cache\\";
 		if (SubPath) base += SubPath;
-		if (CacheSubPath) { cache += CacheSubPath; CreateDirectoryA(cache.c_str(), NULL); }
+		if (CacheSubPath) { cache += CacheSubPath; ShaderProgram::CreateFolders(cache); }
 		else if (SubPath) cache += SubPath;
 		job->Source = base + (TemplateName ? TemplateName : Name) + ".hlsl";
 		job->Preprocessed = cache + Name + ".hlsl";

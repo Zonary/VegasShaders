@@ -9,6 +9,7 @@
 #include "GpuProfiler.h"
 #include "RtTessContact.h"	// UNOFFICIAL 2026-11-07 (rtgap-tess) the bumps' slack + ContactShadows (docs/next/RT-DETAIL-GAPS.md section 1)
 #include "RtShadowDenoise.h"	// UNOFFICIAL 2026-11-07 ShadowDenoiser (docs/next/RT-DENOISER.md)
+#include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (ForwardCrossFade)
 
 namespace {
 	const char* const kSection = "Shaders.ShadowsExteriors.RT";
@@ -753,7 +754,7 @@ namespace RtSunShadows {
 		else if (!TheSettingManager->GetSettingI(kSection, "ForwardLookup")) strcpy_s(forwardWhy, "off (ForwardLookup false): Mode 1 the old way, through the deferred apply");
 		else if (!TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.Main", "ForwardShadows"))
 			strcpy_s(forwardWhy, "off: [Shaders.ShadowsExteriors.Main] ForwardShadows is off (no sun lookup in the shaders): Mode 1 the old way");
-		else if (TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.SunSmoothing", "CrossFade"))
+		else if (SunFadeDeferred::ForwardCrossFade())	// (2026-11-15 fd-smoothsun: not while the deferred sun pass carries the fade)
 			strcpy_s(forwardWhy, "off: [Shaders.ShadowsExteriors.SunSmoothing] CrossFade is on (its constants sit where the lookup's do): Mode 1 runs as Mode 0");
 		else if (!ext || FAILED(ext->QueryInterface(__uuidof(ID3D9NvrExtRt), (void**)&rt)) || !rt)
 			strcpy_s(forwardWhy, "off: needs Vegas Shaders DXVK with the RT core");

@@ -23,6 +23,8 @@
 #include <d3d9.h>
 #include <unordered_set>
 #include "DxvkCompute.h"
+#include "GBufferCensus.h"	// UNOFFICIAL 2026-11-14 GBufferCensus (test only): every draw of a census frame, after BeforeDraw
+#include "MergeCopies.h"	// UNOFFICIAL 2026-11-14 MergeCopies (test only): its merged draw / checks in the innermost draw hook
 #include "DisplaceHeight.h"	// UNOFFICIAL 2026-11-01 SameHeight: the draw hook gives it each draw
 #include "DrawState.h"	// UNOFFICIAL 2026-10-29 SharedDrawState: the tracked state lives there
 #include "PassSums.h"
@@ -30,6 +32,7 @@
 #include "FlashlightLamp.h"	// UNOFFICIAL 2026-11-04 the flashlight's game lamp: which objects the G-buffer holds
 #include "WaterMask.h"	// UNOFFICIAL 2026-11-12 PTGrassOwnPixel: grass without records goes into the path tracer's mask of the game's own pixels
 #include "GpuProfiler.h"	// UNOFFICIAL ShadowContrast step timer	// UNOFFICIAL 2026-10-29 lean hook: AfterStateBlock
+#include "RtCore.h"	// UNOFFICIAL 2026-11-15 RT master switches (RtCore::Gated: the grass records for the RT GI)
 
 namespace RtPathTrace { bool Replacing(); }	// UNOFFICIAL 2026-11-12 (core/RtPathTrace.h): the foliage records are written only while it is true
 
@@ -73,6 +76,15 @@ namespace CapturedNormals {
 	inline void NoteGrassWriter(IDirect3DPixelShader9* handle) { if (handle) GrassWriters.insert(handle); }
 	inline void NoteLeafWriter(IDirect3DPixelShader9* handle) { if (handle) LeafWriters.insert(handle); }
 	inline bool GrassKey = true, LeafKey = true, GrassNow = false, LeafNow = false;	// the keys; this frame: key, writers loaded, path tracing replaces
+	// UNOFFICIAL 2026-11-14 full deferred renderer, foliage (core/DeferredFoliage.h, [Main.Main.Quality] DeferredFoliage): FoliageDeferred, set by
+	// DeferredFoliage::BeginFrame before BeginFrame here, writes the leaf and grass records this frame whatever the keys (the deferred records
+	// need the G-buffer: this is why the census found the leaves "foliageidle"); GrassLateWanted: the late grass's records keep their old readers
+	// only (path tracing, the RT GI); the deferred records' handles (the flashlight's game lamp is taken off the objects they draw).
+	inline bool FoliageDeferred = false, GrassLateWanted = false, LastFoliageDeferred = false;
+	inline std::unordered_set<IDirect3DPixelShader9*> FoliageDeferredHandles;
+	// (2026-11-14 fog) the grass DEFERRED record writes its keep and highlight in COLOR2.g [32, 1024) instead of the mark 4.5 (Includes/DeferredPixel.hlsl
+	// FDFoliageGrassCode): the grass-mark readers here take that range as grass too once such a record is made (DeferredFoliage::Load)
+	inline bool FoliageGrassRange = false;
 	inline bool LastGrassWriter = false, LastLeafWriter = false;
 	inline bool GrassArmed = false;			// a grass shader was bound after the span: the draws are looked at until the first that is not grass
 	inline bool GrassLateOk = false, GrassLateBound = false;	// this frame's span ended (its targets hold the frame); ours are bound outside it
@@ -107,6 +119,7 @@ namespace CapturedNormals {
 	// on the grass (GrassOwnBeam, from GrassShaders::UpdateLights): its light pass lights everything the records hold, and the grass
 	// lights itself by the same beam (TESR_GrassSpot): twice. Under the path tracer the raster flashlight is not shown, so there it stays.
 	constexpr float kGrassMark = 0.5f;	// MaterialBuffer g of a grass record (GRASS23x000TMS.pso.hlsl)
+	constexpr float kGrassMarkV2 = 4.5f;	// UNOFFICIAL 2026-11-14 the same with GBufferV2 (g 4 and up: no shading normal there)
 	inline bool GrassOwnBeam = false;	// the grass shaders light the grass by the deferred flashlight's beam this frame
 	inline bool GrassForGI = false;		// this frame's grass records are written for the raster frame's RT GI (no path tracing)
 	inline bool GrassMergeNow = false;	// this frame: the grass's own normal goes into TESR_NormalsBuffer (MergeIntoNormals)
@@ -166,6 +179,9 @@ namespace CapturedNormals {
 	// of its own) gets its colour through VmSkin (BeforeDraw) and VmSkinFill, its material through SkinFill. Only while the path tracer asks
 	// (VmWanted, set by RtPathTrace each frame), after a world span that captured, with no MSAA, into a target of the G-buffer's size.
 	inline bool VmWanted = false, VmSpan = false, VmSkinDrawn = false, VmSkinFillFailed = false, VmRefusedLogged = false;
+	// UNOFFICIAL 2026-11-15 DeferredFirstPerson (core/DeferredFirstPerson.h): the same span for the full deferred renderer's first person (set by
+	// DeferredFirstPerson::Begin for this frame's first-person render only; false without the switch: the span as before, the path tracer's)
+	inline bool VmDeferred = false;
 	inline UInt32 VmFrame = 0xFFFFFFFFu;	// the frame (TheFrameRateManager->FrameNumber, from Render.cpp) whose view model was captured
 	inline UInt32 VmWritesBefore = 0, VmCaptures = 0, VmSkinDraws = 0;
 	inline float VmContrastSaved = 0.0f;
@@ -229,6 +245,24 @@ namespace CapturedNormals {
 		return AlbedoCompiled;
 	}
 	inline IDirect3DSurface9* AlbedoDrawSurface() { return AlbedoMsaa ? AlbedoMsaa : AlbedoSurface; }
+	// UNOFFICIAL 2026-11-14 GBufferV2 ([Main.Main.Quality] GBufferV2, restart, off by default; CAPTURED_NORMALS_ON 4; Includes/CapturedNormals.hlsl;
+	// docs/next/FD-GBUFFER-RESULTS.md): the MaterialBuffer's layout v2 of the full deferred renderer (FULL-DEFERRED-RENDERER-PLAN.md 4.2). r the
+	// shading model (+16 specular) + 0.49 metal, g / a the normal-mapped normal (octahedral; g 4 and up = none here), b the roughness; written =
+	// r > 0.5. Needs the AlbedoBuffer level (CapturedNormals + MaterialBuffer + AlbedoBuffer): refused with a log line without it.
+	inline bool V2Checked = false, V2Compiled = false;
+	inline bool V2CompiledIn() {
+		if (!V2Checked) {
+			V2Checked = true;
+			const bool wanted = TheSettingManager->GetSettingI("Main.Main.Quality", "GBufferV2") != 0;
+			V2Compiled = wanted && AlbedoCompiledIn();
+			if (wanted && !V2Compiled) Logger::Log("[WARNING] UNOFFICIAL GBufferV2: needs [Main.Main.Quality] CapturedNormals + MaterialBuffer + AlbedoBuffer on (restart): the G-buffer stays in its old layout");
+			else if (V2Compiled) Logger::Log("UNOFFICIAL GBufferV2: the G-buffer's material target in layout v2 (shading model + specular bit + metal, the normal-mapped normal, roughness)");
+		}
+		return V2Compiled;
+	}
+	// A MaterialBuffer texel, either layout: written, and its class / shading model (0-15).
+	inline bool MaterialWritten(const float* v) { return V2Compiled ? v[0] > 0.5f : v[3] > 0.5f; }
+	inline int MaterialClass(const float* v) { int c = (int)floorf(v[0] + 0.004f); if (V2Compiled && c >= 16) c -= 16; return c; }
 	// UNOFFICIAL 2026-11-12 (ptbump; a tester under the path tracer: "textures are missing their normals/bumpmaps", "a gross sheen over
 	// everything"). Two additions to the MaterialBuffer's record, both only read by the path tracer (RtPathTrace.comp ScreenHit):
 	//  - the LAND's bumped normal ([Main.Main.Quality] CapturedBumpNormals, restart; TerrainTemplate.hlsl CAPTURED_PT 2, compiled in only
@@ -273,6 +307,9 @@ namespace CapturedNormals {
 	// (SkinVPSTemplate, one target) writes neither buffer: its pixels stay class 0.
 	inline IDirect3DPixelShader9* SkinFillPS = nullptr;  inline bool SkinFillFailed = false;
 	inline UInt32 SkinFills = 0;
+	// UNOFFICIAL 2026-11-15 DeferredSkin (core/DeferredSkin.h, Includes/SkinDeferred.hlsl): set at record load when the deferred skin records are
+	// made. Their pixels hold the whole G-buffer and a COLOR3.a code of 4 and up: the two skin fills below then take 2.02 .. 3.5 / 1.5 .. 3.5 only
+	inline bool SkinDeferredCodes = false;
 	inline IDirect3DPixelShader9* FullScreenShader(IDirect3DDevice9* d, const char* src, const char* what, bool& failed) {
 		IDirect3DPixelShader9* out = nullptr;
 		ID3DXBuffer* code = nullptr; ID3DXBuffer* errors = nullptr;
@@ -288,7 +325,8 @@ namespace CapturedNormals {
 	// One full-screen draw of ps into target (the whole surface, uv 0-1) reading source on stage 0, optionally blended
 	// (src x srcBlend + dest x destBlend); everything it changes is put back.
 	inline void FullScreenPass(IDirect3DDevice9* d, IDirect3DSurface9* target, IDirect3DPixelShader9* psNew, IDirect3DBaseTexture9* source,
-		bool blendOn, DWORD srcBlend, DWORD destBlend, IDirect3DBaseTexture9* source2 = nullptr) {	// source2: UNOFFICIAL 2026-10-31 AlbedoBuffer, on stage 1
+		bool blendOn, DWORD srcBlend, DWORD destBlend, IDirect3DBaseTexture9* source2 = nullptr,	// source2: UNOFFICIAL 2026-10-31 AlbedoBuffer, on stage 1
+		IDirect3DBaseTexture9* source3 = nullptr) {	// source3: UNOFFICIAL 2026-11-14 GBufferView, on stage 2 (with source2)
 		D3DSURFACE_DESC t = {};
 		if (!target || !psNew || FAILED(target->GetDesc(&t))) return;
 		D3DVIEWPORT9 vp = {}; d->GetViewport(&vp);
@@ -300,9 +338,10 @@ namespace CapturedNormals {
 		d->SetViewport(&full);
 		IDirect3DVertexShader9* vs = nullptr; IDirect3DPixelShader9* ps = nullptr; IDirect3DVertexDeclaration9* decl = nullptr;
 		IDirect3DVertexBuffer9* vb = nullptr; UINT vbOffset = 0, vbStride = 0; DWORD fvf = 0;
-		IDirect3DBaseTexture9* tex0 = nullptr; IDirect3DBaseTexture9* tex1 = nullptr;
+		IDirect3DBaseTexture9* tex0 = nullptr; IDirect3DBaseTexture9* tex1 = nullptr; IDirect3DBaseTexture9* tex2 = nullptr;
+		if (!source2) source3 = nullptr;
 		d->GetVertexShader(&vs); d->GetPixelShader(&ps); d->GetVertexDeclaration(&decl); d->GetFVF(&fvf);
-		d->GetStreamSource(0, &vb, &vbOffset, &vbStride); d->GetTexture(0, &tex0); if (source2) d->GetTexture(1, &tex1);
+		d->GetStreamSource(0, &vb, &vbOffset, &vbStride); d->GetTexture(0, &tex0); if (source2) d->GetTexture(1, &tex1); if (source3) d->GetTexture(2, &tex2);
 		static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHATESTENABLE, D3DRS_CULLMODE, D3DRS_STENCILENABLE,
 			D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_COLORWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
 			D3DRS_BLENDOP, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_FOGENABLE };
@@ -312,14 +351,15 @@ namespace CapturedNormals {
 		for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) { if (FAILED(d->GetRenderState(kRS[i], &saved[i]))) saved[i] = want[i]; if (saved[i] != want[i]) d->SetRenderState(kRS[i], want[i]); }
 		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
 		const DWORD wantS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
-		const DWORD stages = source2 ? 2 : 1;
-		DWORD savedS[2][sizeof(kSS) / sizeof(kSS[0])];
+		const DWORD stages = source3 ? 3 : source2 ? 2 : 1;
+		DWORD savedS[3][sizeof(kSS) / sizeof(kSS[0])];
 		for (DWORD s = 0; s < stages; s++)
 			for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) { if (FAILED(d->GetSamplerState(s, kSS[i], &savedS[s][i]))) savedS[s][i] = wantS[i]; if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], wantS[i]); }
 		d->SetVertexShader(nullptr);
 		d->SetPixelShader(psNew);
 		d->SetTexture(0, source);
 		if (source2) d->SetTexture(1, source2);
+		if (source3) d->SetTexture(2, source3);
 		d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
 		const float x1 = (float)t.Width - 0.5f, y1 = (float)t.Height - 0.5f;
 		const float quad[4][6] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { x1, -0.5f, 0, 1, 1, 0 }, { -0.5f, y1, 0, 1, 0, 1 }, { x1, y1, 0, 1, 1, 1 } };
@@ -333,6 +373,7 @@ namespace CapturedNormals {
 		d->SetViewport(&vp);
 		d->SetTexture(0, tex0); if (tex0) tex0->Release();
 		if (source2) { d->SetTexture(1, tex1); if (tex1) tex1->Release(); }
+		if (source3) { d->SetTexture(2, tex2); if (tex2) tex2->Release(); }
 		if (decl) { d->SetVertexDeclaration(decl); decl->Release(); } else d->SetFVF(fvf);
 		d->SetStreamSource(0, vb, vbOffset, vbStride); if (vb) vb->Release();
 		d->SetVertexShader(vs); if (vs) vs->Release();
@@ -347,7 +388,19 @@ namespace CapturedNormals {
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
 				"  float a = tex2D(N, uv).a; clip(a - 2.02);"
 				"  return float4(6.0, 0.0, saturate((a - 2.05) / 0.4), 1.0); }";
-			SkinFillPS = FullScreenShader(d, kPS, "MaterialBufferSkin", SkinFillFailed);
+			// UNOFFICIAL 2026-11-14 GBufferV2: the same in layout v2: skin's shading model 6, no shading normal (g 4: the skin template has no
+			// target left for it; readers take the smooth normal), written by the class
+			static const char* kPSV2 =
+				"sampler2D N : register(s0);"
+				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+				"  float a = tex2D(N, uv).a; clip(a - 2.02);"
+				"  return float4(6.0, 4.0, saturate((a - 2.05) / 0.4), 1.0); }";
+			static const char* kPSV2Deferred =	// (DeferredSkin: the deferred skin's own record stays)
+				"sampler2D N : register(s0);"
+				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+				"  float a = tex2D(N, uv).a; clip(a - 2.02); clip(3.5 - a);"
+				"  return float4(6.0, 4.0, saturate((a - 2.05) / 0.4), 1.0); }";
+			SkinFillPS = FullScreenShader(d, V2Compiled ? (SkinDeferredCodes ? kPSV2Deferred : kPSV2) : kPS, "MaterialBufferSkin", SkinFillFailed);
 			if (!SkinFillPS) return;
 		}
 		static GpuTimer skinTimer("MaterialBuffer skin fill");
@@ -368,7 +421,13 @@ namespace CapturedNormals {
 				"  float a = tex2D(N, uv).a; clip(a - 1.5);"
 				"  float3 c = max(tex2D(S, uv).rgb, 0.0); c = G.x > 1.0 ? pow(c, G.x) : c;"
 				"  return float4(c, 1.0); }";
-			SkinAlbedoFillPS = FullScreenShader(d, kPS, "AlbedoBuffer skin fill", SkinAlbedoFillFailed);
+			static const char* kPSDeferred =	// (DeferredSkin: the deferred skin's own albedo stays)
+				"sampler2D N : register(s0); sampler2D S : register(s1); float4 G : register(c0);"
+				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+				"  float a = tex2D(N, uv).a; clip(a - 1.5); clip(3.5 - a);"
+				"  float3 c = max(tex2D(S, uv).rgb, 0.0); c = G.x > 1.0 ? pow(c, G.x) : c;"
+				"  return float4(c, 1.0); }";
+			SkinAlbedoFillPS = FullScreenShader(d, SkinDeferredCodes ? kPSDeferred : kPS, "AlbedoBuffer skin fill", SkinAlbedoFillFailed);
 			if (!SkinAlbedoFillPS) return;
 		}
 		if (SkinAlbedoMsaa && SkinAlbedoSurface) d->StretchRect(SkinAlbedoMsaa, NULL, SkinAlbedoSurface, NULL, D3DTEXF_NONE);	// (the blur resolves it again later: the same bytes)
@@ -469,10 +528,11 @@ namespace CapturedNormals {
 		for (int i = 0; i < 4096; i++) {
 			const bool hasN = n[i * 4 + 3] > 0.99f, hasA = a[i * 4 + 3] > 0.99f, skin = n[i * 4 + 3] >= 1.5f;
 			normals += hasN; albedo += hasA; both += hasN && hasA; normalsOnly += hasN && !hasA; skinNormals += skin; skinAlbedo += skin && hasA;
-			if (hasA) { for (int c = 0; c < 3; c++) mean[c] += a[i * 4 + c]; if (material && m[i * 4 + 3] > 0.5f) byClass[(std::min)((std::max)((int)floorf(m[i * 4] + 0.004f), 0), 7)]++; }
-			if (GrassNow && material && hasA && hasN && m[i * 4 + 3] > 0.5f) {
-				const bool isGrass = m[i * 4] > 0.5f && fabsf(m[i * 4 + 1] - kGrassMark) < 0.1f;
-				const int w = isGrass ? 1 : (int)floorf(m[i * 4] + 0.004f) == 4 ? 0 : -1;
+			if (hasA) { for (int c = 0; c < 3; c++) mean[c] += a[i * 4 + c]; if (material && MaterialWritten(&m[i * 4])) { const int cls = MaterialClass(&m[i * 4]); if (cls <= 7) byClass[(std::max)(cls, 0)]++; } }	// (2026-11-14 GBufferV2: either layout)
+			if (GrassNow && material && hasA && hasN && MaterialWritten(&m[i * 4])) {
+				const bool isGrass = m[i * 4] > 0.5f && (fabsf(m[i * 4 + 1] - (V2Compiled ? kGrassMarkV2 : kGrassMark)) < 0.1f ||
+					(FoliageGrassRange && m[i * 4 + 1] > 31.99f && m[i * 4 + 1] < 1024.0f));	// (2026-11-14 the grass deferred record's range)
+				const int w = isGrass ? 1 : MaterialClass(&m[i * 4]) == 4 ? 0 : -1;
 				if (w >= 0) {
 					// the octahedral normal's z (Includes/Shadow.hlsl ShadowEncodeNormal, as the merge shader decodes it)
 					float x = n[i * 4], y = n[i * 4 + 1], z = 1.0f - fabsf(x) - fabsf(y);
@@ -563,8 +623,17 @@ namespace CapturedNormals {
 				"  float d = length(vp);"
 				"  clip(c.a > 0.99f && abs(c.b - d) <= d * G.x + G.y && (dot(nv, fn) > G.z || grass > 0.5f) && z < P.z * 0.99f ? 1.0f : -1.0f);"
 				"  return float4(nv * 0.5f + 0.5f, 1.0f); }";
+			// UNOFFICIAL 2026-11-14 GBufferV2: there the grass's mark is g = 4.5 (kGrassMarkV2) and "written" is the class (r), a being a normal's y
+			std::string source = kPS;
+			if (V2Compiled) {
+				const std::string oldTest = "m.a > 0.5f && m.r > 0.5f && abs(m.g - 0.5f) < 0.1f";
+				// (2026-11-14 DeferredFoliage: + the grass deferred record's COLOR2.g range [32, 1024), only while such records are made)
+				const std::string newTest = FoliageGrassRange ? "m.r > 0.5f && (abs(m.g - 4.5f) < 0.1f || (m.g > 31.99f && m.g < 1024.0f))" : "m.r > 0.5f && abs(m.g - 4.5f) < 0.1f";
+				const size_t at = source.find(oldTest);
+				if (at != std::string::npos) source.replace(at, oldTest.size(), newTest);
+			}
 			ID3DXBuffer* code = nullptr; ID3DXBuffer* errors = nullptr;
-			if (FAILED(D3DXCompileShader(kPS, (UINT)strlen(kPS), NULL, NULL, "main", "ps_3_0", 0, &code, &errors, NULL)) || !code ||
+			if (FAILED(D3DXCompileShader(source.c_str(), (UINT)source.size(), NULL, NULL, "main", "ps_3_0", 0, &code, &errors, NULL)) || !code ||
 				FAILED(d->CreatePixelShader((const DWORD*)code->GetBufferPointer(), &MergePS))) {
 				Logger::Log("[ERROR] CapturedNormals: the merge shader failed (%s): the normals buffer stays depth-rebuilt", errors ? (const char*)errors->GetBufferPointer() : "?");
 				MergeFailed = true;
@@ -1093,6 +1162,7 @@ namespace CapturedNormals {
 			LastAlbedoWriter = ps && AlbedoWriters.count(ps) != 0; LastAlbedoLightOnly = ps && AlbedoLightOnlyWriters.count(ps) != 0;	// UNOFFICIAL 2026-10-31 AlbedoBuffer
 			// UNOFFICIAL 2026-11-12 foliage records: the grass and leaf shaders write all three (while path tracing replaces the picture)
 			LastGrassWriter = GrassNow && ps && GrassWriters.count(ps) != 0; LastLeafWriter = LeafNow && ps && LeafWriters.count(ps) != 0;
+			LastFoliageDeferred = FoliageDeferred && ps && FoliageDeferredHandles.count(ps) != 0;	// UNOFFICIAL 2026-11-14 DeferredFoliage
 			LastCodeWriter = ps && CodeWriters.count(ps) != 0;	// (2026-11-12 CapturedCoverage: not for these)
 			LastBeamMarker = ps && BeamMarkers.count(ps) != 0;	// UNOFFICIAL 2026-11-12 HairAndEyes: a hair shader with the mark output
 			if (LastGrassWriter || LastLeafWriter) LastWriter = LastMaterialWriter = LastAlbedoWriter = true; }
@@ -1109,8 +1179,12 @@ namespace CapturedNormals {
 			// keeps the texel's alpha (the foliage shaders write 1 or 0 by themselves)
 			const bool foliage = LastGrassWriter || LastLeafWriter;
 			const bool coverage = write && blend && CoverageOn && AlbedoCompiled && LastAlbedoWriter && !LastCodeWriter && !LastAlbedoLightOnly;
-			if (coverage && !foliage) CoverageBegin(d);
-			if (write && blend && BlendedAlphaOn) BlendedAlphaBegin(d, mask, coverage || foliage);
+			// UNOFFICIAL 2026-11-14 GBufferV2: every blended template writer is marked (also with CapturedCoverage off, also the code writers and the
+			// light-only records): a v2 record's alpha is a normal's y, which under this blend would weight its rgb; marked, the shaders write
+			// alpha 1 (or CapturedCoverage's 0) and no shading normal (Includes/CapturedNormals.hlsl CapturedShadingNormal)
+			const bool v2Mark = V2Compiled && write && blend && LastAlbedoWriter && !foliage;
+			if ((coverage || v2Mark) && !foliage) CoverageBegin(d);
+			if (write && blend && BlendedAlphaOn) BlendedAlphaBegin(d, mask, coverage || foliage || (v2Mark && !LastCodeWriter));
 			// added (ONE / ONE): the alpha adds up across the lamp passes; any other added blend would scale it, so it is left out (counted)
 			if (!write && LastContrastWriter && ContrastStrength > 0.0f && (mask & 7) && blend && dst == D3DBLEND_ONE) {
 				if (src == D3DBLEND_ONE) contrast = true; else ContrastOtherBlend++;
@@ -1124,7 +1198,9 @@ namespace CapturedNormals {
 			// UNOFFICIAL 2026-11-04: the light pass lights this object (core/FlashlightLamp.h). (2026-11-07 ptaaa-firstperson) not the view
 			// model's draws (VmSpan): the deferred flashlight ran before them, so marking them "lit already" would take the light off the gun
 			// (2026-11-12) nor the grass and the leaves: they keep their own beam / the game lamp (their records are only for the path tracer)
-			if (!VmSpan && !LastGrassWriter && !LastLeafWriter) FlashlightLamp::NoteWrite();
+			// (2026-11-14 DeferredFoliage) a foliage DEFERRED record's draw: the light pass lights it (its grass beam is compiled out), so the
+			// game's flashlight lamp leaves the leaves as it leaves any object the G-buffer holds
+			if (!VmSpan && ((!LastGrassWriter && !LastLeafWriter) || LastFoliageDeferred)) FlashlightLamp::NoteWrite();
 			if (LastGrassWriter) GrassWrites++; else if (LastLeafWriter) LeafWrites++;
 		}
 		else if (LastBeamMarker && BeamNow && !VmSpan) {
@@ -1293,26 +1369,39 @@ namespace CapturedNormals {
 	inline HRESULT STDMETHODCALLTYPE DIPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT b, UINT mi, UINT nv, UINT s, UINT pc) {
 		DisplaceHeight::BeforeDraw(d);	// UNOFFICIAL 2026-11-01 SameHeight (displaced parallax objects)
 		BeforeDraw(d);
-		const HRESULT r = NextDIP(d, t, b, mi, nv, s, pc);
+		const bool census = GBufferCensus::Active;	// UNOFFICIAL 2026-11-14 GBufferCensus (test only): the draw as it is made
+		if (census) GBufferCensus::Before(d, GBufferCensus::KindDIP, (UInt32)t, (UInt32)b, mi, nv, s, pc);
+		// (UNOFFICIAL 2026-11-14 MergeCopies: when this is the innermost of NVR's hooks, after every per-draw step above)
+		const HRESULT r = MergeCopies::DrawAction && MergeCopies::Inner((void*)NextDIP) ? MergeCopies::AtDraw(d, NextDIP, t, b, mi, nv, s, pc) : NextDIP(d, t, b, mi, nv, s, pc);
+		if (census) GBufferCensus::After(d);
 		AfterDraw(d);	// (2026-11-11 BlendedAlpha)
 		if (GrassPass && GrassOwnOk && SUCCEEDED(r)) GrassOwnDraw(d, [&]() { return NextDIP(d, t, b, mi, nv, s, pc); });	// UNOFFICIAL 2026-11-12 PTGrassOwnPixel
 		return r;
 	}
 	inline HRESULT STDMETHODCALLTYPE DPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT s, UINT pc) {
 		BeforeDraw(d);
+		const bool census = GBufferCensus::Active;
+		if (census) GBufferCensus::Before(d, GBufferCensus::KindDP, (UInt32)t, s, pc);
 		const HRESULT r = NextDP(d, t, s, pc);
+		if (census) GBufferCensus::After(d);
 		AfterDraw(d);
 		return r;
 	}
 	inline HRESULT STDMETHODCALLTYPE DPUPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT pc, CONST void* v, UINT stride) {
 		BeforeDraw(d);
+		const bool census = GBufferCensus::Active;
+		if (census) GBufferCensus::Before(d, GBufferCensus::KindDPUP, (UInt32)t, pc, stride);
 		const HRESULT r = NextDPUP(d, t, pc, v, stride);
+		if (census) GBufferCensus::After(d);
 		AfterDraw(d);
 		return r;
 	}
 	inline HRESULT STDMETHODCALLTYPE DIPUPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT mi, UINT nv, UINT pc, CONST void* i, D3DFORMAT f, CONST void* v, UINT stride) {
 		BeforeDraw(d);
+		const bool census = GBufferCensus::Active;
+		if (census) GBufferCensus::Before(d, GBufferCensus::KindDIPUP, (UInt32)t, mi, nv, pc, (UInt32)f, stride);
 		const HRESULT r = NextDIPUP(d, t, mi, nv, pc, i, f, v, stride);
+		if (census) GBufferCensus::After(d);
 		AfterDraw(d);
 		return r;
 	}
@@ -1336,6 +1425,7 @@ namespace CapturedNormals {
 		if (!VirtualProtect(&table[81], 4 * sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return;
 		NextDP = (DPFn)table[81];  table[81] = (void*)&DPHook;
 		NextDIP = (DIPFn)table[82];  table[82] = (void*)&DIPHook;
+		MergeCopies::OurHooks[0] = (void*)&DIPHook;	// UNOFFICIAL 2026-11-14 MergeCopies (which hook is the innermost)
 		NextDPUP = (DPUPFn)table[83];  table[83] = (void*)&DPUPHook;
 		NextDIPUP = (DIPUPFn)table[84];  table[84] = (void*)&DIPUPHook;
 		VirtualProtect(&table[81], 4 * sizeof(void*), old, &old);
@@ -1389,7 +1479,8 @@ namespace CapturedNormals {
 			// deferred flashlight's beam (the light pass would light its records too). The keys are read only with CapturedGrass on.
 			bool forGI = false, beam = false;
 			if (GrassKey && !traced && AlbedoCompiledIn() && !GrassWriters.empty()) {
-				forGI = SunGIWantsAlbedo || (TheSettingManager->GetSettingI("Shaders.AmbientOcclusion.RT", "Enabled") != 0 && TheSettingManager->GetSettingI("Shaders.AmbientOcclusion.RT", "GI") != 0);
+				// (2026-11-15 RT master switches: the RT AO + GI keys count as off while RtCore::Gated; SunGI's switch keeps its own fallback rule)
+				forGI = SunGIWantsAlbedo || (!RtCore::Gated() && TheSettingManager->GetSettingI("Shaders.AmbientOcclusion.RT", "Enabled") != 0 && TheSettingManager->GetSettingI("Shaders.AmbientOcclusion.RT", "GI") != 0);
 				if (forGI && GrassOwnBeam) { forGI = false; beam = true; GrassBeamFrames++; }
 			}
 			// UNOFFICIAL 2026-11-13 PTAlbedoCoverage ([Main.Main.RayTracing], a missing key: on; RtPathTrace.comp gAlbedoCover has the capture's
@@ -1401,10 +1492,12 @@ namespace CapturedNormals {
 			bool msaaOwn = false;
 			if (traced && AlbedoMsaa) { SettingManager::Configuration::ConfigNode ck; msaaOwn = !TheSettingManager->Config.FillNode(&ck, "Main.Main.RayTracing", "PTAlbedoCoverage") || ck.BoolValue; }
 			GrassNow = ((traced && !msaaOwn) || forGI) && GrassKey && !GrassWriters.empty();
+			GrassLateWanted = GrassNow;	// (2026-11-14 DeferredFoliage: the late grass's records for these readers only)
+			if (FoliageDeferred && !GrassWriters.empty()) GrassNow = true;	// UNOFFICIAL 2026-11-14 DeferredFoliage (never while traced: DeferredFoliage::BeginFrame)
 			GrassOwnOn = traced && WaterMask::GrassOn && !WaterMask::Failed;	// UNOFFICIAL 2026-11-12 PTGrassOwnPixel (the key: RtPathTrace.cpp's settings read)
 			GrassForGI = GrassNow && !traced;
 			GrassMergeNow = GrassNow && QualityKeyOn("CapturedGrassNormals");
-			LeafNow = traced && LeafKey && !LeafWriters.empty();
+			LeafNow = (traced && LeafKey && !LeafWriters.empty()) || (FoliageDeferred && !LeafWriters.empty());	// (2026-11-14 DeferredFoliage)
 			{	// one line when the grass records' state changes (at most 24 a session: the flashlight can switch it often)
 				const int state = !GrassKey ? 0 : GrassWriters.empty() || !AlbedoCompiledIn() ? 1 : msaaOwn ? 6 : traced ? 2 : forGI ? 3 : beam ? 4 : 5;
 				if (state != GrassState && (state != 0 || GrassState > 0) && GrassStateLogs < 24) {
@@ -1536,7 +1629,7 @@ namespace CapturedNormals {
 		if (AlbedoDrawn && !Failed && Drawn) SkinAlbedoFill(d);	// UNOFFICIAL 2026-10-31 AlbedoBuffer: the skin's albedo from the skin blur's target
 		// UNOFFICIAL 2026-11-12 grass records: the grass drawn after this list writes into the same targets (GrassLateDraw), this scene target only
 		GrassLateTarget = SpanTarget;
-		GrassLateOk = GrassNow && !Failed && SpanTarget && AlbedoDrawn && MaterialDrawn && Drawn;
+		GrassLateOk = GrassLateWanted && !Failed && SpanTarget && AlbedoDrawn && MaterialDrawn && Drawn;	// (2026-11-14: GrassNow before DeferredFoliage; the same value without it)
 		GrassOwnTarget = SpanTarget;	// (PTGrassOwnPixel: the grass drawn after this list without records, this scene target only)
 		GrassOwnOk = GrassOwnOn && !Failed && SpanTarget && AlbedoDrawn && Drawn;
 		if (SpanTarget) { SpanTarget->Release(); SpanTarget = nullptr; }
@@ -1551,21 +1644,27 @@ namespace CapturedNormals {
 			if (MaterialDrawn && MaterialSurface && CheckTarget && SUCCEEDED(d->StretchRect(MaterialSurface, NULL, CheckTarget, NULL, D3DTEXF_POINT)) &&
 				SUCCEEDED(d->GetRenderTargetData(CheckTarget, CheckCopy)) && SUCCEEDED(CheckCopy->LockRect(&r, NULL, D3DLOCK_READONLY))) {
 				int byClass[8] = {}, metalTexels = 0; float thickMax = 0.0f, roughMin = 2.0f, roughMax = -2.0f, metalMax = 0.0f;	// (7: 2026-11-12 CapturedGrass, grass)
+				int v2Specular = 0, v2Normals = 0, v2NoNormal = 0, v2ByModel[8] = {};	// UNOFFICIAL 2026-11-14 GBufferV2 (8 hair, 9 eye, 10 unlit, the rest)
 				for (int y = 0; y < 64; y++) {
 					const D3DXFLOAT16* row = (const D3DXFLOAT16*)((const char*)r.pBits + y * r.Pitch);
 					for (int x = 0; x < 64; x++) {
 						float v[4]; D3DXFloat16To32Array(v, row + x * 4, 4);
-						if (v[3] < 0.5f) continue;
-						byClass[(std::min)((std::max)((int)floorf(v[0] + 0.004f), 0), 7)]++;	// 2026-10-31: r = class + 0.49 x metal
+						if (!MaterialWritten(v)) continue;	// (2026-11-14 GBufferV2: either layout)
+						{ const int cls = MaterialClass(v); if (cls <= 7) byClass[(std::max)(cls, 0)]++; }	// 2026-10-31: r = class + 0.49 x metal
 						const float metal = (std::max)(v[0] - floorf(v[0] + 0.004f), 0.0f) / 0.49f;
 						if (metal > 0.02f) { metalTexels++; metalMax = (std::max)(metalMax, metal); }
-						thickMax = (std::max)(thickMax, v[1]);
+						if (V2Compiled) { if (v[0] >= 15.99f) v2Specular++; if (fabsf(v[1]) <= 1.001f) v2Normals++; else v2NoNormal++; if (MaterialClass(v) > 7) v2ByModel[(std::min)(MaterialClass(v), 15) - 8]++; }
+						else thickMax = (std::max)(thickMax, v[1]);
 						if (v[2] >= 0.0f) { roughMin = (std::min)(roughMin, v[2]); roughMax = (std::max)(roughMax, v[2]); }
 					}
 				}
 				CheckCopy->UnlockRect();
 				Logger::Log("MaterialBuffer: self-check at captured frame %u: texels by class 0:%d object:%d gear:%d cloth:%d land:%d plant:%d skin:%d grass:%d of 4096; largest thickness %.0f; roughness %.2f-%.2f; metal on %d texels (up to %.2f); skin fills so far %u",
 					LiveFrames, byClass[0], byClass[1], byClass[2], byClass[3], byClass[4], byClass[5], byClass[6], byClass[7], thickMax, roughMin, roughMax, metalTexels, metalMax, SkinFills);
+				// UNOFFICIAL 2026-11-14 GBufferV2: the layout's own channels (the thickness above is not in it: 0)
+				if (V2Compiled)
+					Logger::Log("GBufferV2: self-check at captured frame %u: of the written texels %d with a shading normal, %d without (g 4+: skin fill, foliage, blended draws, light passes), %d with the specular bit; hair:%d eye:%d unlit:%d other:%d",
+						LiveFrames, v2Normals, v2NoNormal, v2Specular, v2ByModel[0], v2ByModel[1], v2ByModel[2], v2ByModel[3] + v2ByModel[4] + v2ByModel[5] + v2ByModel[6] + v2ByModel[7]);
 			}
 			if (AlbedoDrawn && AlbedoSurface && CheckTarget) AlbedoCheck(d);	// UNOFFICIAL 2026-10-31 AlbedoBuffer
 		}
@@ -1602,7 +1701,7 @@ namespace CapturedNormals {
 		if (GrassLateBound) GrassLateEnd(d);	// UNOFFICIAL 2026-11-12 (the world's late grass is over)
 		GrassArmed = GrassLateOk = false;
 		GrassOwnOk = false;	// (PTGrassOwnPixel)
-		if (!VmWanted || !Live || InSpan || Failed || Data.x <= 0.0f || AlbedoData.x <= 0.0f || !Texture || !AlbedoSurface || MsaaSurface || AlbedoMsaa) return;
+		if (!(VmWanted || VmDeferred) || !Live || InSpan || Failed || Data.x <= 0.0f || AlbedoData.x <= 0.0f || !Texture || !AlbedoSurface || MsaaSurface || AlbedoMsaa) return;
 		IDirect3DSurface9* rt0 = nullptr;
 		if (FAILED(d->GetRenderTarget(0, &rt0)) || !rt0) return;
 		D3DSURFACE_DESC t = {};
@@ -1657,9 +1756,71 @@ namespace CapturedNormals {
 			if (MaterialTexture && MaterialCompiled) SkinFill(d);	// the hands' material (class 6) from their captured normals' alpha (the world's again: the same values)
 			if (VmSkinDrawn) VmSkinFill(d);
 			VmFrame = frame;
-			if (VmCaptures++ % 3600 == 0)
+			if (VmWanted && VmCaptures++ % 3600 == 0)	// (2026-11-15: the path tracer's line, not DeferredFirstPerson's)
 				Logger::Log("UNOFFICIAL RT path trace: the first-person model's colour, normals and material captured for the path tracer (%u draws this frame, %u bare-skin draws so far)", Writes - VmWritesBefore, VmSkinDraws);
 		}
 		if (SpanTarget) { SpanTarget->Release(); SpanTarget = nullptr; }
+	}
+	// UNOFFICIAL 2026-11-14 GBufferView ([Main.Main.Quality] GBufferView, live, test only; needs GBufferV2): the G-buffer one channel at a time
+	// over the finished picture (after the post chain, EffectChain PostStep_RtSunDebug). 0 off; 1 albedo (linear, shown with a 1 / 2.2 curve);
+	// 2 shading normal (world axes as rgb; where the record has none, the smooth normal at a third of its brightness); 3 smooth normal
+	// (COLOR3); 4 roughness (grey; blue = none); 5 metal (orange over grey); 6 shading model as colours (1 object grey, 2 gear blue, 3 cloth
+	// purple, 4 land brown, 5 plants green, 6 skin pink, 7 grass light green, 8 hair yellow, 9 eye cyan, 10 unlit white); 7 specular bit
+	// (white = lamps with a highlight, grey = diffuse only); 8 fog factor (COLOR1.a: white = no fog); 9 camera distance (log2, white at
+	// 65,536 units); 10 relief: the shading normal lit from a fixed direction (bumps that read inverted next to a neighbour = a frame sign
+	// fault); 11 how far the shading normal bends from the smooth one (black 0, white 90 degrees). Black everywhere: nothing written there.
+	inline IDirect3DPixelShader9* ViewPS = nullptr;  inline bool ViewFailed = false;
+	inline void ViewEnsure(IDirect3DDevice9* d) {	// at record load (ShaderRecord::LoadShader), never in a frame
+		if (ViewPS || ViewFailed || !d || !V2Compiled) return;
+		static const char* kPS =
+			"sampler2D A : register(s0); sampler2D M : register(s1); sampler2D N : register(s2);"
+			"float4 V : register(c0); float4 R : register(c1);"
+			"float3 Oct(float2 e) { float3 n = float3(e, 1.0f - abs(e.x) - abs(e.y)); float t = saturate(-n.z);"
+			"  n.xy += float2(n.x >= 0.0f ? -t : t, n.y >= 0.0f ? -t : t); return normalize(n); }"
+			"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+			"  float4 g = float4(uv * R.xy, 0.0f, 0.0f);"
+			"  float4 a = tex2Dlod(A, g), m = tex2Dlod(M, g), n = tex2Dlod(N, g);"
+			"  float written = m.r > 0.5f ? 1.0f : 0.0f;"
+			"  float c = floor(m.r + 0.01f); float spec = c >= 16.0f ? 1.0f : 0.0f; c -= 16.0f * spec;"
+			"  float hasN = written > 0.5f && abs(m.g) <= 1.001f ? 1.0f : 0.0f;"
+			"  float3 sm = n.a > 0.5f ? Oct(n.rg) : 0.0f;"
+			"  float3 sn = hasN > 0.5f ? Oct(float2(m.g, m.a)) : sm;"
+			"  float metal = saturate(frac(m.r) / 0.49f);"
+			"  float rough = m.b >= 0.0f ? m.b : (m.b < -1.99f && m.b > -3.01f ? -2.0f - m.b : -1.0f);"
+			"  float v = V.x; float3 o = 0.0f;"
+			"  if (v < 1.5f) o = pow(saturate(a.rgb), 1.0f / 2.2f) * (a.a > 0.0f ? 1.0f : 0.0f);"
+			"  else if (v < 2.5f) o = written * (sn * 0.5f + 0.5f) * (hasN > 0.5f ? 1.0f : 0.33f);"
+			"  else if (v < 3.5f) o = n.a > 0.5f ? sm * 0.5f + 0.5f : 0.0f;"
+			"  else if (v < 4.5f) o = written * (rough >= 0.0f ? saturate(rough).xxx : float3(0.1f, 0.2f, 0.9f));"
+			"  else if (v < 5.5f) o = written * lerp(float3(0.25f, 0.25f, 0.25f), float3(1.0f, 0.45f, 0.05f), metal);"
+			"  else if (v < 6.5f) {"
+			"    float3 k = c < 1.5f ? float3(0.6f, 0.6f, 0.6f) : c < 2.5f ? float3(0.2f, 0.4f, 1.0f) : c < 3.5f ? float3(0.6f, 0.2f, 0.8f) :"
+			"      c < 4.5f ? float3(0.55f, 0.35f, 0.15f) : c < 5.5f ? float3(0.1f, 0.6f, 0.1f) : c < 6.5f ? float3(1.0f, 0.55f, 0.65f) :"
+			"      c < 7.5f ? float3(0.5f, 1.0f, 0.4f) : c < 8.5f ? float3(1.0f, 0.9f, 0.1f) : c < 9.5f ? float3(0.1f, 0.9f, 0.9f) : float3(1.0f, 1.0f, 1.0f);"
+			"    o = written * k; }"
+			"  else if (v < 7.5f) o = written * (spec > 0.5f ? 1.0f : 0.35f).xxx;"
+			"  else if (v < 8.5f) o = saturate(a.a).xxx;"
+			"  else if (v < 9.5f) o = n.a > 0.5f ? saturate(log2(1.0f + n.b) / 16.0f).xxx : 0.0f;"
+			"  else if (v < 10.5f) o = written * saturate(dot(sn, normalize(float3(0.5f, 0.4f, 0.75f)))).xxx;"
+			"  else o = written * hasN * saturate(acos(saturate(dot(sn, sm))) / 1.5708f).xxx;"
+			"  return float4(o, 1.0f); }";
+		ViewPS = FullScreenShader(d, kPS, "GBufferView", ViewFailed);
+		if (ViewPS) Logger::Log("UNOFFICIAL GBufferView: the G-buffer viewer loaded ([Main.Main.Quality] GBufferView 1-11, test only)");
+	}
+	// After the post chain (EffectChain PostStep_RtSunDebug): over the whole target while [Main.Main.Quality] GBufferView is 1-11.
+	inline void ViewRender(IDirect3DDevice9* d, IDirect3DSurface9* target) {
+		if (!ViewPS || !target || !Texture || Data.x <= 0.0f) return;
+		const int view = TheSettingManager->GetSettingI("Main.Main.Quality", "GBufferView");
+		if (view <= 0) return;
+		auto found = TheShaderManager->ConstantsTable.find("TESR_RenderScale");
+		const D3DXVECTOR4* scale = found == TheShaderManager->ConstantsTable.end() ? nullptr : found->second;
+		const float c[2][4] = { { (float)view, 0.0f, 0.0f, 0.0f }, { scale ? scale->x : 1.0f, scale ? scale->y : 1.0f, 0.0f, 0.0f } };
+		float saved[2][4] = {};
+		d->GetPixelShaderConstantF(0, &saved[0][0], 2);
+		d->SetPixelShaderConstantF(0, &c[0][0], 2);
+		IDirect3DBaseTexture9* albedo = AlbedoTexture && AlbedoData.x > 0.5f ? (IDirect3DBaseTexture9*)AlbedoTexture : (IDirect3DBaseTexture9*)Texture;
+		IDirect3DBaseTexture9* material = MaterialTexture && MaterialData.x > 0.5f ? (IDirect3DBaseTexture9*)MaterialTexture : (IDirect3DBaseTexture9*)Texture;
+		FullScreenPass(d, target, ViewPS, albedo, false, D3DBLEND_ONE, D3DBLEND_ZERO, material, Texture);
+		d->SetPixelShaderConstantF(0, &saved[0][0], 2);
 	}
 }

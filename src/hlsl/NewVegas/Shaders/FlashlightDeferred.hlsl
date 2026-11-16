@@ -22,6 +22,16 @@
 #include "includes/Object.hlsl"
 #include "includes/LampFalloff.hlsl"
 #include "includes/Shadow.hlsl"
+// UNOFFICIAL 2026-11-14 DeferredSun: the lighting-free records' code in COLOR1.a decoded to the keep (as DeferredLamps.hlsl DL_KEEP_OF)
+#if defined(FD_LIGHT_FREE) && FD_LIGHT_FREE
+    #include "includes/DeferredPixel.hlsl"
+    #define FL_KEEP_OF(a) FDAddedLightKeep(a)
+#elif defined(CAPTURED_NORMALS_ON) && CAPTURED_NORMALS_ON >= 4
+    #include "includes/DeferredPixel.hlsl"
+    #define FL_KEEP_OF(a) FDAddedLightKeep(a)	// GBufferV2: 1 + (1 - fog), the "sun kept" records' 5 + (1 - fog) (2026-11-14), a forward record's 1
+#else
+    #define FL_KEEP_OF(a) (a)
+#endif
 
 // The pass's own constants (c0-c19: nothing the includes declare lives there; FlashlightDeferred::Apply).
 float4 FL_Depth    : register(c0);	// x, y the projection's _33, _43 (depth = x + y / view z), z the share and w the units the surface is pulled toward the camera
@@ -87,12 +97,21 @@ float4 main(PS_IN IN, out float depth : DEPTH) : COLOR0 {
     // a jagged edge): not for the land (MaterialBuffer class 4), which writes 1 there whatever its fog, but in terrain blending's Smooth fade
     // is drawn alpha-blended, so the albedo buffer's alpha came out 0 on stretches of it while its colour and normal were right (flashlight
     // DebugView checks): the beam skipped that land and lit only the rest. The land takes the full light.
+#if CAPTURED_NORMALS_ON >= 4
+    // UNOFFICIAL 2026-11-14 GBufferV2 (Includes/CapturedNormals.hlsl): the land is 4 + 16 (its lamps have a highlight), and a deferred
+    // record's albedo alpha is 1 + (1 - fog) (forward records 1, as before)
+    const float landClass = floor(tex2Dlod(FL_Material, uv4).r + 0.01f) - 16.0f;
+    const float keepStored = tex2Dlod(FL_Albedo, uv4).a;
+    const float keep = abs(landClass - 4.0f) < 0.5f ? 1.0f : FL_KEEP_OF(keepStored);
+#else
     const float landClass = floor(tex2Dlod(FL_Material, uv4).r + 0.01f);
-    const float keep = abs(landClass - 4.0f) < 0.5f ? 1.0f : tex2Dlod(FL_Albedo, uv4).a;
+    const float keep = abs(landClass - 4.0f) < 0.5f ? 1.0f : FL_KEEP_OF(tex2Dlod(FL_Albedo, uv4).a);
+#endif
     clip(keep - 1.0e-4f);
 
-    // the pixel's camera-relative position along its view ray (DeferredLamps.hlsl DLPixel)
-    const float2 local = (IN.vpos - FL_View.zw + 0.5f) * FL_View.xy;
+    // the pixel's camera-relative position along its view ray (DeferredLamps.hlsl DLPixel). (2026-11-15 fd-lightpass) at the pixel's own
+    // centre, without + 0.5 on VPOS (Includes/DeferredDepth.hlsl DDRay: the D3D9 pixel at VPOS i is at ndc 2 (i - X) / W - 1; FD-SUN-FSR-RESULTS.md)
+    const float2 local = (IN.vpos - FL_View.zw) * FL_View.xy;
     const float3 ray = normalize(FL_Fwd.xyz + FL_Right.xyz * ((local.x * 2.0f - 1.0f) * FL_Right.w) + FL_Up.xyz * ((1.0f - local.y * 2.0f) * FL_Up.w));
     const float3 position = ray * stored.b;
     // 2026-11-04 (user: hair see-through in the beam): the G-buffer holds only what its writers drew; a draw that does not write it (hair,
@@ -141,7 +160,12 @@ float4 main(PS_IN IN, out float depth : DEPTH) : COLOR0 {
     // (2026-11-12 ptbump) b in -3 .. -2: a record coded "the game draws no highlight on this mesh" for the path tracer (Includes/
     // CapturedNormals.hlsl CapturedNoHighlight): the roughness this pass always lit it with is -2 - b. The land's b (-8 .. -6 with its
     // bump recorded, else -1): no roughness, as before.
+#if defined(FD_FOLIAGE) && FD_FOLIAGE
+    // UNOFFICIAL 2026-11-14 foliage (Includes/FoliageDeferred.hlsl): a leaf / grass deferred record's b is 2 + its sun weight: fully rough here
+    const float roughness = m.b > 1.5f ? 1.0f : m.b >= 0.0f ? m.b : (m.b < -1.99f && m.b > -3.01f) ? -2.0f - m.b : 0.7f;
+#else
     const float roughness = m.b >= 0.0f ? m.b : (m.b < -1.99f && m.b > -3.01f) ? -2.0f - m.b : 0.7f;
+#endif
     const float metal = saturate((m.r - floor(m.r)) / 0.49f);
     SetDiffuseEnergyKeep(N, -ray, roughness);
     const float3 albedo = tex2Dlod(FL_Albedo, uv4).rgb;

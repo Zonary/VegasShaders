@@ -10,6 +10,10 @@
 #include "PointShadowForward.h"
 #include "ManyLamps.h"	// UNOFFICIAL 2026-10-27 ManyLampsOnePass
 #include "DeferredLamps.h"	// UNOFFICIAL 2026-10-31 DeferredLamps
+#include "DeferredRenderer.h"	// UNOFFICIAL 2026-11-14 full deferred renderer phase 2
+#include "DeferredSkin.h"	// UNOFFICIAL 2026-11-15 full deferred renderer phase 4 skin ([Main.Main.Quality] DeferredSkin)
+#include "DeferredTransparents.h"	// UNOFFICIAL 2026-11-15 forward+ for the blended list
+#include "DeferredDistant.h"	// UNOFFICIAL 2026-11-14 DeferredDistant (DISTANT_GBUFFER for the far land)
 #include "LandLamps.h"	// UNOFFICIAL 2026-10-30 LandAllLamps
 #include "ShaderPrecompile.h"
 #include "TestTools.h"	// NVR_TEST_TOOLS (FailShaders)
@@ -23,6 +27,7 @@
 #include "ForwardCloudShadows.h"	// UNOFFICIAL 2026-11-04 ForwardCloudShadows (FORWARD_CLOUD_SHADOWS)
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback (a family too long for the driver goes without optional features)
 #include "RtSunShadows.h"	// UNOFFICIAL 2026-11-13 RT sun shadows' ForwardLookup (RT_SUN_FORWARD)
+#include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the forward records' SUN_CROSSFADE)
 #include "GameShaderPairs.h"	// UNOFFICIAL 2026-11-13 GameShaderPairs (a freed shader leaves its list of the game's shaders)
 // Small helpers for the shader loader: a template's define list is searched by name, and a held interface
 // is released and cleared in one step.
@@ -123,6 +128,15 @@ bool ShaderProgram::CheckPreprocessResult(const char* CachedPath, ID3DXBuffer* S
 // renamed): nothing changes. Called from the compile worker threads too: each shader has its own files.
 static std::atomic<long> gShippedSeeds{ 0 };
 long ShaderProgram::ShippedSeeds() { return gShippedSeeds.load(); }
+
+// UNOFFICIAL 2026-11-16: a cache sub-folder two levels deep (Cache\Deferred\Depth\, Cache\Deferred\Fit3\Past16Lit\) was never made,
+// because CreateDirectoryA makes only the last level: the deferred passes compiled again at every start and their shipped cache
+// entries could not be copied in. Every level of the path is made now (existing ones are left as they are).
+void ShaderProgram::CreateFolders(const std::string& Path) {
+	for (size_t at = Path.find_first_of("\\/"); at != std::string::npos; at = Path.find_first_of("\\/", at + 1))
+		if (at > 0 && Path[at - 1] != ':') CreateDirectoryA(Path.substr(0, at).c_str(), NULL);
+	CreateDirectoryA(Path.c_str(), NULL);
+}
 bool ShaderProgram::SeedFromShipped(const char* PreprocessedPath, const char* CompiledPath, const std::string& Text) {
 	auto shipped = [](const char* path) {
 		std::string s = path;
@@ -379,7 +393,11 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// smooth vertex normal to COLOR3; compiled in only when a reader's switch is on at startup, so that otherwise they are exactly as before
 	// (defined only then: the define list, and so the shader cache's keys, stay as they were with it off).
 	// UNOFFICIAL 2026-10-29: 2 = with MaterialBuffer; 2026-10-31: 3 = with AlbedoBuffer too (COLOR1; docs/next/DEFERRED-RENDERING-PLAN.md rung A)
-	if (CapturedNormals::CompiledIn()) AppendDefine("CAPTURED_NORMALS_ON", CapturedNormals::AlbedoCompiledIn() ? "3" : CapturedNormals::MaterialCompiledIn() ? "2" : "1");
+	// UNOFFICIAL 2026-11-14: 4 = GBufferV2 too (the MaterialBuffer's layout v2: core/CapturedNormals.h V2CompiledIn; a new value, no new define)
+	if (CapturedNormals::CompiledIn()) AppendDefine("CAPTURED_NORMALS_ON", CapturedNormals::V2CompiledIn() ? "4" : CapturedNormals::AlbedoCompiledIn() ? "3" : CapturedNormals::MaterialCompiledIn() ? "2" : "1");
+	// UNOFFICIAL 2026-11-14 DeferredDistant (core/DeferredDistant.h, TerrainLODTemplate.hlsl): the far land writes the G-buffer. Defined for that
+	// template only and only with the switch on at startup, so that otherwise every define list (and the shader cache's keys) is as before.
+	if (Template.Name && !strcmp(Template.Name, "TerrainLODTemplate") && DeferredDistant::CompiledIn()) AppendDefine("DISTANT_GBUFFER", "1");
 	// UNOFFICIAL 2026-10-28 [Main.Main.Quality] CapturedNormals also gives the land and parallax templates their smooth vertex normal for
 	// the sun lookup and the sky ambient (TerrainTemplate / ParallaxTemplate CAPTURED_NORMALS_FORWARD), as SmoothObjectNormals did for objects.
 	if (CapturedNormals::MergeWanted()) AppendDefine("CAPTURED_NORMALS_FORWARD", "1");
@@ -393,6 +411,9 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 		const bool bumpKey = !TheSettingManager->Config.FillNode(&bumpNode, "Main.Main.Quality", "CapturedBumpNormals") || bumpNode.BoolValue;
 		CapturedNormals::PtCodesCompiled = CapturedNormals::AlbedoCompiledIn() && TheRenderManager && !strncmp(TheRenderManager->D3D9RuntimeDescription(), "DXVK", 4);
 		CapturedNormals::BumpCompiled = CapturedNormals::PtCodesCompiled && bumpKey;
+		// UNOFFICIAL 2026-11-14 GBufferV2: the land's bump code (2) sits in g / b, where v2 has the shading normal (every family's, the land's
+		// included): with v2 only the no-highlight code (1)
+		if (CapturedNormals::V2CompiledIn()) CapturedNormals::BumpCompiled = false;
 		if (CapturedNormals::PtCodesCompiled) AppendDefine("CAPTURED_PT", CapturedNormals::BumpCompiled ? "2" : "1");
 	}
 #if NVR_TEST_TOOLS
@@ -507,8 +528,9 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// startup (defined only then: the define list, and so the shader cache's keys, stay as they were with it off).
 	if (AlphaHash::CompiledIn()) AppendDefine("ALPHA_HASH_ON", "1");
 
-	AppendDefine("SUN_CROSSFADE", TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.SunSmoothing", "CrossFade") &&
-		TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.Main", "ForwardShadows") ? "1" : "0");
+	// (2026-11-15 fd-smoothsun) not while the deferred sun pass carries the fade itself (core/SunFadeDeferred.h): the forward records then
+	// keep their constant and sampler room (Terrain Blending, Wetness Effects, RT sun shadows' ForwardLookup) and take each step as it comes
+	AppendDefine("SUN_CROSSFADE", SunFadeDeferred::ForwardCrossFade() ? "1" : "0");
 
 	// Which skylighting model is compiled in. 0 = spherical harmonic irradiance, 1 = the older
 	// single directional sample. Compile time rather than a runtime branch: ps_3_0 flattens
@@ -600,7 +622,7 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 	if (SubPath) sourceDir += SubPath;
 	if (CacheSubPath) {
 		cacheDir += CacheSubPath;
-		CreateDirectoryA(cacheDir.c_str(), NULL);	// nothing else writes there
+		CreateFolders(cacheDir);	// nothing else writes there (every level: Deferred\Depth\ is two)
 	}
 	else if (SubPath) cacheDir += SubPath;
 
@@ -771,8 +793,9 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 						if (isOne(lastDefinition(Template, "LINEAR_SCENE_ON"))) LinearScene::NoteCapable(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
 						// UNOFFICIAL 2026-10-28 CapturedNormals (core/CapturedNormals.h): the pixel shaders that write the normal target (COLOR3).
 						const char* capturedOn = lastDefinition(Template, "CAPTURED_NORMALS_ON");
-						const bool writes = capturedOn && (!strcmp(capturedOn, "1") || !strcmp(capturedOn, "2") || !strcmp(capturedOn, "3"));	// (3: 2026-10-31 AlbedoBuffer)
+						const bool writes = capturedOn && (!strcmp(capturedOn, "1") || !strcmp(capturedOn, "2") || !strcmp(capturedOn, "3") || !strcmp(capturedOn, "4"));	// (3: 2026-10-31 AlbedoBuffer; 4: 2026-11-14 GBufferV2)
 						if (writes) CapturedNormals::NoteWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
+						if (writes) CapturedNormals::ViewEnsure(TheRenderManager->device);	// UNOFFICIAL 2026-11-14 GBufferView: compiled here, at record load (GBufferV2 only)
 						// UNOFFICIAL 2026-10-29 MaterialBuffer: Object / Parallax / Terrain write it on COLOR2 (the skin templates' COLOR2 is the skin blur's)
 						if (writes && Template.Name && (!strcmp(Template.Name, "ObjectTemplate") || !strcmp(Template.Name, "ParallaxTemplate") || !strcmp(Template.Name, "TerrainTemplate"))) {
 							CapturedNormals::NoteMaterialWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
@@ -784,6 +807,12 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 								if (!specOnly) CapturedNormals::NoteAlbedoWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle, lightOnly);
 							}
 						}
+						// UNOFFICIAL 2026-11-15 DeferredSkin (core/DeferredSkin.h): the skin's deferred record writes the whole G-buffer v2 (SkinTemplate.hlsl
+						// SKIN_DEFERRED): the draw hook binds the material and albedo targets for it (the skin blur's are not bound for it)
+						if (writes && !strcmp(Template.Name, "SkinTemplate") && hasDefine(Template, "LAMPS_DEFERRED") && CapturedNormals::AlbedoCompiledIn()) {
+							CapturedNormals::NoteMaterialWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
+							CapturedNormals::NoteAlbedoWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle, false);
+						}
 						// UNOFFICIAL 2026-11-12 CapturedCoverage (core/CapturedNormals.h CodeWriters): the records whose alpha is a code (skinned
 						// gear: the normals' 2; the DeferredLamps records: the material's and the albedo's) take no part in it
 						if (writes && (hasDefine(Template, "SKIN") || hasDefine(Template, "LAMPS_DEFERRED")))
@@ -793,12 +822,24 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 							if (hasDefine(Template, "DIFFUSE")) CapturedNormals::NoteContrastWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
 						}
 					}
+					// UNOFFICIAL 2026-11-14 DeferredDistant (core/DeferredDistant.h): the far land's pixel shaders compiled with DISTANT_GBUFFER write all
+					// three targets as the near land does (TerrainLODTemplate.hlsl); the lighting-free record's alpha is a code (CapturedCoverage: no part)
+					if (pixelProfile && Template.Name && !strcmp(Template.Name, "TerrainLODTemplate") && isOne(lastDefinition(Template, "DISTANT_GBUFFER"))) {
+						const char* capturedOn = lastDefinition(Template, "CAPTURED_NORMALS_ON");
+						if (capturedOn && strcmp(capturedOn, "0")) {
+							IDirect3DPixelShader9* handle = static_cast<ShaderRecordPixel*>(record)->ShaderHandle;
+							CapturedNormals::NoteWriter(handle);
+							if (strcmp(capturedOn, "1")) CapturedNormals::NoteMaterialWriter(handle);
+							if (CapturedNormals::AlbedoCompiledIn()) CapturedNormals::NoteAlbedoWriter(handle, false);
+							if (hasDefine(Template, "LAMPS_DEFERRED")) CapturedNormals::NoteCodeWriter(handle);
+						}
+					}
 					// UNOFFICIAL 2026-11-12 foliage records (core/CapturedNormals.h GrassWriters / LeafWriters; audit items 1 and 9): the grass and
 					// SpeedTree leaf pixel shaders (no templates) write the three records when compiled with the AlbedoBuffer level
 					// (Includes/CapturedNormals.hlsl CAPTURED_FOLIAGE). The draw hook binds the targets for them; the keys are live there.
 					if (pixelProfile && !Template.Name && CapturedNormals::AlbedoCompiledIn()) {
 						const char* capturedOn = lastDefinition(Template, "CAPTURED_NORMALS_ON");
-						if (capturedOn && !strcmp(capturedOn, "3")) {
+						if (capturedOn && (!strcmp(capturedOn, "3") || !strcmp(capturedOn, "4"))) {	// (4: 2026-11-14 GBufferV2)
 							if (!_stricmp(Name, "GRASS23x000.pso") || !_stricmp(Name, "GRASS23x000TMS.pso"))
 								CapturedNormals::NoteGrassWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
 							else if (!_stricmp(Name, "STLEAF2000.pso") || !_stricmp(Name, "STLEAF2000TMS.pso") || !_stricmp(Name, "STLEAF2001.pso") || !_stricmp(Name, "STLEAF2001TMS.pso"))
@@ -1258,6 +1299,32 @@ void NiD3DPixelShaderEx::SetupShader(IDirect3DPixelShader9* BoundHandle) {
 			if (BoundHandle != ShaderHandle) found->second->SetCT();
 			return;
 		}
+	}
+	// UNOFFICIAL 2026-11-14 full deferred renderer (core/DeferredRenderer.h): every lit family's deferred record while the main list's G-buffer is
+	// bound (indoors; mode 2 outdoors too once DeferredSun is ready). Off: nothing.
+	if (ShaderRecordPixel* deferred = DeferredRenderer::Live ? DeferredRenderer::Choose(this, Player->GetWorldSpace() != nullptr) : nullptr) {
+		ShaderHandle = deferred->ShaderHandle;
+		if (BoundHandle != ShaderHandle) deferred->SetCT();
+		return;
+	}
+	// UNOFFICIAL 2026-11-15 phase 4 skin (core/DeferredSkin.h): the skin's deferred record inside the G-buffer span. Off: nothing.
+	if (ShaderRecordPixel* skin = DeferredSkin::Records.empty() ? nullptr : DeferredSkin::Choose(this, Player->GetWorldSpace() != nullptr)) {
+		ShaderHandle = skin->ShaderHandle;
+		if (BoundHandle != ShaderHandle) skin->SetCT();
+		return;
+	}
+	// UNOFFICIAL 2026-11-14 phase 3 foliage (core/DeferredFoliage.h): the leaf / grass deferred record inside the G-buffer span. Off: nothing.
+	if (ShaderRecordPixel* foliage = DeferredFoliage::Live ? DeferredFoliage::Choose(this, Name) : nullptr) {
+		ShaderHandle = foliage->ShaderHandle;
+		if (BoundHandle != ShaderHandle) foliage->SetCT();
+		return;
+	}
+	// UNOFFICIAL 2026-11-15 DeferredTransparents (core/DeferredTransparents.h): in the blended list indoors, the forward+ record (every lamp of
+	// the pixel's froxel from the frame's table) while this frame's table and lists are there. Off: nothing.
+	if (ShaderRecordPixel* forwardPlus = DeferredTransparents::Live ? DeferredTransparents::Choose(this) : nullptr) {
+		ShaderHandle = forwardPlus->ShaderHandle;
+		if (BoundHandle != ShaderHandle) forwardPlus->SetCT();
+		return;
 	}
 	// UNOFFICIAL 2026-10-31 DeferredLamps: indoors, the many-lamp shader's deferred record while the main list's G-buffer is bound
 	if (!Player->GetWorldSpace()) {

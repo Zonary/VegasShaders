@@ -5,6 +5,7 @@
 #include "SkyCoverage.h"	// UNOFFICIAL 2026-11-04
 #include "BackDepth.h"	// UNOFFICIAL 2026-10-31 BackDepth
 #include "RenderRect.h"	// UNOFFICIAL 2026-11-12 (memleak) idle targets: ForgetSurface
+#include "DeferredDepth.h"	// UNOFFICIAL 2026-11-14 DeferredDepth
 
 namespace {
 	// A depth-stencil texture the shaders can sample (the INTZ format), screen sized.
@@ -63,6 +64,24 @@ void TextureManager::Initialize() {
 		else {
 			mgr->TerrainBlendDepthTexture = nullptr;
 			Logger::Log("[ERROR] Terrain blending: could not create its depth texture; blending (and displacement's ObjectBlend) stays off");
+		}
+	}
+
+	// UNOFFICIAL 2026-11-14 DeferredDepth (core/DeferredDepth.h; [Main.Main.Quality] DeferredDepth / DeferredDepthProbe at startup): the world's
+	// depth as the main opaque list leaves it, for the deferred light passes. Not made (and never copied) with both off.
+	if (DeferredDepth::ReadStartup() > 0) {
+		if (SUCCEEDED(MakeReadableDepth(dev, screenW, screenH, &DeferredDepth::Texture))) {
+			DeferredDepth::Width = screenW; DeferredDepth::Height = screenH;
+			mgr->RegisterTexture("TESR_DeferredDepth", (IDirect3DBaseTexture9**)&DeferredDepth::Texture);
+			NvAPI_D3D9_RegisterResource(DeferredDepth::Texture);
+			// mode 2: the view z made from it (R32F), which D3D9 passes read as any float texture
+			if (DeferredDepth::Mode >= 2) mgr->InitTexture("TESR_DeferredDepthLinear", &DeferredDepth::LinearTexture, &DeferredDepth::LinearSurface, screenW, screenH, D3DFMT_R32F);
+			Logger::Log("UNOFFICIAL DeferredDepth: mode %d, the depth copy for the deferred passes is on (%ux%u INTZ, TESR_DeferredDepth)%s%s", DeferredDepth::Mode, screenW, screenH,
+				DeferredDepth::LinearSurface ? " + its view z (R32F, TESR_DeferredDepthLinear)" : "", DeferredDepth::ProbeWanted ? "; the probe is on (test only)" : "");
+		}
+		else {
+			DeferredDepth::Texture = nullptr;
+			Logger::Log("[ERROR] UNOFFICIAL DeferredDepth: could not create its INTZ depth texture: no depth copy");
 		}
 	}
 

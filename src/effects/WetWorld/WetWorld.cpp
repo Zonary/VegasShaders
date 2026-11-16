@@ -288,7 +288,9 @@ bool WetWorldEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	// UNOFFICIAL 2026-11-12 PuddlesLandOnly: the D3D9 pass tests TESR_MaterialBufferData itself; here the mode (y, without
 	// WeaponRainHandOff's 4) is sent as 0 while the buffer holds nothing this frame, and the depth texture stands in for it (not read).
 	IDirect3DBaseTexture9* material = CapturedNormals::MaterialTexture;
-	if (!material || CapturedNormals::MaterialData.x < 0.5f) {
+	// UNOFFICIAL 2026-11-14 GBufferV2 (core/CapturedNormals.h): the Vulkan wet map reads the old layout only (Compute/WetWorldMap.frag; its .spv
+	// was left as it is): with v2 it gets "no buffer" too and keeps the old guess. The D3D9 pass reads v2 itself (WetWorld.fx.hlsl GBUFFER_V2).
+	if (!material || CapturedNormals::MaterialData.x < 0.5f || CapturedNormals::V2Compiled) {
 		material = depth;
 		uniforms.wetWorldLook.y = uniforms.wetWorldLook.y >= 3.5f ? 4.0f : 0.0f;
 	}

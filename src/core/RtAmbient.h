@@ -362,12 +362,13 @@ namespace RtAmbient {
 	inline bool GISunDuskFadeOn() { return Current.GISunDuskFade >= 0.0f ? Current.GISunDuskFade > 0.5f : SunGIOutdoors(); }
 	inline bool Ready() {
 		static int reported = -1;
-		const int state = !Current.Enabled ? 0 : !PassesWanted() ? 1 : !CoreReady() ? 2 : 3;
+		const int state = !Current.Enabled ? 0 : !PassesWanted() ? 1 : RtCore::Gated() ? 5 : !CoreReady() ? 2 : 3;	// (2026-11-15: 5 the RT master switches)
 		if (state != reported && (state != 0 || reported > 0)) {
 			const char* text[] = { "off", "on but the Vegas Shaders DXVK passes are off ([Main.Main.Performance] NvrDxvkPasses): Vegas Shaders' AO runs",
 				"on but the RT core is not running (see its log line: no NvrRtHelper, no fork 0028, or a GPU without ray tracing): Vegas Shaders' AO runs",
 				"running (ray-traced occlusion in place of the screen estimate)",
-				"on but not at RenderScale below 1 (FSR / DLSS with LowResEffects: frames drawn small, not supported yet): Vegas Shaders' AO runs" };
+				"on but not at RenderScale below 1 (FSR / DLSS with LowResEffects: frames drawn small, not supported yet): Vegas Shaders' AO runs",
+				"on but ray tracing is off in this kind of space ([Main.Main.RayTracing] RTInteriors / RTExteriors): Vegas Shaders' AO runs" };
 			Logger::Log("UNOFFICIAL RT AO: %s.", text[state]);
 		}
 		reported = state;

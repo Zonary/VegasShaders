@@ -55,10 +55,15 @@ namespace RtLampShadows {
 	// was Live alone. Now Enabled is also read every frame wherever Live is: off = nothing submitted, Wants false, no trace before the
 	// world, the cube maps drawn and read again (exactly Live false, plus the capsule pass may take the buffer); on again = traced again
 	// from the next frame. Coming on when it was off at startup still needs the restart (the shaders).
-	inline bool EnabledNow() { return TheSettingManager->GetSettingI(kSection, "Enabled") != 0; }
+	// (2026-11-15 RT master switches) and not while RtCore::Gated (RTInteriors / RTExteriors off for this space): exactly Enabled switched off,
+	// indoors and outdoors (Exteriors) alike, without touching the setting
+	inline bool EnabledNow() { return TheSettingManager->GetSettingI(kSection, "Enabled") != 0 && !RtCore::Gated(); }
 	inline bool LiveNow() { return EnabledNow() && TheSettingManager->GetSettingI(kSection, "Live") != 0; }
 
 	inline bool CompiledIn = false;			// POINT_SHADOW_RT in the object shaders (fixed at startup)
+	// UNOFFICIAL 2026-11-15 (docs/next/FD-NATIVEFIX.md): some lit shader's Interior record loaded only without the read (ShaderManager::
+	// LoadShader's last level, POINT_SHADOW_RT 0): its objects see people's lamp shadows only in the maps, so CapsuleShadows::DropActors is held off
+	inline bool ReadDropped = false;
 	// UNOFFICIAL 2026-10-31 CapsuleShadows (core/CapsuleShadows.h): a second writer of the same buffer, a D3D9 pass (people's capsules and
 	// contact shadows), no RT needed. RtEnabled: the RT section on at startup with the RT core's interface (the RT path may trace);
 	// ScreenCompiledIn: [Shaders.ShadowsInteriors.Capsules] Enabled at startup. ScreenSourceFrame: this frame's buffer is the pass's
@@ -408,6 +413,9 @@ namespace RtLampShadows {
 		ExtraCount = 0;
 		ManyNoting = false;
 		ScreenSourceFrame = false;
+		// UNOFFICIAL 2026-11-15 RT master switches: a result traced before the gate shut is never reprojected after it opens again (another
+		// place, minutes ago): the first frames after use the cube maps until this frame's (SameFrame) or the next trace
+		if (RtCore::Gated()) Traced.valid = false;
 		if (!CompiledIn) return;
 		MaxLamps = (std::min)((std::max)(TheSettingManager->GetSettingI(kSection, "MaxLamps"), 0), TableSlots);
 		const bool live = LiveNow();	// (2026-11-11) Enabled and Live, both read now

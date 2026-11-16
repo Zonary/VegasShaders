@@ -55,9 +55,37 @@ struct PS_OUTPUT {
     #define LeafRecords(OUT, leaf, albedo)
 #endif
 
+// UNOFFICIAL 2026-11-14 full deferred renderer, phase 3: the leaf's DEFERRED record (FOLIAGE_DEFERRED 1, made by core/DeferredFoliage.h only
+// with [Main.Main.Quality] DeferredFoliage and GBufferV2 at startup; Includes/FoliageDeferred.hlsl has the model). No sun shadow lookup here:
+// COLOR0 is the leaf without its sun, COLOR2.b carries the sun's unshadowed light for DeferredSun. Call after LeafRecords. Without the
+// define: nothing (the macro is empty and the leaf shaders compile as before).
+#if defined(FOLIAGE_DEFERRED) && FOLIAGE_DEFERRED && defined(CAPTURED_FOLIAGE) && CAPTURED_NORMALS_ON >= 4
+    #define NVR_FOLIAGE_DEFERRED 1
+    #ifdef __INTELLISENSE__
+        #include "FoliageDeferred.hlsl"
+    #else
+        #include "includes/FoliageDeferred.hlsl"
+    #endif
+    void LeafDeferredApply(inout PS_OUTPUT OUT, PS_INPUT leaf, float4 albedo, float3 fogColour, float fogAmount) {
+        const float3 a = LinColor(albedo.rgb);
+        const float3 rest = LinColor(leaf.lighting.rgb - leaf.sun), sun = LinColor(leaf.sun);	// as LeafLighting splits them (identity without linear lighting)
+        const float keepQ = FDFoliageLeafKeepQ(1.0f - fogAmount);	// (2026-11-14 fog: the keep the code holds, so DeferredSun's FDAddFogged is exact)
+        const float3 without = lerp(LinEncode(a * rest), fogColour, 1.0f - keepQ);
+        const float3 with = lerp(LinEncode(a * (rest + sun)), fogColour, fogAmount);
+        const bool ours = SHADOW_VS_PRESENT(leaf.shadowWorldPos.w);	// Vegas Shaders' leaf VS (the sun handed over apart); else no record was written
+        OUT.color.rgb = ours ? without : with;
+        // the sun's light, unshadowed and unfogged, per unit of A x the sun's hue: its luma (the leaf's light IS the sun's colour x one number)
+        OUT.capturedPad2.b = ours ? FoliageSunCode(FoliageLuma(sun)) : OUT.capturedPad2.b;
+        OUT.capturedPad2.g = ours ? FDFoliageLeafCode(keepQ) : OUT.capturedPad2.g;
+    }
+    #define LeafDeferred(OUT, leaf, albedo, fogColour, fogAmount) LeafDeferredApply(OUT, leaf, albedo, fogColour, fogAmount);
+#else
+    #define LeafDeferred(OUT, leaf, albedo, fogColour, fogAmount)
+#endif
+
 // Call from main's top level only (the shadow lookup takes gradients, which dynamic branches would forbid).
 float3 LeafLighting(PS_INPUT leaf) {
-#if FORWARD_SHADOWS	// NVR sun shadows in the object pass
+#if FORWARD_SHADOWS && !defined(NVR_FOLIAGE_DEFERRED)	// NVR sun shadows in the object pass (2026-11-14: not in the deferred record: DeferredSun's)
     float3 faceN = GetShadowGeometricNormal(leaf.shadowWorldPos.xyz);
     float sunVis = SHADOW_VS_PRESENT(leaf.shadowWorldPos.w) ? GetSunShadow(leaf.shadowWorldPos.xyz, faceN) : 1.0f;
     #ifdef LINEAR_LIGHTING

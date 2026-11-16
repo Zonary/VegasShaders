@@ -57,6 +57,8 @@ public:
 	// read-only copy (...\CacheShipped\) when that one was made from exactly this source. True = the cache entry is now fresh.
 	static bool				SeedFromShipped(const char* PreprocessedPath, const char* CompiledPath, const std::string& Text);
 	static long				ShippedSeeds();
+	// UNOFFICIAL 2026-11-16: makes every missing level of a folder path (CreateDirectoryA makes only the last one).
+	static void				CreateFolders(const std::string& Path);
 
 	// Drops the cached IDirect3DTexture9* for a named sampler so that SetCT re-resolves it
 	// on the next draw. MUST be called on every consumer of a texture that is released and

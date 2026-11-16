@@ -21,6 +21,7 @@
 #include <d3dx9.h>
 #include "LinearSceneShaders.h"
 #include "DrawState.h"	// UNOFFICIAL 2026-10-29 SharedDrawState: CapturedNormals' tracked device state
+#include "MergeCopies.h"	// UNOFFICIAL 2026-11-14 MergeCopies (test only): its merged draw / checks in the innermost draw hook
 
 namespace LinearScene {
 
@@ -144,7 +145,12 @@ namespace LinearScene {
 		d->SetPixelShaderConstantF(191, c, 1);
 	}
 
+	// UNOFFICIAL 2026-11-15 (DeferredSun, batch 6) a one-draw watcher: called at the next draw (this hook sees every DrawPrimitive /
+	// DrawIndexedPrimitive while hooked) with that draw's constants on the device; DeferredSun arms it at a land record's bind. Null: nothing.
+	inline void (*DrawWatch)(IDirect3DDevice9*) = nullptr;
+
 	inline void BeforeDraw(IDirect3DDevice9* d) {
+		if (DrawWatch) DrawWatch(d);
 		if (!Live || !InSpan) return;
 		const bool shared = SharedWanted && SharedDrawState::Valid;
 		if (shared) SharedDraws++;
@@ -173,6 +179,8 @@ namespace LinearScene {
 
 	inline HRESULT STDMETHODCALLTYPE DIPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, INT b, UINT mi, UINT nv, UINT s, UINT pc) {
 		BeforeDraw(d);
+		// (UNOFFICIAL 2026-11-14 MergeCopies, core/MergeCopies.h: when this is the innermost of NVR's hooks, after the conversion above)
+		if (MergeCopies::DrawAction && MergeCopies::Inner((void*)NextDIP)) return MergeCopies::AtDraw(d, NextDIP, t, b, mi, nv, s, pc);
 		return NextDIP(d, t, b, mi, nv, s, pc);
 	}
 	inline HRESULT STDMETHODCALLTYPE DPHook(IDirect3DDevice9* d, D3DPRIMITIVETYPE t, UINT s, UINT pc) {
@@ -187,6 +195,7 @@ namespace LinearScene {
 		if (!VirtualProtect(&table[81], 2 * sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) return;
 		NextDP = (DPFn)table[81];  table[81] = (void*)&DPHook;
 		NextDIP = (DIPFn)table[82]; table[82] = (void*)&DIPHook;
+		MergeCopies::OurHooks[1] = (void*)&DIPHook;	// UNOFFICIAL 2026-11-14 MergeCopies (which hook is the innermost)
 		VirtualProtect(&table[81], 2 * sizeof(void*), old, &old);
 		Hooked = true;	// stays for the session (other hooks chain through it); off, it only passes the draw on
 	}

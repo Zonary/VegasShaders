@@ -279,10 +279,20 @@ float GetSurfaceWetClass(float2 uv, float vmMask)
     if (mode > 0.5f)
     {
         float4 material = tex2Dlod(TESR_MaterialBuffer, float4(uv, 0.0f, 0.0f));
+#ifdef GBUFFER_V2
+        // UNOFFICIAL 2026-11-14 GBufferV2 (core/CapturedNormals.h): r the shading model (+16 specular), written = r > 0.5; a is a normal's y and
+        // the bound radius is gone: every object counts as large enough (PuddlesMinObjectSize has no effect with it)
+        float written = step(0.5f, material.r);
+        float kind = floor(material.r + 0.01f);
+        kind -= 16.0f * step(15.5f, kind);
+        kind = (kind == 8.0f || kind == 9.0f) ? 2.0f : kind;	// hair, eyes: an actor's, as worn gear
+        float radius = TESR_WetWorldLook.z;
+#else
         float share = clamp(material.a, 0.5f, 1.0f);
         float written = step(0.5f, material.a) * step(0.5f, material.r);
         float kind = floor(material.r / share + 0.01f);
         float radius = material.g / share;
+#endif
         float isActor = (kind == 2.0f || kind == 6.0f) ? 1.0f : 0.0f;
         float isLand = (kind == 4.0f) ? 1.0f : 0.0f;
         float isObject = (kind == 1.0f) ? 1.0f : 0.0f;

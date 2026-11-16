@@ -1363,6 +1363,7 @@ static bool sceneCameraMove(Ctx& c) {
 #include "rt_host_reflfix4.inl"	// (2026-11-08 perf-reflfix4) the gold smooth in a mirror / chrome (5 x 5 tent), the mirror's silver F0, the hair's tint from its property
 #include "rt_host_mirroraa.inl"	// (2026-11-08 perf-reflfix4) blocky mirrors: MirrorJitter vs 4x rays vs the old centred ray
 #include "rt_host_rrrect.inl"	// (2026-11-07 perf-rr) DLSS RR at RenderScale < 1: the guide pass at the render size, the composite's rect mapping
+#include "rt_host_rrv2.inl"	// (2026-11-15 fd-gi) the DLSS RR guides on G-buffer v2 inputs (DeferredRRGuides)
 #include "rt_host_screenown.inl"	// (2026-11-11 PTScreenOwn) hair and skin in front of a wall: the first surface's colour / material are their own, not the wall's
 #include "rt_host_flashhead.inl"	// (2026-11-07 perf-flashlight) a lamp in the hidden first-person head under SameFrame lamp shadows (RtLampPrimary + RtLampTrace / Sigma + RtLampEye)
 #include "rt_host_far.inl"	// (2026-11-12) the path tracer's far hand-over at the loaded cells' edge: fog, level gain, band, shadow buffer, measurement
@@ -1500,6 +1501,7 @@ int main(int argc, char** argv) {
 		{ "denoiseantilag", "RtDenoise RGB temporal AntiLag: a step clears in a few frames, a still noisy pixel keeps its mean and noise", [&] { return sceneDenoiseAntiLag(c); } },
 		{ "historytime", "the denoisers' history in SECONDS (RtHistoryTime.h): 60 fps bit for bit as before; at 20 fps a step's ghost and a moving light's trail clear in the same seconds (RtDenoiseTemporalRgb)", [&] { return sceneHistoryTime(c); } },
 		{ "rrrect", "DLSS RR at RenderScale < 1 (perf-rr): DlssRRGuides one thread per render pixel on rect-layout inputs (outside the rect untouched, the view ray over the render size) + DlssRRComposite filling the screen from the rect (nearest alpha, bilinear weapon) and its native branch", [&] { return sceneRrRect(c); } },
+		{ "rrv2", "DLSS RR guides on G-buffer v2 (fd-gi DeferredRRGuides): material r = model + 16 x spec bit + 0.49 x metal and the albedo buffer in fp16 targets, the shading normals in the normals buffer's encoding; diffuse, specular, normal, roughness vs the CPU, the metal within fp16's step", [&] { return sceneRrV2(c); } },
 		{ "lamplookup", "the lamp shaders' lookup PointShadowTraced (D3D9 ps_3_0)", [&] { return sceneLampLookup(c); } },
 		{ "scenepick", "RtCore's scene picking rules + record packing (RtScenePick.h)", [&] { return sceneScenePick(c); } },
 		{ "decals", "decals (lifted cut-outs, NVR_RT_CUSTOM_DECAL): lamp / AO / sun rays pass them, reflections and camera rays see them (RtLampTrace, ReflectionsRTAlpha, RtAOTrace)", [&] { return sceneDecals(c); } },

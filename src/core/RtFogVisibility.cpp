@@ -86,7 +86,8 @@ namespace {
 	}
 
 	// (rtvol2) the expanded look is asked for (it applies once a trace with it exists: ExpandedLook)
-	bool ExpandedWanted() { return S.enabled && S.expanded && S.debugView != 1; }
+	// (2026-11-15 RT master switches) not while RtCore::Gated: the light's grid then reaches its own MaxDistance, as with Enabled false
+	bool ExpandedWanted() { return S.enabled && S.expanded && S.debugView != 1 && !RtCore::Gated(); }
 
 	// Outdoors, the volumetric light on, the helper already running for another RT effect
 	bool Wants() {
@@ -252,7 +253,8 @@ namespace {
 	UInt32 LampFrameNow() { return TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0; }
 
 	// The texture holds a trace of the last few frames (a frame whose RT record was full keeps the one before)
-	bool LampUsable() { return L.texture && L.tracedOnce && LampFrameNow() - L.tracedFrame <= 8u; }
+	// (2026-11-15 RT master switches) not while RtCore::Gated: no older trace is used after the gate shuts (unshadowed haze at once)
+	bool LampUsable() { return L.texture && L.tracedOnce && LampFrameNow() - L.tracedFrame <= 8u && !RtCore::Gated(); }
 
 	// Indoors, the fog asked within the last two frames, the helper already running for another RT effect. (Every early return comes
 	// before OthersWant: the sun's user above asks the same question outdoors, and each must answer the other's without asking back.)
@@ -450,6 +452,7 @@ namespace RtFogVisibility {
 		auto say = [&](int state, int code, const std::string& text) { Text = text; if (Code) *Code = code; return state; };
 		ReadSettings();
 		if (!S.enabled) return say(0, 1, "off");
+		if (RtCore::Gated()) return say(0, 14, "off here: a ray tracing master switch (indoors / outdoors) is off for this space: the shafts use the shadow maps");	// UNOFFICIAL 2026-11-15
 		ShaderManager* sm = TheShaderManager;
 		VolumetricLightEffect* light = sm->Effects.VolumetricLight;
 		if (!sm->GameState.isExterior) {

@@ -83,6 +83,13 @@ sampler2D TESR_ShadowAtlas : register(SHADOW_ATLAS_SAMPLER_REG) = sampler_state 
 #ifndef SUN_CROSSFADE
     #define SUN_CROSSFADE 0
 #endif
+// UNOFFICIAL 2026-11-15 fd-smoothsun: SUN_CROSSFADE_PASS 1 (with SUN_CROSSFADE 1) = a full-screen pass that draws the sun under the deferred
+// renderer (core/SunFadeDeferred.h gives its record both defines): the fade looks the kept maps up exactly as the live ones
+// (GetOldSunShadowPass), and RT sun shadows' ForwardLookup stays on beside it with its constants moved to c170-c173 (RT_SUN_ROWX_REG
+// below). The forward records never get it.
+#ifndef SUN_CROSSFADE_PASS
+    #define SUN_CROSSFADE_PASS 0
+#endif
 #if SUN_CROSSFADE
 row_major float4x4 TESR_ShadowOldCameraToLightTransformNear   : register(c146);
 row_major float4x4 TESR_ShadowOldCameraToLightTransformMiddle : register(c150);
@@ -239,7 +246,7 @@ float CloudSunAt(float3 P) {
 #ifndef RT_SUN_FORWARD
     #define RT_SUN_FORWARD 0
 #endif
-#if RT_SUN_FORWARD && FORWARD_SHADOWS && !SUN_CROSSFADE && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS) && !defined(RT_SUN_FORWARD_OFF)
+#if RT_SUN_FORWARD && FORWARD_SHADOWS && (!SUN_CROSSFADE || SUN_CROSSFADE_PASS) && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS) && !defined(RT_SUN_FORWARD_OFF)
     #define RT_SUN_LOOKUP 1
 #else
     #define RT_SUN_LOOKUP 0
@@ -247,6 +254,14 @@ float CloudSunAt(float3 P) {
 #if RT_SUN_LOOKUP
 #ifndef RT_SUN_SAMPLER_REG
     #define RT_SUN_SAMPLER_REG s15
+#endif
+#if !defined(RT_SUN_ROWX_REG) && SUN_CROSSFADE && SUN_CROSSFADE_PASS
+    // (2026-11-15 fd-smoothsun) beside the cross-fade's kept centres (c162-c165): c170-c173, free in the full-screen sun and lamp passes
+    // (c170 HudRainWorld and c171-c173 BarrelHeat are per-draw object constants)
+    #define RT_SUN_ROWX_REG c170
+    #define RT_SUN_ROWY_REG c171
+    #define RT_SUN_ROWW_REG c172
+    #define RT_SUN_DATA_REG c173
 #endif
 #ifndef RT_SUN_ROWX_REG
     #define RT_SUN_ROWX_REG c162
@@ -431,6 +446,12 @@ float4 SampleShadowMoments(float2 at, float2 quad) {
 #endif
 #if SHADOW_SKIN_SOFTNESS
     static float ShadowMinPenumbra = 0.0f;
+    #if SHADOW_SKIN_SOFTNESS == 2
+        // UNOFFICIAL 2026-11-15 DeferredSkin (DeferredSun.hlsl FD_SKIN): a screen pass lights skin and other pixels with one lookup, so the skin's
+        // options are switched per pixel: 1 on a skin pixel (the reach cap below; the pass also sets ShadowMinPenumbra there), 0 = exactly the
+        // other shaders' lookup (no cap, no least penumbra)
+        static float ShadowSkinPixel = 0.0f;
+    #endif
 #endif
 
 #if SHADOW_FIXED_MODE == 3
@@ -470,7 +491,9 @@ static float ShadowSlopeBias = 0.0f;
 #ifndef SHADOW_SLACK_CAP_ACTOR
     #define SHADOW_SLACK_CAP_ACTOR 0
 #endif
-#if SHADOW_SKIN_SOFTNESS || SHADOW_SLACK_CAP_ALL
+#if SHADOW_SKIN_SOFTNESS == 2
+    #define SHADOW_CHARACTER_REACH (TESR_ShadowBlur.w * ShadowSkinPixel)	// UNOFFICIAL 2026-11-15 DeferredSkin (above)
+#elif SHADOW_SKIN_SOFTNESS || SHADOW_SLACK_CAP_ALL
     #define SHADOW_CHARACTER_REACH TESR_ShadowBlur.w
 #elif SHADOW_SLACK_CAP_ACTOR
     float4 NVR_ShadowCharacterDraw : register(c204); // x: 1 = this draw is an actor's head/face/headgear (cap on), 0 = not
@@ -691,16 +714,16 @@ static const float2 ContactDisc8[8] = {
     float2(-0.7385f, -0.1306f), float2(0.6997f, -0.4451f), float2(-0.2340f, 0.8705f), float2(-0.4467f, -0.8590f) };  // golden-angle spiral, 8 points
 
 // UNOFFICIAL 2026-10-14: the 2 x 2 texels round uv compared with depth and blended bilinearly, kept inside the quadrant.
-float ShadowPCF2x2Clamped(float2 uv, float depth, float2 uvLo, float2 uvHi) {
+float ShadowPCF2x2Clamped(sampler2D atlas, float2 uv, float depth, float2 uvLo, float2 uvHi) {
     float texW = TESR_ShadowBlur.x;
     float2 p = uv / texW - 0.5f;
     float2 base = floor(p);
     float2 f = p - base;
     float2 uv0 = (base + 0.5f) * texW;
-    float4 d = float4(tex2Dlod(TESR_ShadowAtlas, float4(clamp(uv0, uvLo, uvHi), 0.0f, 0.0f)).x,
-                      tex2Dlod(TESR_ShadowAtlas, float4(clamp(uv0 + float2(texW, 0.0f), uvLo, uvHi), 0.0f, 0.0f)).x,
-                      tex2Dlod(TESR_ShadowAtlas, float4(clamp(uv0 + float2(0.0f, texW), uvLo, uvHi), 0.0f, 0.0f)).x,
-                      tex2Dlod(TESR_ShadowAtlas, float4(clamp(uv0 + texW, uvLo, uvHi), 0.0f, 0.0f)).x);
+    float4 d = float4(tex2Dlod(atlas, float4(clamp(uv0, uvLo, uvHi), 0.0f, 0.0f)).x,
+                      tex2Dlod(atlas, float4(clamp(uv0 + float2(texW, 0.0f), uvLo, uvHi), 0.0f, 0.0f)).x,
+                      tex2Dlod(atlas, float4(clamp(uv0 + float2(0.0f, texW), uvLo, uvHi), 0.0f, 0.0f)).x,
+                      tex2Dlod(atlas, float4(clamp(uv0 + texW, uvLo, uvHi), 0.0f, 0.0f)).x);
     float4 lit = depth <= d ? 1.0f : 0.0f;
     return lerp(lerp(lit.x, lit.y, f.x), lerp(lit.z, lit.w, f.x), f.y);
 }
@@ -710,13 +733,15 @@ float ShadowPCF2x2Clamped(float2 uv, float depth, float2 uvLo, float2 uvHi) {
 // UNOFFICIAL 2026-10-14: Mode 3's lookup with or without contact hardening in one body (contact false: the plain 3 x 3), so a
 // shader holds one copy of the 3 x 3 and one of the disc, not one per exit and per caller (SunCascadeTap): the copies put the
 // 4-lamp object shaders (SLS2034, SLS2036) over ps_3_0's temp registers with _rmaos maps and hand blood on.
-float SampleShadowAtlasPCSS(float3 position, float4x4 lightTransform, float2 quad, float bias, bool contact);
+// (2026-11-15 fd-smoothsun: the atlas is a parameter, so the deferred sun pass's cross-fade reads the kept atlas through the same body:
+// SunCascadeTapOld below. Every other caller passes TESR_ShadowAtlas: the same code as before.)
+float SampleShadowAtlasPCSS(sampler2D atlas, float3 position, float4x4 lightTransform, float2 quad, float bias, bool contact);
 #endif
 float SampleShadowAtlasContact(float3 position, float4x4 lightTransform, float2 quad, float bias, float bleedReduction) {
 #if SHADOW_FIXED_MODE == 3
-    return SampleShadowAtlasPCSS(position, lightTransform, quad, bias, true);
+    return SampleShadowAtlasPCSS(TESR_ShadowAtlas, position, lightTransform, quad, bias, true);
 }
-float SampleShadowAtlasPCSS(float3 position, float4x4 lightTransform, float2 quad, float bias, bool contact) {
+float SampleShadowAtlasPCSS(sampler2D atlas, float3 position, float4x4 lightTransform, float2 quad, float bias, bool contact) {
     float4 lightSpace = mul(float4(position, 1.0f), lightTransform);
     // UNOFFICIAL 2026-10-14 contact hardening for PCF (Mode 3), as below for EVSM4 but on plain depth (PCSS):
     //   1. Blocker search: the depths over the widest penumbra; the ones nearer the sun than this point are its casters,
@@ -744,7 +769,7 @@ float SampleShadowAtlasPCSS(float3 position, float4x4 lightTransform, float2 qua
         float casterSum = 0.0f, casters = 0.0f;
         float searchDepth = depth - SHADOW_SLACK_WIDE(0.73f * TESR_ContactHardeningData.y * ShadowSoftnessCap + 1.0f);
         [unroll] for (int s = 0; s < 5; s++) {   // one read at a time: the terrain shaders are at the temp register limit
-            float d = tex2Dlod(TESR_ShadowAtlas, float4(clamp(uv + search[s] * maxRadius, uvLo, uvHi), 0.0f, 0.0f)).x;
+            float d = tex2Dlod(atlas, float4(clamp(uv + search[s] * maxRadius, uvLo, uvHi), 0.0f, 0.0f)).x;
             float blocks = d < searchDepth ? 1.0f : 0.0f;
             casterSum += d * blocks;
             casters += blocks;
@@ -766,16 +791,16 @@ float SampleShadowAtlasPCSS(float3 position, float4x4 lightTransform, float2 qua
     // same arithmetic as before.
     float w3 = TESR_ContactHardeningData.z > 0.0f ? saturate(2.0f - radius / texW) : (radius <= texW ? 1.0f : 0.0f);
     float lit = 0.0f;
-    [branch] if (w3 > 0.0f) lit = w3 * ShadowPCF3x3(TESR_ShadowAtlas, uv, depth - SHADOW_SLACK(1.5f), quad);
+    [branch] if (w3 > 0.0f) lit = w3 * ShadowPCF3x3(atlas, uv, depth - SHADOW_SLACK(1.5f), quad);
     [branch] if (w3 < 1.0f) {
         float discDepth = depth - SHADOW_SLACK_WIDE(radius / texW + 1.0f);
         float2 turn = float2(1.0f, 0.0f);
         [branch] if (TESR_ContactHardeningData.z > 0.0f)
             sincos(6.2831853f * frac(52.9829189f * frac(dot(floor(uv / texW * 3.0f), float2(0.06711056f, 0.00583715f)))), turn.y, turn.x);
-        float disc = ShadowPCF2x2Clamped(uv, discDepth, uvLo, uvHi);
+        float disc = ShadowPCF2x2Clamped(atlas, uv, discDepth, uvLo, uvHi);
         [unroll] for (int i = 0; i < 8; i++) {
             float2 o = ContactDisc8[i];
-            disc += ShadowPCF2x2Clamped(uv + float2(o.x * turn.x - o.y * turn.y, o.x * turn.y + o.y * turn.x) * radius, discDepth, uvLo, uvHi);
+            disc += ShadowPCF2x2Clamped(atlas, uv + float2(o.x * turn.x - o.y * turn.y, o.x * turn.y + o.y * turn.x) * radius, discDepth, uvLo, uvHi);
         }
         lit += (1.0f - w3) * disc / 9.0f;
     }
@@ -976,13 +1001,94 @@ float SunCascadeTap(float c, float3 worldPos, float3 worldNormal, float offset, 
     float3 position = worldPos + offset * worldNormal;
 #if CONTACT_HARDENING
 #if SHADOW_SKIN_SOFTNESS
-    return SampleShadowAtlasPCSS(position, lightTransform, quadrant, bias, c < 1.5f && (TESR_ContactHardeningData.x > 0.0f || ShadowMinPenumbra > 0.0f));
+    return SampleShadowAtlasPCSS(TESR_ShadowAtlas, position, lightTransform, quadrant, bias, c < 1.5f && (TESR_ContactHardeningData.x > 0.0f || ShadowMinPenumbra > 0.0f));
 #else
-    return SampleShadowAtlasPCSS(position, lightTransform, quadrant, bias, c < 1.5f && TESR_ContactHardeningData.x > 0.0f);
+    return SampleShadowAtlasPCSS(TESR_ShadowAtlas, position, lightTransform, quadrant, bias, c < 1.5f && TESR_ContactHardeningData.x > 0.0f);
 #endif
 #else
     return SampleShadowAtlas(mul(float4(position, 1.0f), lightTransform), quadrant, bias, 0.0f);
 #endif
+}
+#endif
+
+#if SUN_CROSSFADE && SUN_CROSSFADE_PASS && SHADOW_FIXED_MODE == 3
+// UNOFFICIAL 2026-11-15 fd-smoothsun (core/SunFadeDeferred.h, docs/next/FD-SMOOTHSUN-RESULTS.md): the cross-fade of a screen pass that
+// draws the sun (DeferredSun, or whichever deferred light pass draws it), the sun stepping by half a degree every few seconds. At the
+// start of a step the old shadow must be EXACTLY what the pass showed the frame before, or every step would pulse: so the kept maps are
+// looked up as GetSunShadowMaps' Mode 3 path looks up the live ones (one SunCascadeTap: the same filter, contact hardening, band dither,
+// normal offset and slack), with the kept cascades, the kept atlas and the sun direction they were drawn for (TESR_ShadowCrossFade.yzw).
+// Not GetOldSunShadow above (the forward records' fade, left as it was: plain 3 x 3 in a lerped band tree, seven inlined lookups, ~2,900
+// slots in this pass, which the GTX 1070 refused). Keep in step with GetSunShadowMaps' Mode 3 path.
+float SunCascadeTapOld(float c, float3 worldPos, float3 worldNormal, float offset, float bias) {
+    float4x4 lightTransform = c < 0.5f ? TESR_ShadowOldCameraToLightTransformNear : c < 1.5f ? TESR_ShadowOldCameraToLightTransformMiddle :
+                              c < 2.5f ? TESR_ShadowOldCameraToLightTransformFar : TESR_ShadowOldCameraToLightTransformLod;
+    float2 quadrant = c < 0.5f ? float2(0.0f, 0.0f) : c < 1.5f ? float2(0.5f, 0.0f) : c < 2.5f ? float2(0.0f, 0.5f) : float2(0.5f, 0.5f);
+    float3 position = worldPos + offset * worldNormal;
+#if CONTACT_HARDENING
+#if SHADOW_SKIN_SOFTNESS
+    return SampleShadowAtlasPCSS(TESR_ShadowAtlasOld, position, lightTransform, quadrant, bias, c < 1.5f && (TESR_ContactHardeningData.x > 0.0f || ShadowMinPenumbra > 0.0f));
+#else
+    return SampleShadowAtlasPCSS(TESR_ShadowAtlasOld, position, lightTransform, quadrant, bias, c < 1.5f && TESR_ContactHardeningData.x > 0.0f);
+#endif
+#else
+    return SampleShadowAtlasOld(mul(float4(position, 1.0f), lightTransform), quadrant, bias, 0.0f);
+#endif
+}
+
+// The shadow from before the step. covered 0: no kept cascade reaches the point (the camera has moved on): the new shadow alone there.
+// ShadowSlopeBias (and the slack cap) are the live lookup's on entry and are put back on the way out.
+float GetOldSunShadowPass(float3 P, float3 Nw, out float covered) {
+    float nDL = dot(Nw, TESR_ShadowCrossFade.yzw);	// the sun the kept maps were drawn for
+    float offS = saturate(1.0f - nDL);
+    float4 rad = float4(TESR_ShadowOldNearCenter.w, TESR_ShadowOldMiddleCenter.w, TESR_ShadowOldFarCenter.w, TESR_ShadowOldLodCenter.w);
+    float4 tw = 4.0f * rad * max(TESR_ShadowBlur.x, 1.0f / 16384.0f);
+    float4 offD = offS * SHADOW_NORMAL_BIAS_TEXELS * tw;
+    offD = max(offD, offS * 1.5f * tw);
+    float slopeBiasLive = ShadowSlopeBias;
+    ShadowSlopeBias = 2.0f * TESR_ShadowBlur.x * min(sqrt(saturate(1.0f - nDL * nDL)) / max(nDL, 0.05f), 5.0f);
+#if SHADOW_SLACK_CAP
+    float slackCapLive = ShadowSlackCap;
+    [flatten] if (SHADOW_CHARACTER_REACH > 0.0f) {
+        offD = min(offD, SHADOW_CHARACTER_REACH * rad / max(rad.x, 0.001f));
+        ShadowSlackCap = SHADOW_CHARACTER_REACH / (2.0f * max(rad.x, 0.001f) * ((SHADOW_REACH_ALONG_RAY) ? max(nDL, 0.2f) : 1.0f));
+    }
+#endif
+    float bi = 0.0002f * (1.0f + SHADOW_SLOPE_BIAS * offS);
+    float4 st = rad - ShadowCascadeBands(rad);
+    float4 dst;
+    dst.x = length(P - TESR_ShadowOldNearCenter.xyz);
+    dst.y = length(P - TESR_ShadowOldMiddleCenter.xyz);
+    dst.z = length(P - TESR_ShadowOldFarCenter.xyz);
+    dst.w = length(P - TESR_ShadowOldLodCenter.xyz);
+    float cascade = -1.0f, fade = 0.0f;
+    [flatten] if (dst.x < rad.x) { cascade = 0.0f; fade = smoothstep(st.x, rad.x, dst.x); }
+    else if (dst.y < rad.y) { cascade = 1.0f; fade = smoothstep(st.y, rad.y, dst.y); }
+    else if (dst.z < rad.z) { cascade = 2.0f; fade = smoothstep(st.z, rad.z, dst.z); }
+    else if (dst.w < rad.w) { cascade = 3.0f; fade = smoothstep(st.w, rad.w, dst.w); }
+    covered = cascade >= 0.0f ? 1.0f : 0.0f;
+    float offsetHere = cascade < 0.5f ? lerp(offD.x, offD.y, fade) : cascade < 1.5f ? lerp(offD.y, offD.z, fade) :
+                       cascade < 2.5f ? lerp(offD.z, offD.w, fade) : offD.w;
+    float slackScale = cascade < 0.5f ? lerp(rad.x / max(rad.y, 0.001f), 1.0f, fade) : 1.0f;
+    float3 hashP = frac(P * 7.1031f);
+    hashP += dot(hashP, hashP.yzx + 33.33f);
+    float dither = frac((hashP.x + hashP.y) * hashP.z);
+    cascade += fade > dither ? 1.0f : 0.0f;
+    slackScale = cascade > 0.5f ? slackScale : 1.0f;
+    ShadowSlopeBias *= slackScale;
+#if CONTACT_HARDENING
+    ShadowSoftnessCap = slackScale;
+#endif
+    float sh = 1.0f;
+    [branch] if (cascade >= 0.0f && cascade < 3.5f)
+        sh = SunCascadeTapOld(cascade, P, Nw, offsetHere, bi);
+    ShadowSlopeBias = slopeBiasLive;
+#if SHADOW_SLACK_CAP
+    ShadowSlackCap = slackCapLive;
+#endif
+#if CONTACT_HARDENING
+    ShadowSoftnessCap = 1.0f;
+#endif
+    return saturate(sh);
 }
 #endif
 
@@ -1204,7 +1310,11 @@ float GetSunShadowMaps(float3 P, float3 Nw) {
     // During a sun step's cross-fade, part old shadow, part new. Outside a fade this is one skipped branch.
     [branch] if (TESR_ShadowCrossFade.x > 0.0f) {
         float covered;
+#if SUN_CROSSFADE_PASS && SHADOW_FIXED_MODE == 3
+        float oldShadow = GetOldSunShadowPass(P, Nw, covered);	// (2026-11-15 fd-smoothsun: a deferred sun pass, above)
+#else
         float oldShadow = GetOldSunShadow(P, Nw, offS, bi, covered);
+#endif
         sh = lerp(sh, oldShadow, TESR_ShadowCrossFade.x * covered);
     }
 #endif

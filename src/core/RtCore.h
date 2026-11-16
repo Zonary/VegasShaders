@@ -97,6 +97,16 @@ public:
 	// in the game while the eye was 71000 units away: every ray started outside the scene, FORK-RT-SUN.md rtsun-4).
 	static D3DXVECTOR3	Eye();
 	static bool			Running();							// the helper is ready (users trace from the frame after it got ready)
+	// UNOFFICIAL 2026-11-15 (RT master switches, docs/next/RT-MASTER-SWITCHES.md) [Main.Main.RayTracing] RTInteriors / RTExteriors (live, both
+	// true by default; a missing key counts as true). Gated(): the switch for the space the player is in (GameState.isExterior: an interior cell
+	// with a sky or without a worldspace is an interior) is off. While gated the core behaves as if the helper were not running: Running(),
+	// the atlas / actors / grass / decals questions and Exchange say no, Frame / ExchangeEarly / SubmitEarly exchange nothing, every RT effect
+	// takes the path it takes without a helper (its raster twin), and the idle clock (IdleStopMinutes) runs. The effects' settings are not touched.
+	static bool			Gated();
+	// ShaderManager::UpdateConstants, once a frame, after the cell and isCameraCut are known: reads the two switches and sets Gated() for the
+	// frame. True when the gate changed this frame while the helper was up (ShaderManager then makes the frame a camera cut, so every history,
+	// raster and traced, starts over instead of blending what it kept from before the change).
+	static bool			UpdateGate(bool Exterior);
 	// UNOFFICIAL 2026-11-07 (ptaaa-fog) another user than Name (not left out) wants to trace this frame. A user that only rides along with
 	// the RT effects the player switched on (RT fog visibility: on by default) asks this in its Wants, with Running(), so it never starts the
 	// helper or keeps it tracing by itself.

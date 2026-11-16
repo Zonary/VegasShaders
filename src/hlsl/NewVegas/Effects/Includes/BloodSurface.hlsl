@@ -166,9 +166,17 @@ float2 SurfClass(float2 uv) {
 	[branch] if (TESR_MaterialBufferData.x > 0.5) {
 		float4 material = tex2Dlod(TESR_MaterialBuffer, float4(uv, 0.0, 0.0));
 		// (Resolved from the game's MSAA it holds averages, a the share of samples written: as WetWorld's GetSurfaceWetClass.)
+#ifdef GBUFFER_V2
+		// UNOFFICIAL 2026-11-14 GBufferV2 (core/CapturedNormals.h): r the shading model (+16 specular), written = r > 0.5 (a is a normal's y)
+		float written = step(0.5, material.r);
+		float k = floor(material.r + 0.01);
+		k -= 16.0 * step(15.5, k);
+		k = (k == 8.0 || k == 9.0) ? 2.0 : k;	// hair, eyes: an actor's, as worn gear
+#else
 		float share = clamp(material.a, 0.5, 1.0);
 		float written = step(0.5, material.a) * step(0.5, material.r);
 		float k = floor(material.r / share + 0.01);
+#endif
 		float ground = (k == 1.0 || k == 4.0) ? 1.0 : 0.0;
 		float actor = (k == 2.0 || k == 3.0 || k == 6.0) ? 1.0 : 0.0;
 		kind = written > 0.5 ? float2(ground, actor) : float2(1.0, 0.0);

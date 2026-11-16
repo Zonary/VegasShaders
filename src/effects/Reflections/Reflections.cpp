@@ -23,9 +23,22 @@
 #include "../../core/FlashlightDeferred.h"	// UNOFFICIAL 2026-11-07 (perf-reflfix2) the flashlight lights RT hits and keeps its highlight in the composite
 #include "../../core/RtFlashlightCode.h"
 #include "../../core/Paths.h"	// UNOFFICIAL 2026-11-08 (perf-reflfix4) the shader files' check (LogReflShaderFiles)
+#include "../../core/FdIndirect.h"	// UNOFFICIAL 2026-11-15 DeferredReflections (full deferred renderer, phase 6: docs/next/FD-GI-RESULTS.md)
 #include <fstream>
 #include <iterator>
 #include <string>
+
+namespace {
+	// UNOFFICIAL 2026-11-15 DeferredReflections ([Main.Main.Quality], live, test only; core/FdIndirect.h): while the deferred renderer runs with
+	// it on, every pass of this effect (D3D9 and Vulkan, the RT RayGen and the RT denoiser) reads the G-buffer's normal-mapped shading normal
+	// where TESR_NormalsBuffer shows the captured surface. Off: normals itself.
+	IDirect3DBaseTexture9* FdReflNormals(IDirect3DDevice9* d, IDirect3DBaseTexture9* normals) {
+		if (!normals || !FdIndirect::ReflectionsOn()) return normals;
+		std::string depthName = "TESR_DepthBuffer";
+		IDirect3DBaseTexture9** depth = TheTextureManager->GetTextureSlotByName(depthName);
+		return FdIndirect::ShadingNormals(d, normals, depth ? *depth : nullptr);
+	}
+}
 
 void ReflectionsEffect::UpdateSettings() {
 	// UNOFFICIAL 2026-10-18: the frames drawn with the settings that are about to be replaced. 2026-10-19: only while the F10
@@ -767,13 +780,22 @@ void ReflectionsEffect::CaptureMaterial(IDirect3DDevice9* Device) {
 	Render(Device, Textures.MaterialSurface, Textures.MaterialSurface, 7, false, Textures.MaterialSurface);
 	// UNOFFICIAL 2026-10-31 MaterialBufferRoughness for this (D3D9) effect too: where no _rmaos map is seen, the roughness and metal the
 	// game's shader lit with (core/CapturedNormals.h, b 0.5: the floor guess takes them, Reflections.fx.hlsl Reflectivity)
-	if (Settings.MaterialBufferRoughness) CapturedNormals::MergeIntoReflMaterial(Device, Textures.MaterialSurface);
+	// (2026-11-15 DeferredReflections, core/FdIndirect.h: G-buffer v2's specular bit, model, roughness and metal in its place while it is on)
+	if (!FdIndirect::ReflMaterial(Device, Textures.MaterialSurface) && Settings.MaterialBufferRoughness) CapturedNormals::MergeIntoReflMaterial(Device, Textures.MaterialSurface);
 	materialOnly = false;
 	materialFilled = true;
 	Constants.Material.x = Settings.MaterialAware == 1 ? 1.0f : 0.0f;
 }
 
 void ReflectionsEffect::BindMaterial() {
+	{	// UNOFFICIAL 2026-11-15 DeferredReflections: the shading normals on TESR_NormalsBuffer's stage (2) for the D3D9 passes (RenderBuffers' and
+		// the composite's: both call this before their passes; made once a frame); off: nothing set
+		std::string normalsName = "TESR_NormalsBuffer";
+		IDirect3DBaseTexture9** slot = TheTextureManager->GetTextureSlotByName(normalsName);
+		IDirect3DBaseTexture9* normals = slot ? *slot : nullptr;
+		IDirect3DBaseTexture9* shading = FdReflNormals(TheRenderManager->device, normals);
+		if (shading != normals) SetPassTexture(2, shading);	// set after each pass begins (EffectRecord::PassTextures)
+	}
 	if (!materialFilled || !Textures.MaterialTexture) return;
 	SetPassTexture(15, Textures.MaterialTexture);	// set after each pass begins (EffectRecord::PassTextures)
 	const DWORD point[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP},
@@ -1359,7 +1381,7 @@ bool ReflectionsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* R
 	// The textures as SetCT binds them. Those read without a guard must exist; the guarded ones (the light grid, the sky
 	// visibility, the material buffer, the ortho map without the roof test) take the placeholder when absent, which is never read.
 	IDirect3DBaseTexture9* depth = SlotTexture("TESR_DepthBuffer");
-	IDirect3DBaseTexture9* normals = SlotTexture("TESR_NormalsBuffer");
+	IDirect3DBaseTexture9* normals = FdReflNormals(Device, SlotTexture("TESR_NormalsBuffer"));	// (2026-11-15 DeferredReflections: the shading normals while on)
 	IDirect3DBaseTexture9* viewModel = SlotTexture("TESR_DepthBufferViewModel");
 	IDirect3DBaseTexture9* ortho = SlotTexture("TESR_OrthoMapBuffer");
 	if (!depth || !normals || !viewModel || !TheTextureManager->RenderedTexture || (!ortho && Constants.Data4.y > 0.5f) ||
@@ -1590,7 +1612,7 @@ void ReflectionsEffect::RtDenoiseIdle() { RtDenoiser.Restart(); }	// a frame wit
 bool ReflectionsEffect::RunRtDenoiser(IDirect3DDevice9* Device, IDirect3DTexture9* signal, const D3DXMATRIX* reproject) {
 	if (RtDenoiserFailed) return false;
 	ID3D9NvrExt* ext = DxvkCompute::Extension();
-	IDirect3DBaseTexture9* normals = SlotTexture("TESR_NormalsBuffer");
+	IDirect3DBaseTexture9* normals = FdReflNormals(Device, SlotTexture("TESR_NormalsBuffer"));	// (2026-11-15 DeferredReflections)
 	ID3D9NvrExtSampler* linear = DxvkCompute::LinearClamp();
 	ID3D9NvrExtSampler* point = DxvkCompute::PointClamp();
 	if (!ext || !normals || !signal || !Rt.Ray || !Rt.Spread || !Textures.BufferSurface || !linear || !point) return false;

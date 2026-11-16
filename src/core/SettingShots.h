@@ -80,6 +80,14 @@
 //   landflicker [frames]                         (2026-10-30, terrain flicker) the shot's last frames (default 60) measure the land's
 //                                                flicker from a still camera, then one frame marks the land magenta: LAND FLICKER log
 //                                                lines and <slug>-landstd.png (SettingShots::Land below; docs/next/TERRAIN-FLICKER.md)
+//   parity <Section> <Key> [frames] [count] [A] [B]
+//                                                (2026-11-14, full deferred renderer: ParityTest.h) after the shot's wait, the in-game
+//                                                parity self-test of that live setting: <count> measurements (default 3) of four blocks
+//                                                A A B B of <frames> frames (default 64, rounded up to a multiple of 16), the setting at
+//                                                A (default false) or B (default true); "PARITY v1" log lines named after the shot
+//                                                (tools/fd/parity_parse.py). The picture is taken 16 frames after the last measurement,
+//                                                the setting back at the shot's value. A = B is the control (e.g. ... false false).
+//                                                'require onscreen' is checked only after the run: frame the view first.
 // Shots start from the user's settings each time: a shot without changes is the user's own picture.
 #include <algorithm>
 #include <atomic>
@@ -96,6 +104,7 @@
 #include "FrameRecorder.h"	// UNOFFICIAL, test only: 'record' (2026-10-17, frame replay rig)
 #include "CpuSampler.h"
 #include "FlickerWatch.h"	// 2026-10-25 bench sweep mode ('flickerwatch')
+#include "ParityTest.h"	// 2026-11-14 'parity' (full deferred renderer parity self-test)
 
 namespace SettingShots {
 
@@ -105,7 +114,10 @@ namespace SettingShots {
 	struct Change { bool effect = false, console = false, coverage = false; std::string section, key, value; };
 	struct Shot { std::string slug; std::vector<Change> changes; std::string menu; bool menuTests = false; int frames = 0; DWORD_PTR affinity = 0; int capture = 0;
 		bool renderdoc = false; std::string renderdocPath; bool keep = false; int landFrames = 0; bool record = false;
-		bool reload = false; UInt32 aimRef = 0; float aimHeight = 0.0f; UInt32 needRef = 0; float needMargin = 0.1f; bool needDetail = false; bool retried = false; };	// reload ('reloadshaders'), aim/need*: framing check (2026-10-25, bench warm slot)	// landFrames: 'landflicker' (2026-10-30)	// menu: 2026-10-19; frames: 'wait' (2026-10-21); affinity: cpulimits (2026-10-21); capture: RenderDoc frames (2026-10-26); renderdoc: 2026-10-26
+		bool reload = false; UInt32 aimRef = 0; float aimHeight = 0.0f; UInt32 needRef = 0; float needMargin = 0.1f; bool needDetail = false; bool retried = false;
+		bool parity = false; ParityTest::Spec paritySpec; };	// reload ('reloadshaders'), aim/need*: framing check (2026-10-25, bench warm slot)	// landFrames: 'landflicker' (2026-10-30)	// menu: 2026-10-19; frames: 'wait' (2026-10-21); affinity: cpulimits (2026-10-21); capture: RenderDoc frames (2026-10-26); renderdoc: 2026-10-26; parity: 2026-11-14
+	inline bool ParityStarted = false;	// 2026-11-14: this shot's 'parity' run has been started (it may have ended)
+	inline int ParityDoneAt = -1;		// the shot frame its end was first seen at: the picture waits 16 frames more (the world and history back at A's value)
 	struct Undo { bool effect = false; std::string section, key; UInt32 type = 0; bool b = false; int i = 0; float f = 0.0f; std::string s; };
 	struct Job { std::vector<unsigned> bgra; unsigned width = 0, height = 0; char path[MAX_PATH] = ""; };
 
@@ -114,6 +126,13 @@ namespace SettingShots {
 	inline bool Pending = false, Running = false, AllQueued = false;
 	inline size_t Index = 0;
 	inline int Frame = 0;
+	// 'parity': true while the shot's picture must wait for its run (and 16 frames after it, so nothing of block B is left in the picture)
+	inline bool ParityGate() {
+		if (Index >= List.size() || !List[Index].parity) return false;
+		if (!ParityStarted || ParityTest::Running) return true;
+		if (ParityDoneAt < 0) ParityDoneAt = Frame;
+		return Frame - ParityDoneAt < 16;
+	}
 	inline std::vector<Undo> Undos;
 	inline std::vector<Undo> Kept;				// 'keep' (2026-10-27): changes left on for the later shots, undone at the run's end
 	inline SelfTestCore::ShotReader Reader;
@@ -281,6 +300,19 @@ namespace SettingShots {
 				words >> frames;
 				List.back().landFrames = std::clamp(frames, 4, 240);
 			}
+			else if (command == "parity") {	// 2026-11-14 full deferred renderer parity self-test (ParityTest.h)
+				if (List.empty()) { error = "line " + std::to_string(number) + ": a parity before the first 'shot'"; return false; }
+				ParityTest::Spec& p = List.back().paritySpec;
+				words >> p.section >> p.key;
+				if (p.section.empty() || p.key.empty()) { error = "line " + std::to_string(number) + ": parity <Section> <Key> [frames] [count] [A] [B]"; return false; }
+				std::string v;
+				if (words >> v) p.frames = atoi(v.c_str());
+				if (words >> v) p.count = atoi(v.c_str());
+				if (words >> v) p.a = v;
+				if (words >> v) p.b = v;
+				p.label = List.back().slug;
+				List.back().parity = true;
+			}
 			else if (command == "sampler") { words >> CpuSampler::Hz; CpuSampler::Hz = std::clamp(CpuSampler::Hz, 100, 4000); }
 			else if (command == "affinity") {
 				if (List.empty()) { error = "line " + std::to_string(number) + ": an affinity before the first 'shot'"; return false; }
@@ -354,6 +386,7 @@ namespace SettingShots {
 	// One shot's changes, the old values kept for Revert.
 	inline void Apply(const Shot& s) {
 		Commands.clear();
+		ParityStarted = false; ParityDoneAt = -1;
 		Moves = false;
 		FlickerWatch::ShotFrames = 0; FlickerWatch::ShotSpikes = 0; FlickerWatch::ShotMax = 0.0f; FlickerWatch::ShotMaxCell = -1; FlickerWatch::SkipFrames = 10; strncpy_s(FlickerWatch::Label, s.slug.c_str(), _TRUNCATE);	// 2026-10-25
 		if (s.aimRef) AimAt(s.aimRef, s.aimHeight);	// 2026-10-25 framing (the console lines run with this shot's others)
@@ -453,6 +486,7 @@ namespace SettingShots {
 
 	inline void Stop(const char* why) {
 		Logger::Log("SETTING SHOTS %s: stopped, %s", Run, why);
+		ParityTest::Stop("the shot list stopped");	// 2026-11-14 'parity': its switch back first (the shot's own changes are undone below)
 		FrameRecorder::Journal::Stop();
 		GpuTimer::MarkerHook = nullptr;
 		RestoreKept();
@@ -916,6 +950,7 @@ namespace SettingShots {
 			GpuDebug::RequestCapture(List[Index].capture, why);
 		}
 		if (List[Index].renderdoc && Frame == ShotFrames() - 2) TriggerRenderDoc(List[Index]);	// the captured frame is still this shot's
+		if (List[Index].parity && !ParityStarted && Frame >= ShotFrames()) { ParityStarted = true; ParityTest::Start(List[Index].paritySpec); }	// 2026-11-14 'parity'
 	}
 
 	// The picture of the current shot: named after it and written on a worker thread.
@@ -929,6 +964,7 @@ namespace SettingShots {
 	}
 
 	inline void NextShot() {
+		ParityTest::Stop("the shot ended");	// 2026-11-14 'parity': never left running into the next shot's settings (normally already over)
 		if (FlickerWatch::Forced && Index < List.size())	// 2026-10-25 bench sweep mode: this shot's flicker score
 			Logger::Log("FLICKER SHOT '%s': %u frames, %u spikes, max %.2f%% (cell %d)", List[Index].slug.c_str(), FlickerWatch::ShotFrames, FlickerWatch::ShotSpikes,
 				FlickerWatch::ShotMax * 100.0f, FlickerWatch::ShotMaxCell);
@@ -1017,6 +1053,7 @@ namespace SettingShots {
 	// Render.cpp, the finished picture before the HUD (where the neon self-test takes its Final shots).
 	inline void Capture(IDirect3DSurface9* surface) {
 		if (!Running || Frame < ShotFrames() || !surface) return;
+		if (ParityGate()) return;	// 2026-11-14 'parity': the picture after its measurements
 		if (!FramingHolds()) return;	// 'require onscreen' (2026-10-25)
 		if (RecordGate()) return;	// 'record': the shot's frame first
 		if (!List[Index].menu.empty()) return;	// 2026-10-19: taken after the menu is drawn (CaptureMenu)
@@ -1027,6 +1064,7 @@ namespace SettingShots {
 	// 2026-10-19, Render.cpp right after ImGuiManager::Render: a 'menu' shot's picture, the back buffer with the menu drawn on it.
 	inline void CaptureMenu() {
 		if (!Running || Frame < ShotFrames() || Index >= List.size() || List[Index].menu.empty()) return;
+		if (ParityGate()) return;	// 2026-11-14 'parity'
 		IDirect3DSurface9* backBuffer = nullptr;
 		if (FAILED(TheRenderManager->device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer) { Stop("no back buffer for a menu picture"); return; }
 		TakeShot(backBuffer);

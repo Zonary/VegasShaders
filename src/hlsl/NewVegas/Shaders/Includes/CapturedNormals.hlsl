@@ -56,9 +56,67 @@
         #endif
         #define NVR_MATERIAL_RADIUS floor(NVR_MATERIAL_W * 0.125f)
         #define NVR_MATERIAL_CLASS (NVR_MATERIAL_W - 8.0f * NVR_MATERIAL_RADIUS)
+        #if CAPTURED_NORMALS_ON >= 4
+        // UNOFFICIAL 2026-11-14 GBufferV2 ([Main.Main.Quality] GBufferV2, restart; CAPTURED_NORMALS_ON 4; docs/next/FULL-DEFERRED-RENDERER-PLAN.md
+        // 4.2, docs/next/FD-GBUFFER-RESULTS.md). COLOR2 becomes:
+        //   r  the shading model in the integer part (the classes as before: 1 object, 2 gear, 3 cloth, 4 land, 5 plants, 6 skin, 7 grass; new:
+        //      8 hair, 9 eye, 10 unlit) + 16 when the record lights lamps with a highlight (the SPECULAR variants; the others light them with
+        //      diffuse only), + 0.49 x metal in the fraction. model = floor(r + 0.01) - 16 x (that >= 16); metal = frac(r) / 0.49.
+        //   g  the shading normal (normal-mapped, world axes) octahedral x; 4 (GBV2_NO_NORMAL) = none here (readers take COLOR3's smooth normal)
+        //   b  the roughness, as before (-1 none; the path tracer's -3 .. -2 code)
+        //   a  the shading normal's octahedral y (full fp16); "written" is r > 0.5 (the class), no longer a.
+        // The bound radius (g before) is not in it any more.
+            #define GBV2_SPEC_BIT 16.0f
+            #define GBV2_NO_NORMAL 4.0f
+            #if defined(HAIR)
+                #define GBV2_CLASS 8.0f
+            #elif defined(NVR_EYE)
+                #define GBV2_CLASS 9.0f
+            #else
+                #define GBV2_CLASS NVR_MATERIAL_CLASS
+            #endif
+            #if defined(SPECULAR)
+                #define GBV2_SPEC GBV2_SPEC_BIT
+            #else
+                #define GBV2_SPEC 0.0f
+            #endif
+            #define CapturedMaterialOut(roughness) float4(GBV2_CLASS + GBV2_SPEC, GBV2_NO_NORMAL, (roughness), 1.0f)
+            #define CapturedMaterialOutClass(materialClass, roughness) float4((materialClass) + GBV2_SPEC, GBV2_NO_NORMAL, (roughness), 1.0f)
+            #define CapturedMaterialOutMetal(roughness, metal) float4(GBV2_CLASS + GBV2_SPEC + 0.49f * saturate(metal), GBV2_NO_NORMAL, (roughness), 1.0f)
+            // The shading normal into a record made above: n in world axes, any length (0: none). A draw the hook marked as blended
+            // (CapturedCoverage's mark in NVR_SpecFade.z: 3 or -1) keeps a = 1 and records no shading normal: under the SRCALPHA blend the
+            // record's alpha is the blend weight of its rgb, so it must stay 1 (or 0, CapturedCoverage) there.
+            float4 CapturedShadingNormalZ(float4 material, float3 n, float markZ) {
+                const float len2 = dot(n, n);
+                const float2 o = ShadowEncodeNormal(n * rsqrt(max(len2, 1.0e-20f)));
+                const bool none = len2 < 1.0e-12f || markZ > 1.5f || markZ < -0.5f;
+                material.g = none ? GBV2_NO_NORMAL : o.x;
+                material.a = none ? 1.0f : o.y;
+                return material;
+            }
+            #define CapturedShadingNormal(material, n) CapturedShadingNormalZ((material), (n), NVR_SpecFade.z)
+            // The normal-mapped normal where the vertex shader sends no tangent frame: the cotangent frame of the screen derivatives of the
+            // camera-relative world position p and the normal map's uv (Schuler, "Followup: Normal Mapping Without Precomputed Tangents",
+            // 2013), about n0 (the smooth or the face normal, any length). tn: the tangent-space normal the shader lit with (x along +u,
+            // y along +v: Direct3D's v runs down the texture, the game's maps are Direct3D style). ddx / ddy: call it at the top level only.
+            // Mirrored uv flips the frame with it (the sign rides in the cross products). n0 must face the camera: Direct3D's ddy runs DOWN
+            // the screen (GLSL's dFdy up), which makes det(n0, dp1, dp2) negative for a facing n0, so the frame is negated (s < 0). Worked
+            // check: a wall facing +z seen from +z, u = x, v = -y: t = (-1, 0, 0) and b = (0, 1, 0) before the sign, +x and -y after.
+            float3 CapturedDerivNormal(float3 p, float2 uv, float3 n0, float3 tn) {
+                n0 *= rsqrt(max(dot(n0, n0), 1.0e-20f));
+                const float3 dp1 = ddx(p), dp2 = ddy(p);
+                const float2 duv1 = ddx(uv), duv2 = ddy(uv);
+                const float3 dp2perp = cross(dp2, n0), dp1perp = cross(n0, dp1);
+                const float3 t = dp2perp * duv1.x + dp1perp * duv2.x;
+                const float3 b = dp2perp * duv1.y + dp1perp * duv2.y;
+                const float s = -rsqrt(max(max(dot(t, t), dot(b, b)), 1.0e-30f));
+                return (t * tn.x + b * tn.y) * s + n0 * tn.z;
+            }
+        #else
         #define CapturedMaterialOut(roughness) float4(NVR_MATERIAL_CLASS, NVR_MATERIAL_RADIUS, (roughness), 1.0f)
         #define CapturedMaterialOutClass(materialClass, roughness) float4((materialClass), NVR_MATERIAL_RADIUS, (roughness), 1.0f)
         #define CapturedMaterialOutMetal(roughness, metal) float4(NVR_MATERIAL_CLASS + 0.49f * saturate(metal), NVR_MATERIAL_RADIUS, (roughness), 1.0f)
+        #endif
         // the one-pass and base-pass records of a mesh that may have no highlight (metal pixels keep theirs: the game's metal reflects).
         // Without CAPTURED_PT they ARE the plain forms, token for token (the compiled shaders are the same bytes as before: shcheck).
         #if defined(CAPTURED_PT) && CAPTURED_PT

@@ -30,6 +30,8 @@
 #include <algorithm>
 #include <share.h>	// _SH_DENYNO (Copy bug report reads the open log)
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback: its notices, shown with the install check's
+#include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the SunSmoothing notes)
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: BloodFlow and DustMotes have no page, row or search entry in a release build
 
 // The settings overlay (ImGui on the game's D3D9 device). Layout, top to bottom: a menu bar (File / View / Tools and the
 // global switches), the sidebar of sections next to the page of the selected section, and a one-line status bar. Input
@@ -596,6 +598,7 @@ static bool ShouldHideKey(const char* key) {
 		"NewSince", "NewInclude", "NewExclude", "NewDiagnostics",
 		"DevOnly", "SidebarWidth",
 		"Internal", "ShowInternal",	// UNOFFICIAL 2026-11-12: the Internal list and the file-only key that shows its settings
+		"RTInteriors", "RTExteriors",	// UNOFFICIAL 2026-11-15: the RT master switches, drawn at the top of the Ray tracing page (DrawRtSpaceSwitches)
 	};
 	return kRowless.count(key) != 0;
 }
@@ -635,6 +638,7 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Shaders.ShadowsExteriors.Main",        "ForwardShadows",     RestartRule::TurnOn },
 	{ "Main.Main.Performance",                "NvrDxvkDisplacement", RestartRule::TurnOn },	// land shaders registered as they load ([Shaders.Terrain.Displacement] Enabled is live)
 	{ "Shaders.ShadowsExteriors.SunSmoothing","CrossFade",          RestartRule::Changed },
+	{ "Shaders.ShadowsExteriors.SunSmoothing","DeferredFade",       RestartRule::TurnOn },	// UNOFFICIAL 2026-11-15 fd-smoothsun (compiled into the deferred sun pass at startup)
 	{ "Shaders.ContactHardening.Status",      "Enabled",            RestartRule::TurnOn },
 	{ "Shaders.ShadowsInteriors.Forward",     "Enabled",            RestartRule::TurnOn },	// hooks + shader overrides at start
 	{ "Shaders.ShadowsInteriors.Forward",     "SmoothEdges",        RestartRule::Changed },
@@ -822,6 +826,9 @@ static const char* InactiveReason(const char* section, const char* key) {
 			return reason;
 		}
 	}
+	// UNOFFICIAL 2026-11-15 fd-smoothsun (core/SunFadeDeferred.h): the deferred renderer's half-degree steps replace these
+	if (sec == "Shaders.ShadowsExteriors.SunSmoothing" && SunFadeDeferred::CompiledIn() && is({ "CrossFade", "YawStepSize", "PitchStepSize", "GlideSeconds" }))
+		return "Not used while the deferred renderer draws the sun outdoors: DeferredFade (in this section) moves the shadows in half-degree steps, each faded in. Used indoors and in frames drawn without the deferred renderer.";
 	if (sec == "Shaders.ShadowsExteriors.SunSmoothing" && is({ "CrossFade" }) && NumericSetting("Shaders.ShadowsExteriors.Main", "ForwardShadows") == 0.0f)
 		return "Only used with ForwardShadows on (Shadows Exteriors > Main).";
 
@@ -892,6 +899,7 @@ static bool IsInternalSetting(const std::string& section, const std::string& key
 // UNOFFICIAL 2026-11-12: an Internal setting ([Main.Menu.Developer] Internal) while the settings file does not ask for them
 // (ShowInternal): never a row, on its page, in the search or in the simple views, and not counted as a hidden developer setting.
 static bool InternalHidden(const std::string& section, const std::string& key) {
+	if (ShelvedEffects::Section(section)) return true;	// UNOFFICIAL 2026-11-16: a shelved effect (release builds only), whatever ShowInternal says
 	return !gMenu.showInternal && IsInternalSetting(section, key);
 }
 
@@ -2928,6 +2936,7 @@ static void NewWalk(const tomlValue& table, const std::string& path, NewWalkCont
 		if (status && !(path.compare(0, 8, "Shaders.") == 0 && name == "Enabled")) continue;	// Status sections are hidden in the menu; only a shader's own switch has a place
 		if (ShouldHideKey(name.c_str())) continue;
 		if (IsInternalSetting(path, name)) continue;	// UNOFFICIAL 2026-11-12: never in this tab (with ShowInternal: on its own page and in the search)
+		if (ShelvedEffects::Section(path)) continue;	// UNOFFICIAL 2026-11-16: a shelved effect (release builds only; not in IsInternalSetting, so "Reset test and internal settings" leaves its saved keys alone)
 
 		std::string description;
 		for (const std::string& c : value.comments()) { description += c; description += ' '; }
@@ -4317,11 +4326,19 @@ static RtStatusLine RtCoreLine() {
 	return { RtCore::Running() ? RtState::Running : RtState::Off, text, std::string() };
 }
 
+// UNOFFICIAL 2026-11-15 (RT master switches) an effect that is on but has no running core: the master switch for this space, or the core
+static RtStatusLine RtNotRunningLine(const std::string& detail) {
+	if (RtCore::Gated())
+		return { RtState::Off, TheShaderManager->GameState.isExterior ? "off here: Ray tracing outdoors is off (the normal effect is used)" :
+			"off here: Ray tracing indoors is off (the normal effect is used)", detail };
+	return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+}
+
 static RtStatusLine RtSunLine() {
 	const char* s = "Shaders.ShadowsExteriors.RT";
 	const std::string detail = RtSunShadows::StatusText();
 	if (!RtOn(s, "Enabled")) return { RtState::Off, "off", detail };
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	if (!TheShaderManager->GameState.isExterior) return { RtState::Off, "indoors: the sun is traced outdoors only", detail };
 	return { RtState::Running, TheSettingManager->GetSettingI(s, "Mode") == 1 ? "running (replaces the shadow maps near you)" :
 		"running (combined with the shadow maps)", detail };
@@ -4336,7 +4353,7 @@ static RtStatusLine RtLampLine() {
 			"switched off: not traced, the cube maps again (on again without a restart)", detail };	// (2026-11-11: off is live, RtLampShadows::EnabledNow)
 	if (!on) return { RtState::Off, "off (Enabled; needs a restart)", detail };
 	if (!RtOn(s, "Live")) return { RtState::Off, "Live is off: the cube maps again (A/B)", detail };
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	if (TheShaderManager->GameState.isExterior && !RtOn(s, "Exteriors")) return { RtState::Off, "outdoors: traced indoors only (Exteriors off; needs a restart)", detail };
 	// UNOFFICIAL 2026-11-13 (a tester on an RTX card: "RT lamp shadows = no worky"): with path tracing on these are not traced at all
 	// (RtLampShadows::Wants, PTStandDownRT, which every path tracing preset sets), and this line still said "running".
@@ -4354,7 +4371,7 @@ static RtStatusLine RtAOLine() {
 	const char* s = "Shaders.AmbientOcclusion.RT";
 	const std::string detail = AmbientOcclusionEffect::RtStatusText();
 	if (!RtOn(s, "Enabled")) return { RtState::Off, "off", detail };
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	if (!RtAmbient::PassesWanted()) return { RtState::Blocked, "on, but the Vulkan passes are off ([Main.Main.Performance] NvrDxvkPasses)", detail };
 	const bool exterior = TheShaderManager->GameState.isExterior;
 	const bool aoRuns = TheSettingManager->GetMenuShaderEnabled("AmbientOcclusion") &&
@@ -4378,7 +4395,7 @@ static RtStatusLine RtGILine() {
 	const std::string detail = AmbientOcclusionEffect::RtStatusText();
 	if (!RtOn(s, "GI")) return { RtState::Off, "off (GI)", detail };
 	if (!RtOn(s, "Enabled")) return { RtState::Blocked, "GI is on, but it needs the RT ambient occlusion on (Enabled)", detail };
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	if (!TheSettingManager->GetMenuShaderEnabled("AmbientLight")) return { RtState::Blocked, "on, but Ambient light is off: the bounce light is added there", detail };
 	if (RtComputeGIInWay()) return { RtState::Blocked, "on, but Ambient light's ComputeGI is on: it replaces the RT bounce light", detail };
 	if (RtPathTrace::Replacing())	// UNOFFICIAL 2026-11-13
@@ -4397,7 +4414,7 @@ static RtStatusLine RtReflectionsLine() {
 	if (!RtOn(s, "Enabled")) return { RtState::Off, "off", detail };
 	if (!TheSettingManager->GetMenuShaderEnabled("Reflections"))
 		return { RtState::Blocked, "on, but Reflections is off: the rays only fill in what its screen-space reflections miss", detail };
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	// UNOFFICIAL 2026-11-13: with path tracing on the Reflections effect is not drawn (PTReflectionsOff) and its rays are not traced
 	// (PTStandDownRT); every path tracing preset sets both, and this line still said "running"
 	if (RtPathTrace::Replacing() && RtOn("Main.Main.RayTracing", "PTReflectionsOff"))
@@ -4430,7 +4447,7 @@ static RtStatusLine RtPathTraceLine() {
 	const std::string detail = RtPathTrace::StatusText();
 	const bool realtime = RtOn(s, "PTRealtime");
 	if (!realtime && !RtPathTrace::ReferenceOn()) return { RtState::Off, "off", detail };	// (2026-11-11: ReferencePT only as honoured)
-	if (!RtCore::Running()) return { RtState::Blocked, "on, but the ray tracing core is not running (first line)", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
 	return { RtState::Running, realtime ? "running: the path-traced game (experimental)" : "running: the reference picture (a comparison, not for play)", detail };
 }
 
@@ -4490,6 +4507,34 @@ static void DrawRtMasterSwitch() {
 			"a restart). The path tracer is only turned off, never on.");
 }
 
+// UNOFFICIAL 2026-11-15 RT master switches (docs/next/RT-MASTER-SWITCHES.md; owner: one switch for interiors, one for exteriors, e.g. keep
+// ray tracing indoors where it is cheap and drop it outdoors). [Main.Main.RayTracing] RTInteriors / RTExteriors, live (a missing key: on).
+// Off: in that kind of space every ray-traced effect stands down and its normal effect is used (RtCore::Gated); the effects' own settings
+// stay as they are. The core logs one line per change of a switch and a GAME line each time the gate opens or shuts (RtCore::UpdateGate).
+static bool RtSpaceSwitchOn(const char* key) {
+	SettingManager::Configuration::ConfigNode node;
+	return !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", key) || node.BoolValue;
+}
+
+static void DrawRtSpaceSwitch(const char* label, const char* key, const char* tip) {
+	bool on = RtSpaceSwitchOn(key);
+	ImGui::PushID(key);
+	MenuWidgets::RowBegin(label, MenuWidgets::ResetSlotWidth());
+	if (MenuWidgets::Toggle("##rtspace", &on)) TheSettingManager->SetSetting("Main.Main.RayTracing", key, on);
+	if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered()) WrappedTooltip(tip);
+	ImGui::PopID();
+}
+
+static void DrawRtSpaceSwitches() {
+	DrawRtSpaceSwitch("Ray tracing indoors", "RTInteriors", "Off: inside buildings, vaults and caves no effect uses ray tracing; the normal "
+		"shadows, ambient occlusion, reflections and light are used there instead. Your ray tracing settings are kept and come back outdoors "
+		"(and here when you switch this on again). Applies at once.");
+	DrawRtSpaceSwitch("Ray tracing outdoors", "RTExteriors", "Off: outdoors no effect uses ray tracing; the normal shadows, ambient occlusion, "
+		"reflections and light shafts are used there instead. Outdoors is where ray tracing costs the most. Your ray tracing settings are kept "
+		"and come back indoors (and here when you switch this on again). Applies at once.");
+	ImGui::TextDisabled("Turning one off brings back the normal effects in that kind of place.");
+}
+
 // One picker for the RT debug views: picking one sets that DebugView and clears the other three, so only one shows.
 struct RtDebugView { const char* Label; const char* Section; int Value; };
 static const char* const kRtDebugSections[] = { "Shaders.ShadowsExteriors.RT", "Shaders.ShadowsInteriors.RT", "Shaders.AmbientOcclusion.RT", "Shaders.Reflections.RT",
@@ -4539,6 +4584,8 @@ static void DrawRtSharedBlocksOnRtPage(const char* rtSection);	// 2026-11-09: be
 
 static void RenderRayTracingPage() {
 	PageTitle("Ray tracing", "Every ray-traced effect in one place. Needs the DXVK fork, NvrRtHelper.exe and a GPU with ray tracing.");
+	DrawRtSpaceSwitches();	// UNOFFICIAL 2026-11-15 the master switches for indoors and outdoors, first
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
 
 	if (MenuWidgets::SubHeader("Status###rtstatus", true)) {
 		DrawRtStatusLine("Core", RtCoreLine());
@@ -4920,7 +4967,7 @@ static const HidingNote kHidingNotes[] = {
 			(RtPathTrace::ReferenceOn() || SettingOn("Main.Main.RayTracing", "PTRealtime")); },
 		"Path tracing is on but it was left out at start: the other ray-traced effects took all the shared images it needs. Turn one "
 		"of them off (or PTRestirGI) and restart the game.", nullptr, nullptr },
-	{ []() { return TheSettingManager->SettingsMain.Main.RenderEffects && AnyRtOn() && !RtCore::Running(); },
+	{ []() { return TheSettingManager->SettingsMain.Main.RenderEffects && AnyRtOn() && !RtCore::Running() && !RtCore::Gated(); },	// (2026-11-15: not while a master switch is off here)
 		"A ray-traced effect is on but ray tracing is not running (see the Ray tracing page's first line for why): it shows nothing.",
 		nullptr, nullptr },
 };

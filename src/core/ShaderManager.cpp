@@ -16,6 +16,13 @@
 #include "PointShadowSlots.h"
 #include "PointShadowForward.h"
 #include "DeferredLamps.h"	// UNOFFICIAL 2026-10-31 DeferredLamps (the deferred records)
+#include "DeferredDepth.h"	// UNOFFICIAL 2026-11-14 DeferredDepth
+#include "DeferredSun.h"	// UNOFFICIAL 2026-11-14 DeferredSun
+#include "LightFreeRecords.h"	// UNOFFICIAL 2026-11-14 full deferred renderer phase 0 (the lighting-free records)
+#include "DeferredRenderer.h"	// UNOFFICIAL 2026-11-14 full deferred renderer phase 2
+#include "DeferredSkin.h"	// UNOFFICIAL 2026-11-15 full deferred renderer phase 4 skin
+#include "DeferredFirstPerson.h"	// UNOFFICIAL 2026-11-15 first person through the deferred renderer (+ GearWeather)
+#include "DeferredTransparents.h"	// UNOFFICIAL 2026-11-15 forward+ for the blended list
 #include "CapsuleShadows.h"	// UNOFFICIAL 2026-10-31 CapsuleShadows (INTERIOR-SHADOWS-MODERN steps 2-3)
 #include "BackDepth.h"	// UNOFFICIAL 2026-10-31 BackDepth (ROOT-ASSUMPTIONS-PLAN B3)
 #include "EffectPrecompile.h"	// UNOFFICIAL 2026-10-28 the effects compiled in parallel at startup
@@ -33,6 +40,7 @@
 #include "FailOnce.h"	// UNOFFICIAL 2026-11-02 RetryFailedEffects: the cell serial its latches wait for
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback (the family's members loaded again after a drop)
 #include "GameShaderPairs.h"	// UNOFFICIAL 2026-11-13 [Main.Main.Misc] GameShaderPairCheck / GameShaderPairRepair (its settings, read below)
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16 BloodFlow and DustMotes are left out of release builds
 #include <unordered_map>	// UNOFFICIAL 2026-10-27 RenderScale v2 (RenderRect::RescaleRegistered)
 extern D3DXVECTOR4 NvrGameMultisample;	// UNOFFICIAL 2026-11-04 Hooks/Settings.cpp (TESR_GameMultisample)
 
@@ -131,7 +139,9 @@ void ShaderManager::Initialize() {
 	EnrollEffect<HeatHazeEffect>(sm, sm->Effects.HeatHaze);
 	EnrollEffect<SandstormEffect>(sm, sm->Effects.Sandstorm);
 	EnrollEffect<VolumetricLightEffect>(sm, sm->Effects.VolumetricLight);
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: not in release builds
 	EnrollEffect<DustMotesEffect>(sm, sm->Effects.DustMotes);	// UNOFFICIAL 2026-11-03
+#endif
 	EnrollEffect<LocalExposureEffect>(sm, sm->Effects.LocalExposure);	// 2026-11-04
 	EnrollEffect<SkyDitherEffect>(sm, sm->Effects.SkyDither);
 	EnrollEffect<BodycamEffect>(sm, sm->Effects.Bodycam);
@@ -140,7 +150,9 @@ void ShaderManager::Initialize() {
 	EnrollEffect<WetnessReflectionsEffect>(sm, sm->Effects.WetnessReflections);	// UNOFFICIAL 2026-11-04 Wetness Effects
 	EnrollEffect<HudRaindropsEffect>(sm, sm->Effects.HudRaindrops);
 	EnrollEffect<VolumetricCloudsEffect>(sm, sm->Effects.VolumetricClouds);
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: not in release builds
 	EnrollEffect<BloodFlowEffect>(sm, sm->Effects.BloodFlow);
+#endif
 	sm->Effects.BarrelHaze->Enabled = sm->Effects.BarrelHaze->Effect != nullptr;
 	EnrollEffect<VolumetricSmokeEffect>(sm, sm->Effects.VolumetricSmoke);
 	sm->Effects.VolumetricSmoke->Enabled = sm->Effects.VolumetricSmoke->Effect != nullptr;
@@ -148,6 +160,13 @@ void ShaderManager::Initialize() {
 	EnrollEffect<SMAAEffect>(sm, sm->Effects.SMAA);
 	EnrollEffect<FXAAEffect>(sm, sm->Effects.FXAA);
 	EnrollEffect<TAAEffect>(sm, sm->Effects.TAA);
+#if NVR_SHELVED_OUT
+	sm->Effects.DustMotes = nullptr;	// never created: the chain steps and every reader skip a null slot
+	sm->Effects.BloodFlow = nullptr;
+	Logger::Log("%s", ShelvedEffects::LogLine());
+	TheSettingManager->GetSettingI(ShelvedEffects::kSettingSections[0], "Enabled");	// (reads as 0; notes whether the saved file had it on)
+	if (ShelvedEffects::SavedOn) Logger::Log("Capsule shadows ([Shaders.ShadowsInteriors.Capsules] Enabled) are not part of this release (work in progress): left off although your settings file has them on; the setting is kept as it is.");
+#endif
 
 	EnrollCollection<TonemappingShaders>(sm, sm->Shaders.Tonemapping);
 	EnrollCollection<POMShaders>(sm, sm->Shaders.POM);
@@ -221,7 +240,11 @@ void ShaderManager::Initialize() {
 	};
 	for (const ConstantBinding& binding : secondBlock) sm->RegisterConstant(binding.Name, binding.Value);
 
+	sm->RegisterConstant("TESR_DeferredDepthFrame", DeferredDepth::Frame);	// UNOFFICIAL 2026-11-14 DeferredDepth (Includes/DeferredDepth.hlsl)
 	sm->InitializeConstants();
+	DeferredDepth::LoadShaders();	// UNOFFICIAL 2026-11-14 DeferredDepth: its linear pass and the probe, at startup (nothing when off)
+	DeferredSun::LoadShaders();	// UNOFFICIAL 2026-11-14 DeferredSun: the sun pass, at startup (only with the lighting-free records)
+	DeferredFirstPerson::Load();	// UNOFFICIAL 2026-11-15 DeferredFirstPerson / GearWeather: their passes, at startup (nothing when off)
 	startClock.LogTime("ShaderManager::Initialize");
 }
 
@@ -659,6 +682,10 @@ void ShaderManager::UpdateConstants() {
 		cutCamera = camera;
 		cutInterior = interior;
 		cutKnown = true;
+		// UNOFFICIAL 2026-11-15 RT master switches ([Main.Main.RayTracing] RTInteriors / RTExteriors, RtCore::Gated): the frame's gate, from
+		// the same interior test as everything else here. A gate that changes with the helper up (a switch flipped in place; a door is a cut
+		// already) makes this frame a camera cut, so the traced histories and their raster twins' start over instead of blending old frames.
+		if (RtCore::UpdateGate(!interior)) cameraCutThisFrame = true;
 	}
 	GameState.isCellChanged = cellChangedThisFrame;
 	GameState.isCameraCut = cameraCutThisFrame;
@@ -1069,11 +1096,18 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 		// UNOFFICIAL 2026-10-20 (P82 tester): when the GPU refuses a record (too long), shorter ones in turn (PointShadowForward.hlsl
 		// POINT_SHADOW_FIT, each with its own cache folder; the first is the old one exactly, also what ShaderPrecompile makes), and
 		// PointShadowForward::FitLevel / Refused keep every object to what the shortest one loaded can do.
-		static D3DXMACRO overrides[4][7] = {
+		// UNOFFICIAL 2026-11-15 (docs/next/FD-NATIVEFIX.md, bench batch 8) a last level, only with the traced / capsule read compiled in
+		// (RtLampShadows::CompiledIn: CapsuleShadows on native, RT lamp shadows on the fork): the full filter WITHOUT that read (POINT_SHADOW_RT 0;
+		// POINT_SHADOW_S15_TAKEN: s15 stays the read's, the sixth lamp lit). On native with Capsules the six-lamp shiny records (SLS2034-2036)
+		// did not fit at any level with the read (4,038-5,120 slots, since 1.0.9 at least): the [ERROR] below set Refused, and that turned
+		// every lamp shadow map off for the session (forward AND the deferred passes: 0 atlas tiles). Without the read: 3,117-3,146 slots.
+		// Those objects then take people's lamp shadows from the maps (CapsuleShadows::DropActors is held off: RtLampShadows::ReadDropped).
+		static D3DXMACRO overrides[5][8] = {
 			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { NULL, NULL } },
 			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { "POINT_SHADOW_FIT", "1" }, { NULL, NULL } },
 			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { "POINT_SHADOW_FIT", "2" }, { NULL, NULL } },
-			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { "POINT_SHADOW_FIT", "3" }, { NULL, NULL } } };
+			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { "POINT_SHADOW_FIT", "3" }, { NULL, NULL } },
+			{ { "INTERIOR_SHADOWS", "1" }, { "FORWARD_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" }, { "CONTACT_HARDENING", "0" }, { "POINT_SHADOW_RT", "0" }, { "POINT_SHADOW_S15_TAKEN", "1" }, { NULL, NULL } } };
 		// UNOFFICIAL 2026-10-21 LampFalloff (Includes/LampFalloff.hlsl): these records draw indoors only, so without [Shaders.PBR.LampFalloff]
 		// Interior they get no lamp shape (LAMP_FALLOFF_ON 1 = MatchEverywhere only, 0 = nothing): the six-lamp shaders stay as long as they
 		// were (SLS2035: 3592 slots with the user's settings; the shape takes it to ~3700, past what the GPU takes, and the next level).
@@ -1083,17 +1117,25 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 			return value != nullptr;
 		}();
 		(void)lampFalloffOverride;
-		static const char* const cache[4] = { "Interiors\\", "Interiors\\Fit1\\", "Interiors\\Fit2\\", "Interiors\\Fit3\\" };
-		static const char* const what[4] = { "", "the High/Ultra taps in a loop (the same shadows)",
-			"no High/Ultra: lamp shadow Quality is held at Medium for every object", "also no blocker search: contact hardening and LampSize are off for every object's lamp shadows" };
+		static const char* const cache[5] = { "Interiors\\", "Interiors\\Fit1\\", "Interiors\\Fit2\\", "Interiors\\Fit3\\", "Interiors\\NoRtRead\\" };
+		static const char* const what[5] = { "", "the High/Ultra taps in a loop (the same shadows)",
+			"no High/Ultra: lamp shadow Quality is held at Medium for every object", "also no blocker search: contact hardening and LampSize are off for every object's lamp shadows",
+			"the full filter without the capsule / traced lamp shadow read: the objects drawn with it take people's lamp shadows from the shadow maps (DropActors held off)" };
+		const int levels = RtLampShadows::CompiledIn ? 5 : 4;
 		ShaderRecordPixel* record = nullptr;
 		int level = 0;
-		for (; level < 4 && !record; level++) {
-			if (level) Logger::Log("UNOFFICIAL lamp shadows: %s with lamp shadows did not load; trying a shorter version (%d of 3: %s).", pixel->Name, level, what[level]);
+		for (; level < levels && !record; level++) {
+			if (level) Logger::Log("UNOFFICIAL lamp shadows: %s with lamp shadows did not load; trying a shorter version (%d of %d: %s).", pixel->Name, level, levels - 1, what[level]);
 			record = (ShaderRecordPixel*)ShaderRecord::LoadShader(pixel->Name, NULL, tmpl, cache[level], overrides[level]);
 		}
 		if (record) {
-			if (--level) {
+			if (--level == 4) {	// (2026-11-15) the full filter: FitLevel unchanged; the read is gone for this shader only
+				Logger::Log("[WARNING] UNOFFICIAL lamp shadows: %s loaded without the capsule / traced lamp shadow read (its other versions are too long for this GPU): "
+					"its objects keep their lamp shadow maps at the full filter and take people's shadows from the maps; CapsuleShadows' DropActors is held off.", pixel->Name);
+				RtLampShadows::ReadDropped = true;
+				EffectStatus::Level((std::string(pixel->Name) + " lamp shadows").c_str(), "no capsule / traced read (DropActors held off)", false);
+			}
+			else if (level) {
 				Logger::Log("UNOFFICIAL lamp shadows: %s with lamp shadows loaded at the shorter version %d (%s).", pixel->Name, level, what[level]);
 				if (level > PointShadowForward::FitLevel) PointShadowForward::FitLevel = level;
 				EffectStatus::Level((std::string(pixel->Name) + " lamp shadows").c_str(), what[level], false);	// UNOFFICIAL 2026-11-01 (REPORT / FLASH dumps)
@@ -1101,6 +1143,8 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 			record->PointShadowForward = true;
 			pixel->ShaderProg[ShaderRecordType::Interior] = record;
 			if (!level) DeferredLamps::LoadRecord(pixel, pixel->Name, tmpl, overrides[0], record);	// UNOFFICIAL 2026-10-31 DeferredLamps (the many-lamp family's deferred record)
+			DeferredRenderer::LoadInterior(pixel, pixel->Name, tmpl, overrides[0], record);	// UNOFFICIAL 2026-11-14 full deferred renderer 1 (LAMPS_DEFERRED 3; off: nothing)
+			DeferredTransparents::Load(pixel, pixel->Name, tmpl, overrides[0]);	// UNOFFICIAL 2026-11-15 forward+ for blended draws (LAMPS_DEFERRED 4; off: nothing)
 			PointShadowForward::CompiledIn = true;
 			PointShadowForward::CompiledCount++;
 		}
@@ -1164,6 +1208,12 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 			else Logger::Log("[ERROR] UNOFFICIAL RT lamp shadows: %s (land) with outdoor lamp shadows did not load (ExteriorForward).", pixel->Name);
 		}
 	}
+	LightFreeRecords::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-14 full deferred renderer phase 0 (test only, off: nothing made)
+	// (2026-11-15) the lamp pass may be compiled at the first record, before any Interior record handed DeferredLamps its lamp shape: take it here
+	if (DeferredRenderer::On() && !DeferredLamps::LampFalloffOverride) DeferredLamps::LampFalloffOverride = PBRShaders::LampFalloffInteriorDefine();
+	DeferredRenderer::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-14 full deferred renderer phase 2 ([Main.Main.Quality] DeferredRenderer; off: nothing)
+	DeferredFoliage::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-14 phase 3 foliage ([Main.Main.Quality] DeferredFoliage; off: nothing)
+	DeferredSkin::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-15 phase 4 skin ([Main.Main.Quality] DeferredSkin; off: nothing)
 	pixel->Enabled = familyOn;
 
 	if (HasAnyRecord(pixel)) {

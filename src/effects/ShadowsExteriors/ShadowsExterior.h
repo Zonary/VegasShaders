@@ -361,8 +361,19 @@ public:
 	D3DXMATRIX	SunFadeMatrix[4];
 	D3DXVECTOR4	SunFadeCenter[4];
 	D3DXVECTOR3	SunFadeCamera[4];
-	bool		StartSunCrossFade();
+	bool		StartSunCrossFade(bool forceAllCascades = true);
 	void		UpdateSunCrossFade(float oldWeight);
+	// UNOFFICIAL 2026-11-15 fd-smoothsun (core/SunFadeDeferred.h): under the deferred renderer the maps' sun stands still and steps by
+	// SunFadeDeferred::StepDegrees, each step faded by the deferred sun pass. DeferredSunHeld: the direction the maps are drawn for;
+	// DeferredHolding: the step's fade waits for every cascade to be redrawn (at most MaxHoldFrames frames); the copy of the atlas is made
+	// at the first fading step (ShadowAtlasOldTexture, registered empty at startup).
+	D3DXVECTOR3	CalculateDeferredSunDir(D3DXVECTOR3 sunDir);
+	bool		StartDeferredFade(const D3DXVECTOR3& oldSun);
+	D3DXVECTOR3	DeferredSunHeld = D3DXVECTOR3(0.0f, 0.0f, 1.0f), DeferredLastCamera = D3DXVECTOR3(0.0f, 0.0f, 0.0f);
+	bool		DeferredSunValid = false, DeferredFading = false, DeferredHolding = false, DeferredFadeFailed = false;
+	ULONGLONG	DeferredFadeStart = 0;
+	int			DeferredHoldFrames = 0;
+	unsigned	DeferredSteps = 0, DeferredJumps = 0, DeferredHoldSum = 0;
 
 	void		GetCascadeDepths();
 	// UNOFFICIAL 2026-10-31 SunLayers: ExtentScale > 1 widens the map's square (not its depth) by that factor, drawn at MapSize texels

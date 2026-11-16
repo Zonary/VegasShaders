@@ -11,6 +11,7 @@
 #include "../../core/MixCheck.h"	// UNOFFICIAL 2026-10-30 NvrDxvkMixCheck
 #include "../../core/Upscaler.h"	// UNOFFICIAL 2026-10-30 DLSS RR (RayReconstructionWantsRaw: the RT estimate's blurs and history are skipped)
 #include "../../core/CapturedNormals.h"	// UNOFFICIAL 2026-10-31 AlbedoBuffer (TESR_AlbedoBuffer: the bounce's surface colour)
+#include "../../core/FdIndirect.h"	// UNOFFICIAL 2026-11-15 DeferredALAlbedo (full deferred renderer, phase 6: docs/next/FD-GI-RESULTS.md)
 #include "../PBR/PBR.h"	// UNOFFICIAL 2026-11-11 (sungi) ExteriorBalance (LinearScales.y: the lit shaders' ambient scale)
 
 void AmbientLightEffect::RegisterConstants() {
@@ -608,7 +609,7 @@ void AmbientLightEffect::SunGIFrame() {
 	else if (state == 2) Logger::Log("UNOFFICIAL SunGI: on, outdoors, ray-traced path running. Forced in memory: RT AO + GI + Sky + RadianceCache + CacheExteriors on, ExteriorBalance on, "
 		"AmbientReplace %.2f, AlbedoBuffer (AmbientLight key) on%s; GridBounce stays %.2f (the RT bounce is the sun bounce); GI denoiser %s.", ambientReplace,
 		sunGiForced ? ", AmbientLight Status on (it was off)" : "", gridBounce, RtAmbient::Current.GIDenoiseSunGI ? "SunGI settings (GIDenoiseSunGI)" : "as before (GIDenoiseSunGI off)");
-	else Logger::Log("UNOFFICIAL SunGI: on, outdoors, FALLBACK: the RT core is not running (native D3D9, stock DXVK, no ray-tracing GPU, or NvrDxvkPasses off). Forced in memory: "
+	else Logger::Log("UNOFFICIAL SunGI: on, outdoors, FALLBACK: the RT core is not running (native D3D9, stock DXVK, no ray-tracing GPU, NvrDxvkPasses off, or ray tracing switched off for this kind of space: RTInteriors / RTExteriors). Forced in memory: "
 		"ExteriorBalance on, AlbedoBuffer on%s; no AmbientReplace (it needs the RT GI); the light grid is the sun bounce: GridBounce %.2f.", sunGiForced ? ", AmbientLight Status on (it was off)" : "", gridBounce);
 	static bool albedoNoted = false;
 	if (on && !albedoNoted && !CapturedNormals::AlbedoCompiledIn()) {
@@ -646,7 +647,7 @@ void AmbientLightEffect::RoomGIFrame(bool outdoors, bool rt) {
 		"InteriorBalance on, AlbedoBuffer (AmbientLight key) on, AmbientReplaceInterior %.2f with AmbientFloorInterior %.2f%s; GI denoiser %s.", RtAmbient::Current.GlowGI,
 		ambientReplaceInterior, ambientFloorInterior, roomGiForced ? ", AmbientLight Status on (it was off)" : "",
 		RtAmbient::Current.GIDenoiseRoomGI ? "SunGI's settings (GIDenoiseRoomGI)" : "as before (GIDenoiseRoomGI off)");
-	else Logger::Log("UNOFFICIAL RoomGI: on, indoors, FALLBACK: the RT core is not running (native D3D9, stock DXVK, no ray-tracing GPU, or NvrDxvkPasses off). "
+	else Logger::Log("UNOFFICIAL RoomGI: on, indoors, FALLBACK: the RT core is not running (native D3D9, stock DXVK, no ray-tracing GPU, NvrDxvkPasses off, or ray tracing switched off for this kind of space: RTInteriors / RTExteriors). "
 		"Nothing is changed: the room keeps the game's ambient%s.", roomGiForced ? "; AmbientLight does not render here, its Status is off" : "");
 }
 
@@ -1406,6 +1407,8 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 	// UNOFFICIAL 2026-10-31 AlbedoBuffer: the templates' own base colour for the bounce (NVR_ALAlbedo on s12 in the Apply and balance passes) when
 	// it holds this frame's; those two passes then run as D3D9 passes (their Vulkan twins have no albedo input yet; logged once).
 	const bool albedoOn = albedoBuffer && CapturedNormals::AlbedoData.x > 0.5f && CapturedNormals::AlbedoTexture != nullptr;
+	// UNOFFICIAL 2026-11-15 DeferredALAlbedo (core/FdIndirect.h): made here, before any pass begins; AlbedoTexture itself while off
+	IDirect3DBaseTexture9* const albedoTexture = albedoOn ? FdIndirect::ALAlbedo(Device) : nullptr;
 	if (albedoOn && !albedoLogged) { albedoLogged = true; Logger::Log("UNOFFICIAL AmbientLight: AlbedoBuffer on: the bounce takes the surfaces' own colour from TESR_AlbedoBuffer where written (elsewhere, grass for one, the guessed colour capped at %.2f: AlbedoFallbackCap); the balance and Apply passes run as D3D9 passes", albedoFallbackCap > 0.0f ? albedoFallbackCap : 0.6f); }
 	if (flagsHandle) {
 		D3DXVECTOR4 flags(shadow ? 1.0f : 0.0f, noEdgeOutline ? 1.0f : 0.0f, albedoOn ? 1.0f : 0.0f, edgeReject ? 1.0f : 0.0f);
@@ -1683,8 +1686,9 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 			if (applyLike && gridValid) Device->SetTexture(9, gridAccum[gridAccumIndex]);
 			if (applyLike && gridValid && gridColorValid) Device->SetTexture(14, gridAccumColor[gridAccumIndex]);
 			if (applyLike && albedoOn) {	// UNOFFICIAL 2026-10-31 AlbedoBuffer: NVR_ALAlbedo on s12 (the grid passes' NVR_GridSunColor stage, never read here), point sampled
-				Device->SetTexture(12, CapturedNormals::AlbedoTexture);
-				TheRenderManager->renderState->NoteDeviceTexture(12, CapturedNormals::AlbedoTexture);
+				// (2026-11-15 DeferredALAlbedo: albedoTexture is COLOR1 x (1 - metal) x DeferredALAlbedoGain while on, AlbedoTexture itself while off)
+				Device->SetTexture(12, albedoTexture);
+				TheRenderManager->renderState->NoteDeviceTexture(12, albedoTexture);
 				const DWORD states[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP},
 					{D3DSAMP_MAGFILTER, D3DTEXF_POINT}, {D3DSAMP_MINFILTER, D3DTEXF_POINT}, {D3DSAMP_MIPFILTER, D3DTEXF_NONE} };
 				for (const auto& s : states) TheRenderManager->SetSamplerState(12, (D3DSAMPLERSTATETYPE)s[0], s[1]);

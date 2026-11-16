@@ -11,6 +11,7 @@
 #include "CapsuleShadows.h"	// UNOFFICIAL 2026-10-31 CapsuleShadows (steps 2-3): DropActors
 #include "PipboyFit.h"	// UNOFFICIAL 2026-11-04 ViewModelShadows: its object cleared before the viewmodel map
 #include "NpcCharacterMaps.h"	// UNOFFICIAL 2026-11-08 CharacterShadowMapNpcs
+#include "ViewModelLight.h"	// UNOFFICIAL 2026-11-15 DeferredFirstPerson: the view model map's light transform for the first-person deferred sun pass
 
 // UNOFFICIAL SkinnedShadowFaceTest ([Main.Main.Performance], default on, 2026-10-07). An animated (skinned) mesh's own
 // world bound is stale, so skinned casters used to be drawn into all six faces of every lamp cube map near them; with a
@@ -3945,6 +3946,8 @@ bool ShadowManager::RenderViewModelShadowMap(NiCamera* FirstPersonCamera) {
 	if (zFar - zNear < extent) { const float grow = 0.5f * (extent - (zFar - zNear)); zNear -= grow; zFar += grow; }
 	D3DXMatrixOrthoOffCenterRH(&lightProj, cx - 0.5f * extent, cx + 0.5f * extent, cy - 0.5f * extent, cy + 0.5f * extent, zNear, zFar);
 	D3DXMATRIX viewProj = lightView * lightProj;
+	ViewModelLight::ViewProj = viewProj;	// UNOFFICIAL 2026-11-15 DeferredFirstPerson (core/ViewModelLight.h): the true camera-relative point's transform
+	ViewModelLight::Frame = TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0u;
 
 	// The lookup's space is not the one drawn here: the object and skin shaders rebuild their position from the clip position with NVR's
 	// inverse view and projection (Includes/Shadow.hlsl GetShadowWorldPos), made from the world camera when the world scene began

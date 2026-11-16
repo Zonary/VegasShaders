@@ -153,6 +153,8 @@
     <ClCompile Include="..\src\core\Sm6Pass.cpp" />
     <ClCompile Include="..\src\core\DxvkCompute.cpp" />
     <ClCompile Include="..\src\core\SessionLog.cpp" />
+    <ClCompile Include="..\src\core\GBufferCensus.cpp" />
+    <ClCompile Include="..\src\core\MergeCopies.cpp" />
     <ClCompile Include="..\src\core\Paths.cpp" />
     <ClCompile Include="..\src\core\InstallCheck.cpp" />
     <ClCompile Include="..\src\core\Diagnostics.cpp" />

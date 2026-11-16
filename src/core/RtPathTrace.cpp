@@ -1989,7 +1989,7 @@ namespace RtPathTrace {
 	// (2026-11-03) PTReplace: the traced picture into the game's scene right after the RT core's point (HDR, the stored curve), so
 	// NVR's and the game's later passes (tonemap, bloom, grading) treat it as the frame
 	void Replace(IDirect3DDevice9* Device) {
-		ReactiveMask::WantCopies = S.enabled && S.replace && S.denoise && S.blendedLayer;	// (2026-11-10 PTBlendedLayer) for the next frame's world
+		ReactiveMask::WantCopies = S.enabled && S.replace && S.denoise && S.blendedLayer && !RtCore::Gated();	// (2026-11-10 PTBlendedLayer) for the next frame's world (2026-11-15: not while the RT master switches gate this space)
 		if (!S.enabled || !S.replace) return;
 		IDirect3DSurface9* scene = nullptr;
 		if (FAILED(Device->GetRenderTarget(0, &scene)) || !scene) return;

@@ -2,6 +2,8 @@
 #include <unordered_set>	// UNOFFICIAL 2026-10-30 SettingsCache
 #include "InstallCheck.h"	// 2026-11-03: the user toml's unknown keys and version mark, for the install self-check
 #include "GpuDebug.h"	// UNOFFICIAL 2026-10-26: GpuDebugLabels / RenderDoc capture key ([Main.Develop.Main])
+#include "SettingForce.h"	// UNOFFICIAL 2026-11-14 full deferred renderer: its prerequisites read as forced
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: a release build reads [Shaders.ShadowsInteriors.Capsules] Enabled as off
 
 // A settings file in <game>\Data\NVSE\Plugins (the game folder is read once, Paths::GameRoot: common-dialog calls can change the
 // current directory later). 2026-11-02 Vegas Shaders: forWrite gives the new name (VegasShaders.toml...); a read takes the new
@@ -56,7 +58,7 @@ template <> std::string SettingManager::ToString<int>(const int number) {
 }
 
 // The user config's [_Unofficial] SettingsVersion this build brings it up to (UpdateOldDefaults, below).
-static const int UnofficialSettingsVersion = 83;  // (83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
+static const int UnofficialSettingsVersion = 85;  // (85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
 
 // UNOFFICIAL 2026-10-30: a setting is read only when the defaults file lists it (FillNode), so a line in the user's toml that
 // this build does not know (a key from a newer or an older build, a typo) silently did nothing. Each one is logged once per
@@ -758,6 +760,21 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 			changed += std::string(changed.empty() ? "" : ", ") + "Main.Main.RayTracing.Grass false -> true";
 		}
 	}
+	// 84 (2026-11-14): the flash detector, beat detector and history watch are off by default (their per-frame read-backs measured
+	// 4-7 ms a frame on native D3D9 (a CPU wait in the HUD step) and 0.3-0.6 ms on DXVK at 1440p, GTX 1070, every other setting the same). Menu saves hold the old true.
+	if (version < 84) {
+		tomlValue* saved = UserSection("Main.Main.Misc");
+		for (const char* key : { "FlashDetect", "BeatDetect", "HistoryWatch" }) {
+			if (saved && saved->contains(key) && saved->at(key).is_boolean() && saved->at(key).as_boolean()) {
+				(*saved)[key] = false;
+				changed += std::string(changed.empty() ? "" : ", ") + "Main.Main.Misc." + key + " true -> false";
+			}
+		}
+	}
+	// 85 (2026-11-15, owner decision, docs/next/FULL-DEFERRED-RENDERER-PLAN.md section 7): the deferred renderer ships on by default,
+	// [Main.Main.Quality] DeferredRenderer 0 -> 2. The key never shipped in a public release (added 2026-11-14, default 0), so only files saved
+	// by the development and playtest builds hold the old 0. A saved 1 or 2 is a choice and stays.
+	if (version < 85) replace("Main.Main.Quality", "DeferredRenderer", 0, 2, true);
 	if (!changed.empty())
 		Logger::Log("UNOFFICIAL settings: old defaults saved by an earlier build moved to the new defaults: %s. "
 			"Change them in the menu and press Save if you want the old values back.", changed.c_str());
@@ -1491,16 +1508,41 @@ static const CachedSetting* CachedNode(SettingManager* manager, const char* sect
 	return &slot->second;
 }
 
+// UNOFFICIAL 2026-11-14 full deferred renderer (core/SettingForce.h): the prerequisites [Main.Main.Quality] DeferredRenderer turns on read as
+// forced while it is on at startup (decided at the session's first read; nothing is written into the settings). Off: State 0, nothing more.
+static bool ForcedValue(SettingManager* manager, const char* section, const char* key, int& value) {
+	if (SettingForce::State < 0) {
+		CachedSetting scratch;
+		const CachedSetting* mode = CachedNode(manager, "Main.Main.Quality", "DeferredRenderer", scratch);
+		if (!mode->ok) {	// a key every defaults file has: missing too = the settings are not loaded yet (decide at a later read)
+			CachedSetting other;
+			if (!CachedNode(manager, "Main.Main.Quality", "CapturedNormals", other)->ok) return false;
+		}
+		const int m = mode->ok ? mode->i : 0;
+		SettingForce::RendererMode = m < 0 ? 0 : m > 2 ? 2 : m;
+		SettingForce::State = SettingForce::RendererMode > 0 ? 1 : 0;
+		// (logged by DeferredRenderer::BeginFrame, not here: under the cache lock)
+	}
+	return SettingForce::State == 1 && SettingForce::Find(section, key, value);
+}
+
 int SettingManager::GetSettingI(const char* section, const char* key) {
 	std::lock_guard<std::mutex> lock(SettingCacheLock);
 	CachedSetting scratch;
-	return CachedNode(this, section, key, scratch)->i;	// the typed value directly, no string re-parse (0 when the setting does not exist)
+	if (SettingForce::State) { int forced; if (ForcedValue(this, section, key, forced)) return forced; }
+	const CachedSetting* node = CachedNode(this, section, key, scratch);
+	if constexpr (ShelvedEffects::Active) { if (ShelvedEffects::ForcedOff(section, key, node->i)) return 0; }	// UNOFFICIAL 2026-11-16 (release builds only)
+	return node->i;	// the typed value directly, no string re-parse (0 when the setting does not exist)
 }
 
 float SettingManager::GetSettingF(const char* section, const char* key) {
 	std::lock_guard<std::mutex> lock(SettingCacheLock);
 	CachedSetting scratch;
-	return CachedNode(this, section, key, scratch)->f;
+	if (SettingForce::State) { int forced; if (ForcedValue(this, section, key, forced)) return (float)forced; }	// UNOFFICIAL 2026-11-14 (above)
+	float value = CachedNode(this, section, key, scratch)->f;
+	if constexpr (ShelvedEffects::Active) { if (ShelvedEffects::ForcedOff(section, key, value != 0.0f)) return 0.0f; }	// UNOFFICIAL 2026-11-16 (release builds only)
+	if (SettingForce::State == 1) SettingForce::FloorF(section, key, value);	// UNOFFICIAL 2026-11-15 linear gamma floor (SettingForce.h)
+	return value;
 }
 
 char* SettingManager::GetSettingS(const char* section, const char* key, char* out) {

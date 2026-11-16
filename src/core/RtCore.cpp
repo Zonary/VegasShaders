@@ -718,6 +718,19 @@ namespace {
 
 	Core TheCore;
 
+	// UNOFFICIAL 2026-11-15 (RT master switches; RtCore.h Gated / UpdateGate, docs/next/RT-MASTER-SWITCHES.md). Set once a frame by UpdateGate.
+	struct MasterGate {
+		bool	gated = false;					// this frame: the switch for the player's space is off
+		bool	known = false;					// UpdateGate has run once (the first frame logs only a switch that is off)
+		bool	interiors = true, exteriors = true;	// the two keys as last read
+		bool	exterior = false;				// the space the gate was worked out for
+		UInt32	changes = 0;					// gate changes this session (on or off, doors and switches)
+		char	status[480] = "";				// StatusText while gated
+	};
+	MasterGate TheGate;
+	// The helper is ready and ray tracing is allowed here: what RtCore::Running() and the scene questions (atlases, actors, grass, decals) mean
+	inline bool CoreLive() { return TheCore.state == Core::Running && !TheGate.gated; }
+
 	// A texture's slot in the alpha atlas: >= 0, -1 not possible (never again), -2 not this frame (8 a frame at most). On the GPU: the
 	// fork pass RtAlphaToAtlas draws the texture's alpha into a 64 x 64 R16F target (the texture's mips downsample; any pool and format),
 	// then that goes into the atlas slot. Both are recorded before this exchange's signal, so the helper sees them this frame.
@@ -3565,6 +3578,15 @@ bool RtCore::CopyOut(int Image, IUnknown* Target, UINT Width, UINT Height) {
 namespace {
 	bool Core::Ready() {
 		if (state == Core::Off) return false;
+		// UNOFFICIAL 2026-11-15 RT master switches: gated = a frame no user wants. Nothing is gathered, built, uploaded or traced; a running
+		// helper idles (IdleFrame: IdleStopMinutes stops it after that much gated play, as for any idle helper). One still starting is
+		// polled on so it gets ready (and idles) instead of being found late by the start timeout.
+		if (TheGate.gated) {
+			if (state == Core::Starting) Poll();
+			RtHairTint::Wanted = false;
+			IdleFrame();
+			return false;
+		}
 		bool wanted = false;
 		for (const RtCore::User& user : users) wanted = wanted || (!Out(user) && user.Wants && user.Wants());
 		// (a running helper stayed up, idle, until the game's exit: now IdleFrame stops it after IdleStopMinutes. 2026-11-12 audit: the hair tint
@@ -3897,7 +3919,7 @@ void RtCore::Frame(IDirect3DDevice9* Device) {
 // UNOFFICIAL 2026-10-28 (RT reflections): RtCore.h. Frame (earlier in the frame) has already started the helper and checked the screen.
 bool RtCore::Exchange(IDirect3DDevice9* Device, const User& user) {
 	Core& c = TheCore;
-	if (c.state != Core::Running || !c.shared || TheRenderManager->width != c.width || TheRenderManager->height != c.height) return false;
+	if (!CoreLive() || !c.shared || TheRenderManager->width != c.width || TheRenderManager->height != c.height) return false;	// (2026-11-15: + the master gate)
 	if (c.Out(user) || !user.Wants || !user.Wants()) return false;
 	return c.Exchange(Device, &user);
 }
@@ -4032,7 +4054,7 @@ bool RtCore::EarlyPending() { return TheCore.pendingN != 0; }
 void RtCore::CollectEarly(IDirect3DDevice9* Device) { if (TheCore.pendingN) TheCore.CollectEarly(Device, Core::kAtShow); }	// (only caller: RtPathTrace::CollectBeforeShow)
 bool RtCore::SubmittedEarlyThisFrame(const User* user) { return user && TheCore.EarlyThisFrame(user->Name); }
 
-bool RtCore::Running() { return TheCore.state == Core::Running; }
+bool RtCore::Running() { return CoreLive(); }
 bool RtCore::OthersWant(const char* Name) {	// UNOFFICIAL 2026-11-07 (ptaaa-fog; RtCore.h)
 	for (const User& user : TheCore.users)
 		if (user.Name != Name && !(user.Name && Name && !strcmp(user.Name, Name)) && !TheCore.Out(user) && user.Wants && user.Wants()) return true;
@@ -4052,7 +4074,50 @@ void RtCore::Shutdown(const char* Why) {	// UNOFFICIAL 2026-11-07 (rt-shutdown; 
 	c.state = Core::Off;
 	_snprintf_s(c.status, sizeof(c.status), _TRUNCATE, "off: %s", Why);
 }
-const char* RtCore::StatusText() { return TheCore.status; }
+const char* RtCore::StatusText() {
+	if (!TheGate.gated) return TheCore.status;
+	// UNOFFICIAL 2026-11-15 RT master switches: the menu's first line and the REPORT block say why nothing is traced here
+	_snprintf_s(TheGate.status, sizeof(TheGate.status), _TRUNCATE, "off here: Ray tracing %s is off ([Main.Main.RayTracing] %s false), so every ray-traced "
+		"effect stands down and the normal effects draw; the helper: %s", TheGate.exterior ? "outdoors" : "indoors", TheGate.exterior ? "RTExteriors" : "RTInteriors",
+		TheCore.state == Core::Running ? "up, idle (nothing gathered, built or traced)" : TheCore.status[0] ? TheCore.status : "not started");
+	return TheGate.status;
+}
+
+// UNOFFICIAL 2026-11-15 RT master switches (RtCore.h Gated / UpdateGate)
+bool RtCore::Gated() { return TheGate.gated; }
+
+bool RtCore::UpdateGate(bool Exterior) {
+	MasterGate& g = TheGate;
+	SettingManager::Configuration::ConfigNode node;
+	const bool interiors = !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "RTInteriors") || node.BoolValue;	// (a missing key: on)
+	const bool exteriors = !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "RTExteriors") || node.BoolValue;
+	if (!g.known ? (!interiors || !exteriors) : (interiors != g.interiors || exteriors != g.exteriors))
+		Logger::Log("UNOFFICIAL RT master switches: Ray tracing indoors %s, Ray tracing outdoors %s ([Main.Main.RayTracing] RTInteriors / RTExteriors; "
+			"a switch that is off makes every ray-traced effect stand down in that kind of space, the effects' own settings unchanged).",
+			interiors ? "on" : "OFF", exteriors ? "on" : "OFF");
+	const bool was = g.gated;
+	g.interiors = interiors;
+	g.exteriors = exteriors;
+	g.exterior = Exterior;
+	g.gated = !(Exterior ? exteriors : interiors);
+	const bool first = !g.known;
+	g.known = true;
+	if (g.gated == was) return false;
+	g.changes++;
+	// One GAME line in the session log per change (doors and switches alike), with the cell and the game time; only for a player who has
+	// a switch off, so a default session never shows one
+	char what[300];
+	if (g.gated)
+		_snprintf_s(what, sizeof(what), _TRUNCATE, "RT master switch: ray tracing OFF here (%s, [Main.Main.RayTracing] %s false): every ray-traced effect stands down, the "
+			"normal effects draw; the RT helper %s", Exterior ? "outdoors" : "indoors", Exterior ? "RTExteriors" : "RTInteriors",
+			TheCore.state == Core::Running ? "idles (no scene, no passes, no uploads)" : "is not running");
+	else
+		_snprintf_s(what, sizeof(what), _TRUNCATE, "RT master switch: ray tracing allowed again here (%s): each ray-traced effect follows its own switch%s",
+			Exterior ? "outdoors" : "indoors", TheCore.state == Core::Running ? "; the histories start over (camera cut)" : "");
+	SessionLog::OnEvent(what);
+	// (the first frame's gate is no change: nothing was traced before it)
+	return !first && TheCore.state == Core::Running;
+}
 const NvrRtShared* RtCore::Helper() { return TheCore.state == Core::Running ? TheCore.shared : nullptr; }
 UInt32 RtCore::Instances() { return TheCore.instances; }
 const std::vector<RtCore::GlowLight>& RtCore::GlowLights() { return TheCore.frameGlows; }
@@ -4075,18 +4140,18 @@ bool RtCore::MarkEmissive(UInt32 Record, UInt32 Number) {
 UInt32 RtCore::Geometries() { return (UInt32)TheCore.geometries.size(); }
 UInt32 RtCore::Waiting() { return TheCore.waiting; }
 UInt32 RtCore::Released() { return TheCore.released; }
-bool RtCore::AlphaTested() { return TheCore.state == Core::Running && TheCore.alphaOn && TheCore.atlasImage >= 0; }
+bool RtCore::AlphaTested() { return CoreLive() && TheCore.alphaOn && TheCore.atlasImage >= 0; }
 int RtCore::AlphaAtlasImage() { return TheCore.alphaOn || TheCore.hitTextures ? TheCore.atlasImage : -1; }	// shared slots
-int RtCore::AlbedoAtlasImage() { return TheCore.state == Core::Running && TheCore.hitTextures ? TheCore.albedoAtlasImage : -1; }
-int RtCore::GlowAtlasImage() { return TheCore.state == Core::Running && TheCore.hitTextures ? TheCore.glowAtlasImage : -1; }
-int RtCore::NormalAtlasImage() { return TheCore.state == Core::Running && TheCore.hitTextures ? TheCore.normalAtlasImage : -1; }	// UNOFFICIAL 2026-11-02
+int RtCore::AlbedoAtlasImage() { return CoreLive() && TheCore.hitTextures ? TheCore.albedoAtlasImage : -1; }
+int RtCore::GlowAtlasImage() { return CoreLive() && TheCore.hitTextures ? TheCore.glowAtlasImage : -1; }
+int RtCore::NormalAtlasImage() { return CoreLive() && TheCore.hitTextures ? TheCore.normalAtlasImage : -1; }	// UNOFFICIAL 2026-11-02
 UInt32 RtCore::HiddenInstances() { return TheCore.hiddenInstances; }	// UNOFFICIAL 2026-11-07 (perf-ptcost; RtCore.h)
-bool RtCore::GrassWanted() { return TheCore.state == Core::Running && TheCore.grassOn; }
+bool RtCore::GrassWanted() { return CoreLive() && TheCore.grassOn; }
 void RtCore::DisplacedCopies(bool& Land, bool& Objects) {	// UNOFFICIAL 2026-11-07
-	const bool on = TheCore.state == Core::Running;
+	const bool on = CoreLive();	// (2026-11-15: + the RT master gate)
 	Land = on && TheCore.dispLand; Objects = on && TheCore.dispObjects;
 }
-bool RtCore::DecalsTraced() { return TheCore.state == Core::Running && TheCore.decalsOn && TheCore.alphaOn && TheCore.atlasImage >= 0; }	// UNOFFICIAL 2026-11-07
+bool RtCore::DecalsTraced() { return CoreLive() && TheCore.decalsOn && TheCore.alphaOn && TheCore.atlasImage >= 0; }	// UNOFFICIAL 2026-11-07
 
 void RtCore::NoteGrass(NiGeometry* Geometry, IDirect3DBaseTexture9* Texture, const float* Instances, UINT Count, UINT VertsPerTuft, const float* ScaleMask, UInt32 AlphaRef) {
 	Core& c = TheCore;
@@ -4125,4 +4190,4 @@ void RtCore::NoteGrass(NiGeometry* Geometry, IDirect3DBaseTexture9* Texture, con
 	}
 }
 
-bool RtCore::Actors() { return TheCore.state == Core::Running && TheCore.actorsOn && TheCore.rtSkin; }
+bool RtCore::Actors() { return CoreLive() && TheCore.actorsOn && TheCore.rtSkin; }

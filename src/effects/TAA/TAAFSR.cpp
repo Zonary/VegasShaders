@@ -28,6 +28,7 @@
 #include "../../core/ReactiveMask.h"	// UNOFFICIAL 2026-10-30 ReactiveMask: FSR's reactive mask from the world's alpha draws
 #include "../../core/ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion: FSR's motion vectors for what moved itself
 #include "../../core/RenderRect.h"	// UNOFFICIAL 2026-10-30 DLSS Ray Reconstruction (no RR in rect frames)
+#include "../../core/FdIndirect.h"	// UNOFFICIAL 2026-11-15 DeferredRRGuides (full deferred renderer, phase 6: docs/next/FD-GI-RESULTS.md)
 #include "../../core/RtPathTrace.h"	// UNOFFICIAL 2026-11-07 (ptaaa-denoiser) RR's guides from the path tracer
 #include "../../core/RrRectPlan.h"	// UNOFFICIAL 2026-11-07 (perf-rr) RR at RenderScale < 1: sizes, jitter, the composite's rect mapping
 
@@ -520,7 +521,12 @@ bool TAAEffect::RayReconstruct(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	// UNOFFICIAL 2026-10-31 AlbedoBuffer (RRAlbedo 2): the templates' own base colour ([Main.Main.Quality] AlbedoBuffer) when it holds this frame's, at the screen's size
 	const D3DXVECTOR4* albedoData = Registered("TESR_AlbedoBufferData");
 	IDirect3DBaseTexture9* albedo = SlotTexture("TESR_AlbedoBuffer");
-	bool albedoOn = RRSettings.Albedo == 2 && albedoData && albedoData->x > 0.5f && albedo && albedo->GetType() == D3DRTYPE_TEXTURE;
+	// UNOFFICIAL 2026-11-15 DeferredRRGuides ([Main.Main.Quality], live, test only; core/FdIndirect.h): while the deferred renderer runs with it
+	// on, the guides take G-buffer v2: its albedo (the RRAlbedo 2 path whatever RRAlbedo says) and its normal-mapped shading normal in place
+	// of the smooth normals buffer (the same view-space encoding: DlssRRGuides.comp reads it unchanged). Off: as before.
+	const bool fdGuides = FdIndirect::RRGuidesOn();
+	if (fdGuides) normals = FdIndirect::ShadingNormals(Device, normals, depth);
+	bool albedoOn = (RRSettings.Albedo == 2 || fdGuides) && albedoData && albedoData->x > 0.5f && albedo && albedo->GetType() == D3DRTYPE_TEXTURE;
 	if (albedoOn) {
 		D3DSURFACE_DESC desc = {};
 		albedoOn = SUCCEEDED(static_cast<IDirect3DTexture9*>(albedo)->GetLevelDesc(0, &desc)) && desc.Width == (UINT)width && desc.Height == (UINT)height;

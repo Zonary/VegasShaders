@@ -149,6 +149,7 @@
 //                             when: FlickerWatch on outdoors
 
 #include "OrthoProbe.h"	// UNOFFICIAL 2026-10-17 test tools (AfterCombine)
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16 BloodFlow and DustMotes: not in release builds (no step, no slot)
 #include "CapturedNormals.h"	// UNOFFICIAL 2026-10-28 CapturedNormals (TESR_CapturedNormalsData)
 #include "ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion (TESR_ObjectMotionData)
 #include "Diagnostics.h"	// UNOFFICIAL 2026-11-01 the flash detector's stage probes (StageMark), the report burst's VL stages
@@ -677,7 +678,7 @@ void ShaderManager::PreStep_CompositePlan(ChainContext& ctx) {
 		if (Effects.ShadowsExteriors->Constants.ShadowBlur.y > 0.5f) FlickerWatch::Flags |= FlickerWatch::kLodUpdated;
 		if (GameState.isCellChanged) FlickerWatch::Flags |= FlickerWatch::kCellChanged;
 		ShadowsExteriorEffect* sx = Effects.ShadowsExteriors;
-		if (sx->SunGlideValid && GetTickCount64() - sx->SunGlideStart < (ULONGLONG)(1000.0f * sx->Settings.SunSmoothing.GlideSeconds))
+		if ((sx->SunGlideValid && GetTickCount64() - sx->SunGlideStart < (ULONGLONG)(1000.0f * sx->Settings.SunSmoothing.GlideSeconds)) || sx->DeferredFading)	// (2026-11-15 + the deferred steps' fades)
 			FlickerWatch::Flags |= FlickerWatch::kSunGlide;
 		FlickerWatch::Hour = ShaderConst.GameTime.y;
 		FlickerWatch::SunZ = sx->Constants.SmoothedSunDir.z;
@@ -885,6 +886,7 @@ void ShaderManager::PreStep_BounceLight(ChainContext& ctx) {
 }
 
 void ShaderManager::PreStep_BloodFlow(ChainContext& ctx) {
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: release builds have no BloodFlow (and no step row below)
 	IDirect3DDevice9* Device = ctx.Device;
 	IDirect3DSurface9* RenderTarget = ctx.RenderTarget;
 	IDirect3DSurface9* SourceSurface = ctx.SourceSurface;
@@ -895,6 +897,7 @@ void ShaderManager::PreStep_BloodFlow(ChainContext& ctx) {
 		GpuProfileScope gpu(bloodFlowTimer, Device);
 		{ Effects.BloodFlow->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 0, false, SourceSurface); PixelInspector::AfterFrame(Effects.BloodFlow); }
 	}
+#endif
 }
 
 void ShaderManager::PreStep_WetFlashlightSpecularUnderwater(ChainContext& ctx) {
@@ -1078,6 +1081,7 @@ void ShaderManager::PreStep_VolumetricLight(ChainContext& ctx) {
 }
 
 void ShaderManager::PreStep_DustMotes(ChainContext& ctx) {
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: release builds have no DustMotes (and no step row below)
 	static GpuTimer dustMotesTimer("Dust motes");
 	IDirect3DDevice9* Device = ctx.Device;
 	IDirect3DSurface9* RenderTarget = ctx.RenderTarget;
@@ -1088,6 +1092,7 @@ void ShaderManager::PreStep_DustMotes(ChainContext& ctx) {
 		GpuProfileScope gpu(dustMotesTimer, Device);
 		Effects.DustMotes->RenderFrame(Device, RenderTarget, ctx.lightGrid);
 	}
+#endif
 }
 
 void ShaderManager::PreStep_Sandstorm(ChainContext& ctx) {
@@ -1510,6 +1515,7 @@ void ShaderManager::PostStep_RtSunDebug(ChainContext& ctx) {
 	IDirect3DSurface9* RenderTarget = ctx.RenderTarget;
 	RtSunShadows::RenderDebug(Device, RenderTarget);	// UNOFFICIAL 2026-10-28 [Shaders.ShadowsExteriors.RT] DebugView 4 (nothing otherwise)
 	RtPathTrace::RenderDebug(Device, RenderTarget);	// UNOFFICIAL 2026-11-02 [Main.Main.RayTracing] ReferencePT (nothing otherwise)
+	CapturedNormals::ViewRender(Device, RenderTarget);	// UNOFFICIAL 2026-11-14 [Main.Main.Quality] GBufferView (test only; nothing otherwise)
 }
 
 void ShaderManager::PostStep_Debug(ChainContext& ctx) {
@@ -1572,14 +1578,18 @@ static const EffectChain::Step PreTonemapSteps[] = {
 	{ "AmbientLight", EffectChain::PreTonemap, &ShaderManager::PreStep_AmbientLight },
 	{ "LitProbes", EffectChain::PreTonemap, &ShaderManager::PreStep_LitProbes },
 	{ "BounceLight", EffectChain::PreTonemap, &ShaderManager::PreStep_BounceLight },
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h
 	{ "BloodFlow", EffectChain::PreTonemap, &ShaderManager::PreStep_BloodFlow },
+#endif
 	{ "WetFlashlightSpecularUnderwater", EffectChain::PreTonemap, &ShaderManager::PreStep_WetFlashlightSpecularUnderwater },
 	{ "SpillSelfTest", EffectChain::PreTonemap, &ShaderManager::PreStep_SpillSelfTest },
 	{ "Reflections", EffectChain::PreTonemap, &ShaderManager::PreStep_Reflections },
 	{ "VolumetricLightGrid", EffectChain::PreTonemap, &ShaderManager::PreStep_VolumetricLightGrid },
 	{ "VolumetricFog", EffectChain::PreTonemap, &ShaderManager::PreStep_VolumetricFog },
 	{ "VolumetricLight", EffectChain::PreTonemap, &ShaderManager::PreStep_VolumetricLight },
+#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h
 	{ "DustMotes", EffectChain::PreTonemap, &ShaderManager::PreStep_DustMotes },
+#endif
 	{ "Sandstorm", EffectChain::PreTonemap, &ShaderManager::PreStep_Sandstorm },
 	{ "GodRays", EffectChain::PreTonemap, &ShaderManager::PreStep_GodRays },
 	{ "RayReconstruction", EffectChain::PreTonemap, &ShaderManager::PreStep_RayReconstruction },

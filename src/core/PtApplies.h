@@ -9,6 +9,7 @@
 //     picture first replaces the scene and again when the set changes ("PT APPLIES" lines).
 // The evidence for every row, with file and line, is docs/PT-WHAT-APPLIES.md: change the two together. Lines are plain and short. A key
 // the menu shows is named "Ray tracing > Key"; a key it hides (the Internal list) is named as a settings file key.
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: EachName leaves out a shelved effect (release builds only)
 namespace RtPathTrace { bool Replacing(); }	// (core/RtPathTrace.h)
 
 namespace PtApplies {
@@ -130,7 +131,7 @@ namespace PtApplies {
 			while (*p == ' ' || *p == ',') p++;
 			const char* end = p;
 			while (*end && *end != ',') end++;
-			if (end > p) each(std::string(p, end));
+			if (end > p && !ShelvedEffects::Name(std::string(p, end).c_str())) each(std::string(p, end));	// UNOFFICIAL 2026-11-16: not a shelved effect (release builds only)
 			p = end;
 		}
 	}
