@@ -284,7 +284,10 @@ namespace DeferredFirstPerson {
 
 	// The view model's screen box from its parts' bounds (as ShadowManager's ViewModelSpheres gathers them), the whole view if none.
 	inline void Spheres(NiAVObject* o, RECT& box, bool& any, int depth) {
-		if (!o || depth > 48 || (o->m_flags & NiAVObject::NiFlags::APP_CULLED)) return;
+		// (2026-11-16) not the root's APP_CULLED: the game clears it only inside the first-person render (Render.cpp's ViewModelShadows note) and
+		// sets it again after, so read here (after the render) the walk stopped at the root and the box was always the whole screen (batch 8:
+		// "box pixels 2,073,600" in every window)
+		if (!o || depth > 48 || (depth > 0 && (o->m_flags & NiAVObject::NiFlags::APP_CULLED))) return;
 		if (o->IsGeometry()) {
 			NiGeometry* g = static_cast<NiGeometry*>(o);
 			NiSkinInstance* skin = g->skinInstance;
@@ -371,10 +374,10 @@ namespace DeferredFirstPerson {
 			DiagLines++;
 			const D3DXMATRIX& rp = NiDX9Renderer::GetSingleton()->projMatrix;
 			Logger::Log("UNOFFICIAL DeferredFirstPerson: frame %u: eye off the world eye + offset %.3f units, forward cosine %.6f, offset (%.1f %.1f %.1f) | tan fp %.4f / %.4f, world %.4f / %.4f | "
-				"depth terms %.6g %.6g, the renderer's projection now %.6g %.6g | deferred binds: lamps %u, sun %u | box %ld,%ld-%ld,%ld of %ux%u | parts %d, weather %s (%.2f %.2f %.2f %.2f) | sun map %s",
+				"depth terms %.6g %.6g, the renderer's projection now %.6g %.6g | deferred binds: lamps %u, sun %u | box %ld,%ld-%ld,%ld of %ux%u | parts %d (nearest bound %.1f units from the eye), weather %s (%.2f %.2f %.2f %.2f) | sun map %s",
 				(unsigned)TheFrameRateManager->FrameNumber, EyeOff, Turn, Offset.x, Offset.y, Offset.z, Frame[0].w, Frame[1].w, fabsf(TheRenderManager->InvProjMatrix._11), fabsf(TheRenderManager->InvProjMatrix._22),
 				proj[0], proj[1], rp._33, rp._43, DeferredLamps::DeferredBindsThisSpan, DeferredSun::LightFreeBindsThisSpan, box.left, box.top, box.right, box.bottom, t.Width, t.Height,
-				GearWeather::PartCount, GearWeather::Live ? "live" : "off", GearWeather::Sent[0], GearWeather::Sent[1], GearWeather::Sent[2], GearWeather::Sent[3],
+				GearWeather::PartCount, GearWeather::NearestPart, GearWeather::Live ? "live" : "off", GearWeather::Sent[0], GearWeather::Sent[1], GearWeather::Sent[2], GearWeather::Sent[3],
 				DeferredSun::Vm.charData[3] > 0.0f ? "this frame's" : "none");
 		}
 		StatBoxPixels += (unsigned long long)(box.right - box.left) * (unsigned long long)(box.bottom - box.top);

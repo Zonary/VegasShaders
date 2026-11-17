@@ -46,6 +46,9 @@ float4 FL_Gamma    : register(c8);	// z the gamma (copy path), w 1 / the gamma; 
 float4 FL_Shadow   : register(c9);	// x 1 = the shadow map is there, y its texel size (0-1), z the depth bias (share of the reach), w PCF radius (texels)
 float4 FL_Look     : register(c10);	// x cookie strength (0 none), y DebugView (0 off, 1 the light alone, 2 the shadow, 3 the normal), z Falloff (0: the lamps' 1 - d^2 / r^2), w NearFade (units, 0 off; UNOFFICIAL 2026-11-11)
 row_major float4x4 FL_LightViewProj : register(c11);	// c11-c14: camera-relative world -> the shadow map's clip space
+#if CAPTURED_NORMALS_ON >= 4
+float4 FL_Model    : register(c15);	// UNOFFICIAL 2026-11-16 fd-batchA item 6: x 1 = the record's specular bit picks the model ([Shaders.Flashlight.Deferred] SpecularBit)
+#endif
 
 sampler2D FL_Frame    : register(s0);	// the frame's copy (only when it is not linear)
 sampler2D FL_Albedo   : register(s1);	// TESR_AlbedoBuffer: rgb linear base colour, a 1 - the draw's fog
@@ -160,16 +163,21 @@ float4 main(PS_IN IN, out float depth : DEPTH) : COLOR0 {
     // (2026-11-12 ptbump) b in -3 .. -2: a record coded "the game draws no highlight on this mesh" for the path tracer (Includes/
     // CapturedNormals.hlsl CapturedNoHighlight): the roughness this pass always lit it with is -2 - b. The land's b (-8 .. -6 with its
     // bump recorded, else -1): no roughness, as before.
-#if defined(FD_FOLIAGE) && FD_FOLIAGE
-    // UNOFFICIAL 2026-11-14 foliage (Includes/FoliageDeferred.hlsl): a leaf / grass deferred record's b is 2 + its sun weight: fully rough here
-    const float roughness = m.b > 1.5f ? 1.0f : m.b >= 0.0f ? m.b : (m.b < -1.99f && m.b > -3.01f) ? -2.0f - m.b : 0.7f;
-#else
-    const float roughness = m.b >= 0.0f ? m.b : (m.b < -1.99f && m.b > -3.01f) ? -2.0f - m.b : 0.7f;
-#endif
+    // (2026-11-16 fd-sunvis) the deferred passes' one decode (Includes/Object.hlsl GBufferRoughness): the foliage records' 2 + sun weight fully
+    // rough as before; none (-1) and the land's old -8 .. -6 fully rough (0.7 here until then)
+    const float roughness = GBufferRoughness(m.b);
     const float metal = saturate((m.r - floor(m.r)) / 0.49f);
     SetDiffuseEnergyKeep(N, -ray, roughness);
     const float3 albedo = tex2Dlod(FL_Albedo, uv4).rgb;
     float3 lit = getPointLightLightingAtt(toLight, att, FL_Color.rgb, -ray, N, albedo, roughness, metal);
+#if CAPTURED_NORMALS_ON >= 4
+    // UNOFFICIAL 2026-11-16 fd-batchA item 6 (docs/next/FD-BATCH-A.md): the record's specular bit (COLOR2.r + 16, the SPECULAR variants) picks the
+    // model as the forward shaders' objLampTerm did and DeferredLamps.hlsl does for the lamps: PBR for the shiny records (above), PBRDiffuse for
+    // the others (the plain and light-only records: meshes the game draws without a highlight, whose b is the DXT1 alpha's ~0.04, so the beam
+    // left a sharp GGX hot spot on matte walls). FL_Model.x 0: PBR for every pixel, as before.
+    [branch] if (FL_Model.x > 0.5f && floor(m.r + 0.01f) < 15.5f)
+        lit = LampAtt(att) * MICRO_SHADOW(N, toLight) PBRDiffuse(metal, roughness, lerp(luma(albedo), albedo, TESR_PBRExtraData.x), N, -ray, toLight, FL_Color.rgb * LIN_SCALE_LIGHT);
+#endif
     // UNOFFICIAL 2026-11-11 SoftEdges (the old flashlight's wrap: 0.75 x ((N.L + 1) / 2)^2 for the clamped N.L, the same mean light over
     // all normals, less speckle where the normals scatter): the diffuse's plain Lambert part (PBRDiffuse's: (1 - metal) x colour x N.L x
     // light) swapped for the wrap; the highlight as it is. Off: nothing changes.

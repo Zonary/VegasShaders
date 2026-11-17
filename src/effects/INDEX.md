@@ -43,6 +43,7 @@ One folder per effect: its C++, `README.md` (what it does, inputs, settings, pas
 | [PointShadows](PointShadows/) | - | yes | 15 | 0 | PointShadows.cpp, PointShadows.h | This pass builds one grey mask for the whole screen that says how much of the nearby point lights (lamps) and the one spot light reach each visible surface. A l |
 | [PointShadows2](PointShadows2/) | - | yes | 3 | 0 | PointShadows2.cpp, PointShadows2.h | PointShadows2 darkens or lights the scene for point lamps that PointShadows does not handle. It is a screen-space pass over the point-shadow buffer: for every p |
 | [Precipitations](Precipitations/) | true | yes | 3 | 2 | Rain.cpp, Rain.h | While it rains outdoors, the picture gets falling rain streaks laid over the view. Drops are drawn in layers at increasing distance from the camera, so near str |
+| [Puddles](Puddles/) | false | yes | 6 | 3 | PuddleMap.h, Puddles.cpp, Puddles.h | Puddles that behave like a modern engine's: they sit where water would gather (dips in the noise field, the land's crevices, flat open ground), grow while it ra |
 | [Reflections](Reflections/) | false | yes | 44 | 3 | Reflections.cpp, Reflections.h, RtReflLamps.h |  |
 | [SMAA](SMAA/) | true | - | 12 | 2 | SMAA.cpp, SMAA.h |  |
 | [Sandstorm](Sandstorm/) | false | - | 16 | 2 | Sandstorm.cpp, Sandstorm.h |  |
@@ -58,6 +59,7 @@ One folder per effect: its C++, `README.md` (what it does, inputs, settings, pas
 | [SnowAccumulation](SnowAccumulation/) | false | yes | 3 | 2 | SnowAccumulation.cpp, SnowAccumulation.h | While it snows outdoors, snow builds up on the ground, on the tops of rocks, walls and cars, and stays for a while after the flakes stop, then melts over game h |
 | [Specular](Specular/) | false | - | 10 | 3 | Specular.cpp, Specular.h |  |
 | [SunFar](SunFar/) | true | - | 3 | 1 | SunFar.cpp, SunFar.h |  |
+| [SunGlare](SunGlare/) | false | yes | 1 | 2 | SunGlare.cpp, SunGlare.h | The sun's lens glare: what a camera lens (or the eye, through its lashes) makes of a small, very bright source. Round the sun's place on screen it adds - a tigh |
 | [SunShadows](SunShadows/) | - | yes | 13 | 0 | SunShadows.cpp, SunShadows.h | SunShadows writes the outdoor sun's shadow term into the two-channel buffer `TESR_PointShadowBuffer` (G16R16, 0..1). - Red: sun visibility, 1 = lit. It always h |
 | [TAA](TAA/) | false | - | 8 | 5 | TAA.cpp, TAA.h, TAAFSR.cpp, TAAUpscale.cpp |  |
 | [Terrain](Terrain/) | true | - | 0 | 13 | LandHeights.cpp, LandHeights.h, Terrain.cpp, Terrain.h |  |

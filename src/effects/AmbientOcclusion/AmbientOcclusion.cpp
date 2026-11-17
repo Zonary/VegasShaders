@@ -6,6 +6,7 @@
 #include "../../core/DxvkCompute.h"	// UNOFFICIAL 2026-10-25 (NVR DXVK)
 #include "../../core/RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
 #include "../../core/RtAmbient.h"
+#include "../../core/GrassMaskedAlbedo.h"	// UNOFFICIAL 2026-11-15 GIGrassDenoise's soft mask from the MaterialBuffer's grass mark
 #include "../../core/ManyLamps.h"
 #include "../PBR/PBR.h"	// UNOFFICIAL 2026-11-04 (rtgap) the game's light scale	// UNOFFICIAL 2026-11-03 (rtspec) GIGameLamps: the game's lamp table
 #include "../../core/RtCore.h"
@@ -484,7 +485,8 @@ namespace {
 		// (2026-10-30) GIReuse's reservoirs: two pairs, last frame's and this frame's, swapped every frame (RtAOTrace.comp RT_GI_PASS).
 		for (int set = 0; set < 2; set++) {
 			RtImageReservoir[set][0] = RtCore::AddImage(set ? "NVR RT gi reservoir A1" : "NVR RT gi reservoir A0", w, h, NVR_EXT_SHARED_RGBA16F);
-			RtImageReservoir[set][1] = RtCore::AddImage(set ? "NVR RT gi reservoir B1" : "NVR RT gi reservoir B0", w, h, NVR_EXT_SHARED_RGBA16F);
+			// UNOFFICIAL 2026-11-13 (rtgi-review B3) twice as tall: the lower half holds GISamplePoints' sample points (RtAOTrace.comp ReuseGIPoints); no new shared image
+			RtImageReservoir[set][1] = RtCore::AddImage(set ? "NVR RT gi reservoir B1" : "NVR RT gi reservoir B0", w, 2 * h, NVR_EXT_SHARED_RGBA16F);
 		}
 		RtGIHistory = false;
 		RtImageGIOut = RtCore::AddImage("NVR RT gi out", w, h, NVR_EXT_SHARED_RGBA16F);
@@ -696,6 +698,9 @@ IDirect3DTexture9* AmbientOcclusionEffect::RtDenoisedGI(IDirect3DDevice9* Device
 	s.MovingHistory = RtAmbient::Current.GIMovingHistory;	// (2026-10-31, rt-ao-sky) with DenoiseBackbone only
 	s.Kernel = RtAmbient::Current.DenoiseKernel;	// (2026-10-30) 3 by default: ~2.5x cheaper (rt-sun 1f5d987e)
 	s.AntiLag = RtAmbient::Current.GIDenoiseAntiLag;	// UNOFFICIAL 2026-11-08 (rtgi-ghost): the path tracer's anti-lag (0 = off, as before)
+	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs, docs/next/RT-DENOISE-INPUTS.md) [Main.Main.RayTracing] GIDenoiseConfidence: the 1/5-size history
+	// confidence (RtDenoise Settings.Confidence; 0 / a missing key = off, as before)
+	s.Confidence = (std::max)(0.0f, (std::min)(16.0f, TheSettingManager->GetSettingF("Main.Main.RayTracing", "GIDenoiseConfidence")));
 	// UNOFFICIAL 2026-11-12 (sungi p4, STUDY F7 / phase 4) SunGI outdoors ([Shaders.AmbientOcclusion.RT] GIDenoiseSunGI, default true; off = the settings above
 	// only): the denoiser is the GI's one history, so (1) HistoryClamp 1.5: the history is clipped to the new frame's 3 x 3 mean +- 1.5 deviations (a moved
 	// light or a turn no longer leaves the old bounce behind); (2) Guide / GuideAlbedo / GuideSigma 0.5 as the path tracer's PTDenoiseGuide: the a-trous passes
@@ -717,13 +722,29 @@ IDirect3DTexture9* AmbientOcclusionEffect::RtDenoisedGI(IDirect3DDevice9* Device
 			s.Guide = lit;
 			s.GuideAlbedo = CapturedNormals::AlbedoTexture;
 			s.GuideSigma = 0.5f;
+			s.GuideOnce = true;	// UNOFFICIAL 2026-11-13 (rtgi-review B2; no key since the settings cleanup)
+			// UNOFFICIAL 2026-11-16 (rtgi-review; user: "its sparkling still under shadow", GIGrassBlur on or off) GIGrassDenoise: grass (no albedo texel) is one
+			// soft surface for the denoiser (RtDenoise.h Settings.Soft). Slot F, Zone, clear weather 10:00, the bounce alone: grass in the sun was calm, grass
+			// in the shade flickered 10-20 times more than solid ground beside it (there the bounce comes from a few sunlit spots: a high-variance sample, and
+			// on grass nothing averaged it: no history, no a-trous tap).
+			s.Soft = RtAmbient::Current.GIGrassDenoise;
+			// (2026-11-15 Vegas Shaders) the soft mask is "no albedo record" in the fork; our CapturedGrass gives the grass a record whenever RT GI runs,
+			// so with Soft on the guide's albedo is the copy whose alpha is 0 on the MaterialBuffer's grass mark too (core/GrassMaskedAlbedo.h; its
+			// colour is the albedo buffer's). Soft 0: the albedo buffer itself, as before.
+			if (s.Soft) s.GuideAlbedo = GrassMaskedAlbedo::Get(Device);
 		}
+		// UNOFFICIAL 2026-11-13 (rtgi-review R9 / R10) GIDenoiseTune (0 off = the settings above; 1; 2 default): 1 = MeanVariance 4 (the a-trous brightness test
+		// with the variance of the accumulated mean: a converged pixel is no longer smoothed as hard as a new one) + HistoryFix 3 (a newly seen pixel is
+		// smoothed by geometry only, so its one noisy sample leaves no speckle); 2 = and no HistoryClamp (its 3 x 3 window of raw 1-sample neighbours is
+		// too narrow, the reuse makes them alike, and it cut good history while turning; AntiLag's fast history keeps doing that job).
+		if (RtAmbient::Current.GIDenoiseTune >= 1) { s.MeanVariance = 4.0f; s.HistoryFix = 3.0f; }
+		if (RtAmbient::Current.GIDenoiseTune >= 2) s.HistoryClamp = 0.0f;
 		static bool sunGiLogged = false;
 		static bool roomGiLogged = false;
 		if (roomGiDenoise) {
-			if (!roomGiLogged) { roomGiLogged = true; Logger::Log("UNOFFICIAL RoomGI: the GI denoiser runs with HistoryClamp 1.5, kernel 5 x 3 passes%s%s (GIDenoiseRoomGI).", s.Guide ? ", guided by the lit frame + albedo buffer (sigma 0.5)" : ", unguided (no albedo buffer this frame)", s.ObjectMotion ? ", object motion" : ""); }
+			if (!roomGiLogged) { roomGiLogged = true; Logger::Log("UNOFFICIAL RoomGI: the GI denoiser runs with HistoryClamp 1.5, kernel 5 x 3 passes%s%s (GIDenoiseRoomGI).", s.Guide ? (s.Soft ? ", guided by the lit frame + albedo buffer (sigma 0.5), grass as one soft surface (GIGrassDenoise)" : ", guided by the lit frame + albedo buffer (sigma 0.5)") : ", unguided (no albedo buffer this frame)", s.ObjectMotion ? ", object motion" : ""); }
 		}
-		else if (!sunGiLogged) { sunGiLogged = true; Logger::Log("UNOFFICIAL SunGI: the GI denoiser runs with HistoryClamp 1.5, kernel 5 x 3 passes%s%s (GIDenoiseSunGI).", s.Guide ? ", guided by the lit frame + albedo buffer (sigma 0.5)" : ", unguided (no albedo buffer this frame)", s.ObjectMotion ? ", object motion" : ""); }
+		else if (!sunGiLogged) { sunGiLogged = true; Logger::Log("UNOFFICIAL SunGI: the GI denoiser runs with HistoryClamp 1.5, kernel 5 x 3 passes%s%s (GIDenoiseSunGI).", s.Guide ? (s.Soft ? ", guided by the lit frame + albedo buffer (sigma 0.5), grass as one soft surface (GIGrassDenoise)" : ", guided by the lit frame + albedo buffer (sigma 0.5)") : ", unguided (no albedo buffer this frame)", s.ObjectMotion ? ", object motion" : ""); }
 	}
 	result = RtDenoise::Run(denoiser, Device, gi, rtDenoisedGISurface, s);
 	static bool logged = false;
@@ -775,7 +796,7 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 					normalGuard ? "the rays' normals fetched by texel, no sampler; a texel that is not a unit normal takes the normal rebuilt from depth" : "the point-sampled read, traced as it reads");
 			}
 		}
-		if (!ExtConstants(extRtUniforms, layout, D3DXVECTOR4(RtAmbient::Current.LegacyTilt, 0.0f, 0.0f, normalGuard ? 1.0f : 0.0f))	/* x: 2026-11-10 LegacyTilt */ || !Resources(resources, count, inputs, 2, extRtUniforms.Buffer) ||
+		if (!ExtConstants(extRtUniforms, layout, D3DXVECTOR4(RtAmbient::Current.LegacyTilt, normalGuard ? 1.0f : 0.0f /* y: 2026-11-13 rtgi-review R4, the start point and the normal from one pixel */, 0.0f, normalGuard ? 1.0f : 0.0f))	/* x: 2026-11-10 LegacyTilt */ || !Resources(resources, count, inputs, 2, extRtUniforms.Buffer) ||
 			!ExtDrawTo(extInputRT.Pipeline, &rtInputSurface, 1, resources, count, &push, sizeof(push))) {
 			ExtFailed = wasFailed;
 			failed = true;
@@ -843,6 +864,19 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 	// puts the bounce into rgb the same way. The reuse's reservoirs hold one frame's rect layout: a history made at another RenderRect scale
 	// (or rect vs native) holds other texels and starts again (as the AO's RtHistoryScale).
 	const bool gi = rt.GI && al && al->ShouldRender();
+	// UNOFFICIAL 2026-11-13 (rtgi-review B3, from mrfury97's fork) GISamplePoints stores its reservoirs another way (A = light, W): a change of mode starts
+	// the history over. (2026-11-15 port) Not while DebugView 9 runs: that test view replaces the new candidate with DirectLight (BounceOrTest), which
+	// only ReuseGI knows; the test then runs on the plain reuse, and leaving it starts the history over like any change of mode.
+	const bool giSamplePoints = rt.GISamplePoints && rt.DebugView != 9;
+	{
+		static int lastPoints = -1;
+		if (lastPoints != (giSamplePoints ? 1 : 0)) {
+			if (lastPoints >= 0) RtGIHistory = false;
+			lastPoints = giSamplePoints ? 1 : 0;
+			Logger::Log("UNOFFICIAL RT AO: GI reuse: GISamplePoints %s (%s), GIValidate %s.", lastPoints ? "on" : "off",
+				lastPoints ? "the reservoirs keep their sample points: cosine, Jacobian and a visibility ray on spatial reuse" : "the reservoirs keep the light only", RtAmbient::Current.GIValidate ? "on" : "off");
+		}
+	}
 	if (gi && RtGIHistory && RtPlaceRestart()) RtGIHistory = false;	// UNOFFICIAL 2026-11-11 (sungi, F16): reuse.w 0 = no history (a new place / a sun jump)
 	{
 		static float giHistoryScale[2] = { 1.0f, 1.0f };
@@ -867,6 +901,10 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 		// UNOFFICIAL 2026-11-12 GILeafTransmission: rides on sunDir.w as 1 + the key (the constants are full; every reader tests w > 0.5 only). Key 0: w
 		// stays exactly 1 and RtAOTrace.comp Shade takes the old shadow ray.
 		if (sunUp && rt.GILeafTransmission > 0.0f) c.sunDir.w = 1.0f + rt.GILeafTransmission;
+		// UNOFFICIAL 2026-11-13 (rtgi-review R19, from mrfury97's fork; 2026-11-15 port) the hit textures' mip by the ray's footprint, always on since the
+		// fork's settings cleanup (was GIHitMips): + 4 on sunDir.w (the fork uses w's fraction, which here already carries GILeafTransmission).
+		// RtAOTrace.comp: SunW() = mod(w, 4) is the sun term, w > 3.5 the flag (the RT test host's scenes leave it off); the C++ readers below take fmodf(w, 4).
+		c.sunDir.w += 4.0f;
 		// UNOFFICIAL 2026-11-04 (rtgap) GIGameLamps: x the game's light scale, as its lit shaders light the sun (LIN_SCALE_LIGHT: 0.49 by day
 		// outdoors, 1 indoors / at night); the bounce hits were lit twice as strongly as the game lights the same surfaces by day
 		PBRShaders* pbr = TheShaderManager->Shaders.PBR;
@@ -996,6 +1034,7 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 	// count; the sun's luminance and height), the history may stand for 1 frame of samples only, growing back by one each frame.
 	static float prevLight[GILightKeys] = {};
 	static float giCap = 0.0f;
+	static float RtGIChange = 0.0f;	// UNOFFICIAL 2026-11-13 (rtgi-review R2) this frame's change of the bounce's light (0 none .. 1), for the cache's cap
 	// (2026-10-30) At full rate (Interleave 1, GIInterleave 1) the reuse runs inside the AO pass (one pass instead of two: ~6 ms on the
 	// iGPU, rt-gi-10/14), which then binds 10 images (the RT core's passes take up to 12 since rt-sun-core 6b9784c3); interleaved GI keeps
 	// its own pass (its whole-grid dispatch and tiles).
@@ -1039,16 +1078,20 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 	// update (its cells keep their light). Before, the flag itself followed PassesLeft(), and every flip started every cell over (GI pumping).
 	const bool coarseUpdate = cascade2 && RtCore::PassesLeft() >= 4;
 	const int cacheFlags = cacheOn ? (rt.CacheVisibility ? 1 : 0) | (cascade2 ? 2 : 0) : 0;
+	// UNOFFICIAL 2026-11-13 (rtgi-review B6, from mrfury97's fork) GIScreenAmbientOut: with AmbientReplace active and on-screen hits taking the lit frame,
+	// those hits lose the game's ambient share and gain the cache's irradiance (RtAOTrace.comp Bounce). (2026-11-15 port) + 64 in lamp slot 7's w here
+	// (the fork's + 32 is DebugView 9's test flag in Vegas Shaders; the off-screen flag is + 16). DebugView 9 forces the off-screen view, so it is left out.
+	const bool screenAmbientOut = gi && rt.GIScreenAmbientOut && rt.GIScreenLight && rt.DebugView != 7 && rt.DebugView != 9 && al && al->AmbientReplaceActive() && exterior;
 	// UNOFFICIAL 2026-11-13 (R21, from the tester fork's RT GI review) BUG FIX: the GI passes read lamp slot 7 as the radiance cache's grid,
 	// strength and flags WHATEVER it holds. With the cache off and no flag set the block below was skipped and the slot kept an eighth lamp or
 	// stack garbage (a positive w = "cache on", a w of 16+ = the off-screen flag: the on-screen bounce dropped). The slot is the cache's in
 	// every GI frame now: cleared here, and at most seven lamps.
-	if (gi && !(cacheOn || offscreenView)) {
+	if (gi && !(cacheOn || offscreenView || screenAmbientOut)) {
 		c.gi.z = (std::min)(c.gi.z, (float)(RtAmbient::GILampsMax - 1));
 		c.lampPos[RtAmbient::GILampsMax - 1] = D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);
 		c.lampColor[RtAmbient::GILampsMax - 1] = D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);
 	}
-	if (cacheOn || offscreenView) {
+	if (cacheOn || offscreenView || screenAmbientOut) {
 		const D3DXVECTOR4& camera = TheRenderManager->CameraPosition;
 		const double size = rt.CacheCellSize;
 		const double cell[3] = { floor(camera.x / size), floor(camera.y / size), floor(camera.z / size) };
@@ -1060,6 +1103,7 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 		c.lampPos[RtAmbient::GILampsMax - 1] = cc.cacheA;
 		c.lampColor[RtAmbient::GILampsMax - 1] = cc.cacheB;
 		if (offscreenView) c.lampColor[RtAmbient::GILampsMax - 1].w += 16.0f + giTestFlag;	// (the cache pass's own cacheB keeps the plain strength)
+		if (screenAmbientOut) c.lampColor[RtAmbient::GILampsMax - 1].w += 64.0f;	// (2026-11-13 B6; + 64 here, see above)
 	}
 	RtAmbient::GIConstants g = {};
 	memset(&g, 0, sizeof(g));	// (2026-11-13 R21)
@@ -1072,18 +1116,35 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 			light[1] = (std::max)(light[1], luma(c.lampColor[k]));
 		}
 		light[2] = c.gi.z;
-		light[3] = c.sunDir.w > 0.5f ? luma(c.sunColor) : 0.0f;
-		light[4] = c.sunDir.w > 0.5f ? c.sunDir.z * 10.0f : 0.0f;
+		light[3] = fmodf(c.sunDir.w, 4.0f) > 0.5f ? luma(c.sunColor) : 0.0f;	// (w: the sun term + 4, the hit-mip flag)
+		light[4] = fmodf(c.sunDir.w, 4.0f) > 0.5f ? c.sunDir.z * 10.0f : 0.0f;
 		bool changed = false;
 		for (int k = 0; k < GILightKeys; k++)
 			if (fabsf(light[k] - prevLight[k]) > 0.1f * (std::max)((std::max)(fabsf(light[k]), fabsf(prevLight[k])), 0.01f)) changed = true;
+		float giLightLast[GILightKeys];	// (2026-11-13 rtgi-review R2) last frame's keys, for the size of the change below
+		memcpy(giLightLast, prevLight, sizeof(giLightLast));
 		memcpy(prevLight, light, sizeof(light));
-		giCap = changed ? 1.0f : (std::min)(giCap + 1.0f, (float)rt.GIReuse);
+		// UNOFFICIAL 2026-11-13 (rtgi-review R2) the history cut by energy (no key since the settings cleanup). The user's log of 2026-11-13: 2660 cuts in 74400
+		// frames (one every 30-45 frames outdoors by day), each one the reservoirs back to 1 frame AND the radiance cache back to 2 visits (112 frames to
+		// grow back), all from the lamps' keys (the nearest 7 change as the player walks, fires flicker) while the sun was nearly all of the bounce.
+		// Now the size of the change sets how much history may stay: change = the sun keys' largest relative change, or the lamp keys' x 0.1 while the
+		// sun lights (outdoors by day their light is a few percent of the bounce) and x 1 otherwise; under 3 % nothing happens; else the history may hold
+		// 0.5 / change frames (10 %: 5 frames, 25 %: 2, 50 % and up: 1), so the stale light left in it stays about the same small share. RtGIChange is
+		// read by the cache's cap below the same way.
+		RtGIChange = changed ? 1.0f : 0.0f;
+		{
+			auto rel = [&](int k) { return fabsf(light[k] - giLightLast[k]) / (std::max)((std::max)(fabsf(light[k]), fabsf(giLightLast[k])), 0.01f); };
+			const float lampShare = fmodf(c.sunDir.w, 4.0f) > 0.5f && light[3] > 0.02f ? 0.1f : 1.0f;
+			RtGIChange = (std::max)((std::max)(rel(3), rel(4)), lampShare * (std::max)((std::max)(rel(0), rel(1)), rel(2)));
+			if (RtGIChange < 0.03f) RtGIChange = 0.0f;
+			changed = RtGIChange > 0.0f;
+			giCap = changed ? (std::min)(giCap, std::clamp(0.5f / RtGIChange, 1.0f, (float)rt.GIReuse)) : (std::min)(giCap + 1.0f, (float)rt.GIReuse);
+		}
 		static int cuts = 0, frames = 0;	// (logged every 600 GI frames: how often the light changed enough to cut the history)
 		cuts += changed ? 1 : 0;
 		if (++frames >= 600) { Logger::Log("UNOFFICIAL RT AO: GI reuse history cut %d times in the last 600 frames (the lamps or the sun changed by > 10 %%).", cuts); cuts = frames = 0; }
 		// UNOFFICIAL 2026-11-08 (rtgi-ghost) + 4096 x the reuse fixes' flags (RtAOTrace.comp ReuseGI: 1 GIReuseSpread, 2 GIReuseShuffle, 4 SampleLockFix 2026-11-09)
-		const int reuseFlags = (rt.GIReuseSpread ? 1 : 0) | (rt.GIReuseShuffle ? 2 : 0) | (rt.SampleLockFix ? 4 : 0);
+		const int reuseFlags = (rt.GIReuseSpread ? 1 : 0) | (rt.GIReuseShuffle ? 2 : 0) | (rt.SampleLockFix ? 4 : 0) | (giSamplePoints ? 16 : 0) | (giSamplePoints && rt.GIValidate ? 32 : 0);	// (8 and 64 were GICandidates / GISpatialVisibility: removed in the fork's settings cleanup 2026-11-13)
 		{
 			static int loggedFlags = -1;
 			if (reuseFlags != loggedFlags) {
@@ -1134,7 +1195,7 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 	const bool mergedNow = merged && c.gi3.z > 0.5f;
 	const bool cacheNow = cacheOn && (giPass || mergedNow);
 	bool cacheReset = false;
-	if (cacheOn && !cacheNow) { c.lampColor[RtAmbient::GILampsMax - 1] = D3DXVECTOR4(0.0f, 0.0f, 0.0f, offscreenView ? 16.0f + giTestFlag : 0.0f); g.lampColor[RtAmbient::GILampsMax - 1] = c.lampColor[RtAmbient::GILampsMax - 1]; }
+	if (cacheOn && !cacheNow) { c.lampColor[RtAmbient::GILampsMax - 1] = D3DXVECTOR4(0.0f, 0.0f, 0.0f, (offscreenView ? 16.0f + giTestFlag : 0.0f) + (screenAmbientOut ? 64.0f : 0.0f)); g.lampColor[RtAmbient::GILampsMax - 1] = c.lampColor[RtAmbient::GILampsMax - 1]; }
 	if (cacheNow) {
 		cc.origin = c.origin;
 		cc.gi = c.gi;
@@ -1150,7 +1211,9 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 		const UINT div = cacheReset ? 1u : (UINT)cacheSpread;
 		// (2026-11-07 perf-history) CacheFrames is frames at 60 fps: the same seconds at this frame rate (RtHistoryTime.h)
 		const float cacheFrames = RtHistoryTime::Frames((float)rt.CacheFrames, RtDenoise::HistoryClock());
-		RtCacheCap = cacheReset || giCap <= 1.0f ? 2.0f : (std::min)(RtCacheCap + 1.0f / (float)div, cacheFrames);
+		// (2026-11-13 rtgi-review R2) the history cut by energy (was GICutByEnergy): on a change of light the cells keep 0.5 / change visits (at least 2), not 2 on every one
+		if (cacheReset) RtCacheCap = 2.0f;
+		else RtCacheCap = RtGIChange > 0.0f ? (std::max)(2.0f, (std::min)(RtCacheCap, 0.5f / RtGIChange)) : (std::min)(RtCacheCap + 1.0f / (float)div, cacheFrames);
 		cc.cacheC = D3DXVECTOR4((float)cacheRays, cacheReset ? -RtCacheCap : (std::min)(RtCacheCap, cacheFrames),
 			(float)(TheFrameRateManager->FrameNumber % div), (float)div);
 		cc.cacheD = D3DXVECTOR4((float)((TheFrameRateManager->FrameNumber / div) % 4096u), (float)RtAmbient::CacheLazyPeriod, 2.5f, 0.0f);
@@ -1270,7 +1333,7 @@ void AmbientOcclusionEffect::RtRecord(IDirect3DDevice9* Device) {
 	static bool giLogged = false;
 	if (gi && !giLogged) {
 		giLogged = true;
-		Logger::Log("UNOFFICIAL RT AO: GI traced (1 bounce ray of %.0f units, %d lamps, sun %s, %s).", rt.GIDistance, (int)c.gi.z, c.sunDir.w > 0.5f ? "up" : "down / indoors",
+		Logger::Log("UNOFFICIAL RT AO: GI traced (1 bounce ray of %.0f units, %d lamps, sun %s, %s).", rt.GIDistance, (int)c.gi.z, fmodf(c.sunDir.w, 4.0f) > 0.5f ? "up" : "down / indoors",
 			giPass ? "its own pass with ReSTIR GI temporal reuse (GIReuse)" : mergedNow ? "in the AO pass with ReSTIR GI temporal reuse" : "in the AO pass");
 	}
 }

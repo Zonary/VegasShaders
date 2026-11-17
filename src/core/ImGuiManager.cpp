@@ -32,6 +32,7 @@
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback: its notices, shown with the install check's
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the SunSmoothing notes)
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: BloodFlow and DustMotes have no page, row or search entry in a release build
+#include "SettingForce.h"	// UNOFFICIAL 2026-11-16: keys the deferred renderer sets (on or off) show greyed, at the value in effect
 
 // The settings overlay (ImGui on the game's D3D9 device). Layout, top to bottom: a menu bar (File / View / Tools and the
 // global switches), the sidebar of sections next to the page of the selected section, and a one-line status bar. Input
@@ -636,6 +637,8 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Main.Main.Performance",                "ShaderWarmUp",       RestartRule::Changed },	// runs once, at the main menu
 	{ "Main.Main.Performance",                "SlimDepthBuffer",    RestartRule::Changed },	// depth texture format (CombineDepth)
 	{ "Shaders.ShadowsExteriors.Main",        "ForwardShadows",     RestartRule::TurnOn },
+	{ "Shaders.ShadowsExteriors.ScreenSpace", "Bend",               RestartRule::TurnOn },	// UNOFFICIAL 2026-11-06 SUN_CONTACT_FORWARD + texture at start
+	{ "Shaders.ShadowsExteriors.ScreenSpace", "InLighting",         RestartRule::TurnOn },
 	{ "Main.Main.Performance",                "NvrDxvkDisplacement", RestartRule::TurnOn },	// land shaders registered as they load ([Shaders.Terrain.Displacement] Enabled is live)
 	{ "Shaders.ShadowsExteriors.SunSmoothing","CrossFade",          RestartRule::Changed },
 	{ "Shaders.ShadowsExteriors.SunSmoothing","DeferredFade",       RestartRule::TurnOn },	// UNOFFICIAL 2026-11-15 fd-smoothsun (compiled into the deferred sun pass at startup)
@@ -678,6 +681,8 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Shaders.PBR.Main",                     "VanillaBridgeDielectricMax", RestartRule::Changed },	// VANILLA_BRIDGE_DIELECTRIC_MAX (2026-11-06)
 	{ "Shaders.HandBlood.Status",             "Enabled",            RestartRule::Changed },
 	{ "Shaders.Cloth.Main",                   "Enabled",            RestartRule::TurnOn },
+	{ "Shaders.Puddles.Status",               "Enabled",            RestartRule::Changed },	// WETNESS_EFFECTS 2 (2026-11-08)
+	{ "Shaders.Puddles.Main",                 "MapMode",            RestartRule::Changed },	// WETNESS_EFFECTS 3 (2026-11-12)
 	{ "Shaders.WetnessEffects.HudRaindrops",  "Enabled",            RestartRule::TurnOn },	// HUD_RAIN_ON: on at start
 	{ "Shaders.VolumetricClouds.Main",        "Resolution",         RestartRule::Changed },	// textures made at start
 	{ "Shaders.VolumetricClouds.Main",        "HalfResolution",     RestartRule::Changed },
@@ -1513,8 +1518,9 @@ static const SimpleRow kSimpleRows[] = {
 		"For much more speed, use FSR or DLSS at Quality (67%) on the anti-aliasing page: path tracing follows the render scale, and that "
 		"roughly doubles the frame rate. A preset does not change your anti-aliasing or any other setting. "
 		"Custom means your settings match none of the three (for example path tracing switched on by its own switch above)." },
-	// GunFX (Main)
-	{ "Main.GunFX.Main", "Puff", "Smoke puff at the muzzle", nullptr, "A small puff of smoke from the barrel on every shot. Needs GunFX.dll." },
+	// GunFX (2026-11-16, gunfx-builtin: built into Vegas Shaders; its settings moved from GunFX.ini into [Main.GunFX.*]). The Gun effects
+	// page draws one drop-down per effect (RenderGunPage): its switch and these few keys; the rest with Advanced on.
+	{ "Main.GunFX.Main", "Puff", "Smoke puff at the muzzle", nullptr, "A small puff of smoke from the barrel on every shot." },
 	{ "Main.GunFX.Main", "HeatSmoke", "Smoke from a hot barrel", nullptr, "A thin strand of smoke rises from the barrel after sustained fire." },
 	{ "Main.GunFX.Main", "AfterFireTrail", "Smoke trail after firing", nullptr, "A wispy trail rises from the barrel once you stop shooting." },
 	{ "Main.GunFX.Main", "EjectionSmoke", "Smoke from the ejection port", nullptr, "A burst of smoke with every spent casing, bigger when the gun is hot." },
@@ -1522,8 +1528,46 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Main.GunFX.Main", "HeatHaze", "Heat shimmer over a hot barrel", nullptr, "The air shimmers around a hot barrel." },
 	{ "Main.GunFX.Main", "MuzzleBlast", "Heat ripple on every shot", nullptr, "A quick ripple of hot air at the muzzle each time you fire." },
 	{ "Main.GunFX.Main", "VolumetricSmoke", "Real 3D smoke (experimental)", nullptr, "Gun smoke drawn as real 3D smoke that lamps and the sun light. Costs frame rate." },
+	{ "Main.GunFX.Main", "VolumetricSmokeHalfRes", "Draw the 3D smoke at half resolution", nullptr, "Much cheaper, and the smoke is soft anyway. Off = full resolution." },
+	{ "Main.GunFX.Main", "VolumetricSmokeLowRes", "Big close smoke at low resolution", nullptr, "When you walk into thick smoke, it is drawn at an eighth of the resolution. Much cheaper; looks the same." },
+	{ "Main.GunFX.Main", "BulletTunnels", "Bullets cut through the smoke", nullptr, "Bullets punch tunnels through the 3D smoke and the haze, which then fill back in." },
 	{ "Main.GunFX.Main", "SmokeHaze", "Smoke haze fills the room", nullptr, "Firing for a while fills the room with haze. Needs Real 3D smoke; the most expensive part." },
 	{ "Main.GunFX.Main", "EnergyWeapons", "Also on energy weapons", nullptr, "Lasers, plasma and other energy weapons get the effects too." },
+	{ "Main.GunFX.Puff", "Scale", "Puff size", nullptr, "How big each puff is." },
+	{ "Main.GunFX.Puff", "Opacity", "Puff thickness", nullptr, "How thick the smoke is (0 = invisible). Small numbers: the pieces of smoke overlap and add up." },
+	{ "Main.GunFX.Puff", "SmokeLife", "How long a puff lasts", nullptr, "Seconds each bit of smoke stays before it fades." },
+	{ "Main.GunFX.Puff", "MinInterval", "Gap between puffs (automatic guns)", nullptr, "Seconds between two puffs on automatic guns. Higher = a lighter haze of puffs." },
+	{ "Main.GunFX.Puff", "PlayerOnly", "Only your own shots", nullptr, "Off: everyone's guns puff smoke." },
+	{ "Main.GunFX.Wisp", "Scale", "Strand size", nullptr, "How big the heat smoke strand is." },
+	{ "Main.GunFX.Wisp", "Opacity", "Strand thickness", nullptr, "How thick the heat smoke is (0 = invisible)." },
+	{ "Main.GunFX.Wisp", "SmokeLife", "How long the smoke lasts", nullptr, "Seconds each bit of the strand stays before it fades." },
+	{ "Main.GunFX.Wisp", "HeatPerShot", "Heat per shot", nullptr, "How much each shot heats the barrel. Also how fast the glow and the shimmer build up." },
+	{ "Main.GunFX.Wisp", "CoolPerSecond", "Cooling speed", nullptr, "How fast the barrel cools once you stop firing." },
+	{ "Main.GunFX.Trail", "Scale", "Trail size", nullptr, "How big the after-fire trail is." },
+	{ "Main.GunFX.Trail", "Opacity", "Trail thickness", nullptr, "How thick the trail is (0 = invisible)." },
+	{ "Main.GunFX.Trail", "SmokeLife", "How long the trail lingers", nullptr, "Seconds each bit of the trail stays before it fades." },
+	{ "Main.GunFX.Trail", "StartDelay", "Starts after you stop firing", nullptr, "Seconds after your last shot before the trail starts." },
+	{ "Main.GunFX.Ejection", "Scale", "Burst size", nullptr, "How big the burst from the ejection port is." },
+	{ "Main.GunFX.Ejection", "HotScale", "Bigger when hot", nullptr, "How much bigger the burst gets on a hot gun (1 = the same)." },
+	{ "Main.GunFX.Ejection", "Opacity", "Burst thickness", nullptr, "How thick the smoke is (0 = invisible)." },
+	{ "Main.GunFX.Ejection", "SmokeLife", "How long it lasts", nullptr, "Seconds each bit of smoke stays before it fades." },
+	{ "Main.GunFX.Glow", "Radius", "Glow thickness", nullptr, "How far round the barrel the glow reaches." },
+	{ "Main.GunFX.Glow", "Length", "Glow length", nullptr, "How far back along the barrel it glows when fully hot." },
+	{ "Main.GunFX.Glow", "StartHeat", "Heat before it glows", nullptr, "How hot the barrel must be before it starts to glow (a few shots' worth)." },
+	{ "Main.GunFX.Glow", "RiseSeconds", "Time to full glow", nullptr, "Seconds the glow takes to come up." },
+	{ "Main.GunFX.Haze", "StrengthPixels", "Shimmer strength", nullptr, "How much the air above the barrel ripples." },
+	{ "Main.GunFX.Haze", "HeightPixels", "Shimmer height", nullptr, "How tall the shimmer is on screen." },
+	{ "Main.GunFX.Haze", "StartHeat", "Heat before it shimmers", nullptr, "How hot the barrel must be before the air shimmers." },
+	{ "Main.GunFX.Blast", "StrengthPixels", "Ripple strength", nullptr, "How strong the ripple at the muzzle is on each shot." },
+	{ "Main.GunFX.Blast", "RadiusPixels", "Ripple size", nullptr, "How wide the ripple is on screen." },
+	{ "Main.GunFX.Blast", "Seconds", "Ripple length", nullptr, "How long each ripple lasts." },
+	{ "Main.GunFX.Volume", "DensityScale", "3D smoke thickness", nullptr, "How thick the 3D smoke is." },
+	{ "Main.GunFX.Volume", "SizeScale", "3D smoke size", nullptr, "How big the 3D smoke is." },
+	{ "Main.GunFX.Volume", "Brightness", "3D smoke brightness", nullptr, "How bright the light makes the 3D smoke." },
+	{ "Main.GunFX.Volume", "Wind", "Drift with the wind", nullptr, "How far the weather's wind carries the smoke outdoors." },
+	{ "Main.GunFX.Volume", "Haze", "Haze per shot", nullptr, "How much haze each shot adds to the room." },
+	{ "Main.GunFX.Volume", "HazeLife", "How long the haze lingers", nullptr, "Seconds the haze takes to clear." },
+	{ "Main.GunFX.Volume", "HazeSize", "Haze size", nullptr, "How big each cloud of haze is." },
 	// AmbientLight (Main)
 	{ "Shaders.AmbientLight.Main", "OcclusionStrength", "Corner shading strength", nullptr, "How dark creases, corners and the ground under things get." },
 	{ "Shaders.AmbientLight.Main", "Radius", "Corner shading reach", nullptr, "How far the corner shading and bounce light reach." },
@@ -2302,6 +2346,12 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.TAA.DLSS", "Enabled", "DLSS (NVIDIA RTX only)", nullptr, "NVIDIA DLSS upscaling and anti-aliasing. NVIDIA RTX cards only, needs the DXVK fork." },
 	{ "Shaders.TAA.DLSS", "RenderScale", "Upscaling quality", nullptr, "Draws the game at a lower resolution and scales it up. Lower runs faster but looks softer." },
 	{ "Shaders.TAA.DLSS", "RayReconstruction", "DLSS Ray Reconstruction", nullptr, "NVIDIA's cleaner denoising for ray tracing. NVIDIA RTX cards only, with DLSS on." },
+	// UNOFFICIAL 2026-11-15 (docs/next/DLSS-RR-MODEL.md) RRPreset 3 / 4: NVIDIA's newer Ray Reconstruction model (preset F)
+	{ "Shaders.TAA.DLSS", nullptr, "Ray Reconstruction model",
+		"NVIDIA's choice (as before): RRPreset=0 | Current model: RRPreset=2 | Newer model (DLSS 4.5): RRPreset=3 | Pick by graphics card: RRPreset=4",
+		"Newer model: more detail and reacts faster, but can shimmer more. About the same speed on RTX 40 and 50 cards; on RTX 20 and 30 it "
+		"can cost up to a quarter of the frame rate. Pick by graphics card uses the newer model on RTX 40 / 50 and the current one on "
+		"RTX 20 / 30. Needs an NVIDIA driver from version 580. NVIDIA's choice is already the newer model on drivers from 580." },
 	{ "Shaders.TAA.DLSS", "WeaponMask", "Weapon ghosting fix", nullptr, "Reduces ghosting and smearing on your weapon and hands with DLSS." },
 	// SMAA (Main)
 	{ "Shaders.SMAA.Main", nullptr, "Quality",
@@ -2514,6 +2564,26 @@ static const std::unordered_map<std::string, FloatRange> kFloatSliders = {
 	{ "Shaders.ShadowsInteriors.Main.NearFade", { 0.0f, 128.0f, "%.0f" } },
 	{ "Shaders.ShadowsInteriors.Main.PlayerLampMargin", { 0.0f, 64.0f, "%.0f" } },
 	// UNOFFICIAL 2026-10-21 cloth indoors (core/ClothWind.h BeginFrame)
+	// 2026-11-16 GunFX's menu keys (gunfx-builtin; the Gun effects page)
+	{ "Main.GunFX.Puff.Scale", { 0.2f, 5.0f, "%.2f" } }, { "Main.GunFX.Puff.Opacity", { 0.0f, 0.3f, "%.3f" } },
+	{ "Main.GunFX.Puff.SmokeLife", { 0.2f, 5.0f, "%.2f" } }, { "Main.GunFX.Puff.MinInterval", { 0.0f, 1.0f, "%.2f" } },
+	{ "Main.GunFX.Wisp.Scale", { 0.5f, 6.0f, "%.2f" } }, { "Main.GunFX.Wisp.Opacity", { 0.0f, 0.5f, "%.3f" } },
+	{ "Main.GunFX.Wisp.SmokeLife", { 0.5f, 8.0f, "%.2f" } }, { "Main.GunFX.Wisp.HeatPerShot", { 0.05f, 3.0f, "%.2f" } },
+	{ "Main.GunFX.Wisp.CoolPerSecond", { 0.2f, 15.0f, "%.1f" } },
+	{ "Main.GunFX.Trail.Scale", { 0.5f, 6.0f, "%.2f" } }, { "Main.GunFX.Trail.Opacity", { 0.0f, 0.6f, "%.3f" } },
+	{ "Main.GunFX.Trail.SmokeLife", { 0.5f, 10.0f, "%.2f" } }, { "Main.GunFX.Trail.StartDelay", { 0.0f, 3.0f, "%.2f" } },
+	{ "Main.GunFX.Ejection.Scale", { 0.01f, 3.0f, "%.2f" } }, { "Main.GunFX.Ejection.HotScale", { 1.0f, 5.0f, "%.2f" } },
+	{ "Main.GunFX.Ejection.Opacity", { 0.0f, 0.3f, "%.3f" } }, { "Main.GunFX.Ejection.SmokeLife", { 0.2f, 5.0f, "%.2f" } },
+	{ "Main.GunFX.Glow.Radius", { 1.0f, 20.0f, "%.1f" } }, { "Main.GunFX.Glow.Length", { 0.0f, 40.0f, "%.1f" } },
+	{ "Main.GunFX.Glow.StartHeat", { 0.0f, 15.0f, "%.1f" } }, { "Main.GunFX.Glow.RiseSeconds", { 0.1f, 10.0f, "%.1f" } },
+	{ "Main.GunFX.Haze.StrengthPixels", { 0.0f, 8.0f, "%.1f" } }, { "Main.GunFX.Haze.HeightPixels", { 1.0f, 200.0f, "%.0f" } },
+	{ "Main.GunFX.Haze.StartHeat", { 0.0f, 15.0f, "%.1f" } },
+	{ "Main.GunFX.Blast.StrengthPixels", { 0.0f, 30.0f, "%.1f" } }, { "Main.GunFX.Blast.RadiusPixels", { 5.0f, 400.0f, "%.0f" } },
+	{ "Main.GunFX.Blast.Seconds", { 0.01f, 1.0f, "%.2f" } },
+	{ "Main.GunFX.Volume.DensityScale", { 0.5f, 12.0f, "%.2f" } }, { "Main.GunFX.Volume.SizeScale", { 0.05f, 1.0f, "%.2f" } },
+	{ "Main.GunFX.Volume.Brightness", { 0.2f, 3.0f, "%.2f" } }, { "Main.GunFX.Volume.Wind", { 0.0f, 120.0f, "%.0f" } },
+	{ "Main.GunFX.Volume.Haze", { 0.0f, 10.0f, "%.1f" } }, { "Main.GunFX.Volume.HazeLife", { 5.0f, 180.0f, "%.0f" } },
+	{ "Main.GunFX.Volume.HazeSize", { 20.0f, 300.0f, "%.0f" } },
 	{ "Shaders.Cloth.Interiors.Strength", { 0.0f, 2.0f, "%.2f" } },
 	{ "Shaders.Cloth.Interiors.WindIntensity", { 0.0f, 12.0f, "%.2f" } },
 	{ "Shaders.Cloth.Interiors.WindSpeed", { 0.0f, 400.0f, "%.0f" } },
@@ -2521,6 +2591,9 @@ static const std::unordered_map<std::string, FloatRange> kFloatSliders = {
 	{ "Shaders.Cloth.Interiors.FlutterSpeed", { 0.0f, 6.0f, "%.2f" } },
 	{ "Shaders.Cloth.Interiors.FlutterAmount", { 0.0f, 1.0f, "%.2f" } },
 	{ "Shaders.Cloth.Interiors.RippleAmount", { 0.0f, 1.0f, "%.2f" } },
+	// UNOFFICIAL 2026-11-06 Bend contact shadows: where they start (0 = where the shadow maps end) and how long they fade in
+	{ "Shaders.ShadowsExteriors.ScreenSpace.StartDistance", { 0.0f, 40000.0f, "%.0f" } },
+	{ "Shaders.ShadowsExteriors.ScreenSpace.FadeLength", { 100.0f, 10000.0f, "%.0f" } },
 };
 
 // ---- Setting rows ------------------------------------------------------------------------------------------------------------
@@ -2538,7 +2611,28 @@ struct SettingRow {
 	ImVec4 normalText;			// the style's text colour, for the tooltip
 	RestartNote restart;		// restart.text is null when there is no note
 	float controlW = 0.0f;		// the control's width (set by RenderSetting)
+	bool forced = false;		// the deferred renderer sets it to the value shown (SettingForce::Find): greyed, not editable
+	const char* note = nullptr;	// a hover note that does not grey the row (the deferred renderer's forced or floored value)
 };
+
+// UNOFFICIAL 2026-11-16 (owner: "grey out linear light when the deferred renderer is on"): what the deferred renderer does to a key
+// this session (core/SettingForce.h). Its Table keys read as a fixed value whatever the file says, so their rows show that value,
+// greyed; [Shaders.PBR.Linear] Gamma and NightGamma are only floored, so they stay editable with a note. The file is never written
+// with a forced value: the row draws a copy of the node, and a menu save writes the player's own values as before.
+static const char* const kForcedByRenderer = "Set by the deferred renderer ([Main.Main.Quality] DeferredRenderer) to the value shown. "
+	"Set that to 0 and restart to change this.";
+static bool ForcedByRenderer(const char* section, const char* key, int& value) {
+	return SettingForce::Mode() > 0 && SettingForce::Find(section, key, value);
+}
+static bool LinearGammaFloored(const char* section, const char* key, bool& night) {
+	if (SettingForce::Mode() <= 0 || strcmp(section, "Shaders.PBR.Linear")) return false;
+	night = !strcmp(key, "NightGamma");
+	return night || !strcmp(key, "Gamma");
+}
+static const char* LinearGammaNote(bool night) {
+	return night ? "With the deferred renderer on, 1.0 or below reads as 0 (follow Gamma)."
+		: "With the deferred renderer on, 1.0 or below reads as 2.2.";
+}
 
 static void Store(const SettingManager::Configuration::ConfigNode& node, float value) {
 	TheSettingManager->SetSetting(node.Section, node.Key, value);
@@ -2596,6 +2690,14 @@ static bool DrawFloatSetting(SettingRow& row, bool isShader) {
 	if (!modes) {
 		if (range != kFloatSliders.end()) { lo = range->second.Min; hi = range->second.Max; limited = true; }
 		else limited = DocumentedRange(node.Description, lo, hi);
+	}
+	// UNOFFICIAL 2026-11-16: with the deferred renderer on, Gamma <= 1.0 reads as 2.2 (SettingForce::FloorF): show the value in
+	// effect, and the lower end starts above 1.0. Only an edit writes. NightGamma keeps its stored value (0 must stay reachable, and
+	// a drag up from 0 passes through (0, 1.0]); its row's note tells the floor.
+	bool night = false;
+	if (LinearGammaFloored(node.Section, node.Key, night) && !night) {
+		if (value <= 1.0f) value = 2.2f;
+		if (limited) lo = ImMax(lo, 1.01f);
 	}
 	if (limited) value = ImClamp(value, lo, hi);
 
@@ -2702,15 +2804,32 @@ static float TrailingWidth(const SettingRow& row, bool isShader) {
 	return width;
 }
 
-static void RenderSetting(SettingManager::Configuration::ConfigNode& node, bool isShader = false) {
+static void RenderSetting(SettingManager::Configuration::ConfigNode& stored, bool isShader = false) {
 	using NodeType = SettingManager::Configuration::NodeType;
-	ImGui::PushID(node.Key);
+	ImGui::PushID(stored.Key);
 
-	const std::string& atOpen = SessionValue(node.Section, node.Key, node.Value);
+	// The session's first value and "changed" come from the player's own value (stored), never from a forced one.
+	const std::string& atOpen = SessionValue(stored.Section, stored.Key, stored.Value);
+	const bool changed = atOpen != stored.Value;
+	// UNOFFICIAL 2026-11-16: a key the deferred renderer keeps at a value is drawn from a copy holding that value (greyed below)
+	int forcedValue = 0;
+	const bool forced = ForcedByRenderer(stored.Section, stored.Key, forcedValue);
+	SettingManager::Configuration::ConfigNode shown;
+	if (forced) {
+		shown = stored;
+		if (stored.Type == NodeType::Float) sprintf_s(shown.Value, "%d.0", forcedValue);
+		else sprintf_s(shown.Value, "%d", forcedValue);
+	}
+	SettingManager::Configuration::ConfigNode& node = forced ? shown : stored;
+
 	const bool inert = IsInertSetting(node.Section, node.Key);
-	SettingRow row{ node, atOpen, atOpen != node.Value, node.MaxQuality, inert,
-		inert ? nullptr : InactiveReason(node.Section, node.Key), ImGui::GetStyleColorVec4(ImGuiCol_Text) };
+	SettingRow row{ node, atOpen, changed, node.MaxQuality, inert,
+		inert || forced ? nullptr : InactiveReason(node.Section, node.Key), ImGui::GetStyleColorVec4(ImGuiCol_Text) };
 	FindRestartNote(node.Section, node.Key, row.restart);
+	row.forced = forced;
+	bool night = false;
+	if (forced) row.note = kForcedByRenderer;
+	else if (LinearGammaFloored(node.Section, node.Key, night)) row.note = LinearGammaNote(night);
 
 	if (row.inert) ImGui::BeginDisabled();
 	int tints = 0;
@@ -2718,12 +2837,14 @@ static void RenderSetting(SettingManager::Configuration::ConfigNode& node, bool 
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
 		tints++;
 	}
-	if (row.why) {
+	if (row.why || row.forced) {
 		ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
 		tints++;
 	}
 
 	row.controlW = MenuWidgets::RowBegin(MenuKeyLabel(node.Section, node.Key), TrailingWidth(row, isShader));
+	// A forced row is disabled after its name, so hovering the name still shows the note (ImGui does not hover disabled items)
+	if (row.forced) ImGui::BeginDisabled();
 	bool overControl;
 	switch (node.Type) {
 	case NodeType::Boolean:
@@ -2743,6 +2864,7 @@ static void RenderSetting(SettingManager::Configuration::ConfigNode& node, bool 
 			overControl = DrawTextSetting(row);
 		break;
 	}
+	if (row.forced) overControl = overControl || ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled);
 	if (tints) ImGui::PopStyleColor(tints);
 
 	if (row.restart.text) {
@@ -2753,13 +2875,18 @@ static void RenderSetting(SettingManager::Configuration::ConfigNode& node, bool 
 		TheSettingManager->SetSettingS(node.Section, node.Key, row.atOpen.c_str());
 		TheSettingManager->LoadSettings();
 	}
+	if (row.forced) ImGui::EndDisabled();
 	if (row.inert) ImGui::EndDisabled();
 
 	if (overControl || MenuWidgets::RowLabelHovered()) {
 		const char* plain = AdvancedShown() ? nullptr : SimpleTip(node.Section, node.Key);	// 2026-11-05: the simple view's own words
-		if (plain && !row.why) WrappedTooltip(plain);
-		else if (plain) WrappedTooltip((std::string(plain) + "\n\nNot active now: " + row.why).c_str());
-		else SettingTooltip(node, row.why, row.normalText, MenuWidgets::RowLabelClipped());
+		if (plain) {
+			std::string tip = plain;
+			if (row.why) tip += std::string("\n\nNot active now: ") + row.why;
+			if (row.note) tip += std::string("\n\n") + row.note;
+			WrappedTooltip(tip.c_str());
+		}
+		else SettingTooltip(node, row.why ? row.why : row.note, row.normalText, MenuWidgets::RowLabelClipped());
 	}
 	ImGui::PopID();
 }
@@ -4860,6 +4987,52 @@ static void DrawRtSharedBlocksOnRtPage(const char* rtSection) {
 		if (!strcmp(b.Rt, rtSection)) DrawRtSharedBlock(b);
 }
 
+// ---- The Gun effects page (2026-11-16, gunfx-builtin) ---------------------------------------------------------------------------
+// User: "we could just have the most important gunfx cfg keys exist inside the menu under different sorted drop downs". GunFX is built
+// in and its old GunFX.ini keys live in [Main.GunFX.<section>]. The page (the effects list's "Gun effects" entry, [Main.GunFX.Main]) is
+// one drop-down per effect: its switch and the few keys a player would tune (kSimpleRows); with Advanced on, every key of its section.
+// Where the smoke starts and the log switch only with Advanced on. The same rows as anywhere else (DrawVisualItem): same keys, same file.
+struct GunFolder { const char* Title; const char* Id; std::vector<VisualItem> Items; bool AdvancedOnly; };
+static const GunFolder kGunFolders[] = {
+	{ "Smoke puff at the muzzle", "puff", { { "Main.GunFX.Main", "Puff", nullptr }, { "Main.GunFX.Puff", nullptr, nullptr } }, false },
+	{ "Smoke from a hot barrel", "heat", { { "Main.GunFX.Main", "HeatSmoke", nullptr }, { "Main.GunFX.Wisp", nullptr, nullptr } }, false },
+	{ "Smoke trail after firing", "trail", { { "Main.GunFX.Main", "AfterFireTrail", nullptr }, { "Main.GunFX.Trail", nullptr, nullptr } }, false },
+	{ "Smoke from the ejection port", "eject", { { "Main.GunFX.Main", "EjectionSmoke", nullptr }, { "Main.GunFX.Ejection", nullptr, nullptr } }, false },
+	{ "Glowing hot barrel", "glow", { { "Main.GunFX.Main", "BarrelGlow", nullptr }, { "Main.GunFX.Glow", nullptr, nullptr } }, false },
+	{ "Heat shimmer over a hot barrel", "haze", { { "Main.GunFX.Main", "HeatHaze", nullptr }, { "Main.GunFX.Haze", nullptr, nullptr } }, false },
+	{ "Heat ripple on every shot", "blast", { { "Main.GunFX.Main", "MuzzleBlast", nullptr }, { "Main.GunFX.Blast", nullptr, nullptr } }, false },
+	{ "Real 3D smoke (experimental)", "volume", { { "Main.GunFX.Main", "VolumetricSmoke, VolumetricSmokeHalfRes, VolumetricSmokeLowRes, BulletTunnels", nullptr },
+		{ "Main.GunFX.Volume", "-Haze, HazeLife, HazeSize", nullptr } }, false },
+	{ "Smoke haze fills the room", "smokehaze", { { "Main.GunFX.Main", "SmokeHaze", nullptr }, { "Main.GunFX.Volume", "Haze, HazeLife, HazeSize", nullptr } }, false },
+	{ "Where the smoke starts on the gun", "muzzle", { { "Main.GunFX.Muzzle", nullptr, "Barrel tip (puff, heat smoke, trail)" } }, true },
+	{ "Log and general", "general", { { "Main.GunFX.General", nullptr, nullptr } }, true },
+};
+
+static bool RenderGunPage() {
+	if (gMenu.page != "Main.GunFX.Main") return false;
+	RenderPageHeader(gMenu.page);
+	RenderSectionHelp(gMenu.page);
+	DrawVisualItem({ "Main.GunFX.Main", "EnergyWeapons", nullptr }, false);
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
+	for (const GunFolder& f : kGunFolders) {
+		if (f.AdvancedOnly && !AdvancedShown()) continue;
+		const std::string header = std::string(f.Title) + "###gunfx/" + f.Id;
+		if (!MenuWidgets::SubHeader(header.c_str(), false)) continue;
+		ImGui::PushID(f.Id);
+		ImGui::Indent(ImGui::GetFontSize() * 0.75f);
+		for (const VisualItem& item : f.Items) DrawVisualItem(item, item.Title != nullptr);
+		ImGui::Unindent(ImGui::GetFontSize() * 0.75f);
+		ImGui::PopID();
+	}
+	if (!AdvancedShown()) {
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
+		ImGui::TextDisabled("Advanced (top row) shows every GunFX setting under its own name, where the smoke starts and the log switch.");
+	}
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
+	ImGui::TextDisabled("Per-gun settings: Data/NVSE/Plugins/GunFX/Weapons/<gun>.ini (made when you first equip a gun).");
+	return true;
+}
+
 // ---- What is hiding effects right now ---------------------------------------------------------------------------------------
 // 2026-11-05 (user, after an hour of "the rays show in the debug view but I see no reflection": the master switch, a debug view left
 // on, specular occlusion and physically faint floors each hid it in turn): "add a note for each setting that could override and make
@@ -5056,6 +5229,7 @@ static void RenderContent() {
 		ImGui::TextDisabled("No settings in this section.");
 		return;
 	}
+	if (RenderGunPage()) return;	// 2026-11-16 (gunfx-builtin): one drop-down per gun effect
 	if (RenderSimpleEffectPage()) return;	// 2026-11-05: Advanced off: the effect's pages as cards on one page
 	PageOrder(rows);
 	RenderPageHeader(gMenu.page);
@@ -5222,7 +5396,7 @@ static const EffectGroup kEffectGroups[] = {
 	{ "Lighting", "AmbientLight, AmbientOcclusion, BounceLight, Specular, PBR, Reflections, Flashlight" },
 	{ "Shadows", "ShadowsExteriors, ShadowsInteriors, ContactHardening" },
 	{ "Ray tracing", nullptr },
-	{ "Sky and atmosphere", "Sky, VolumetricClouds, VolumetricFog, VolumetricLight, GodRays, Sandstorm, HeatHaze" },
+	{ "Sky and atmosphere", "Sky, VolumetricClouds, VolumetricFog, VolumetricLight, GodRays, SunGlare, Sandstorm, HeatHaze" },
 	{ "Weather and water", "Precipitations, Snow, SnowAccumulation, WetnessEffects, HudRaindrops, WetWorld, Water, Underwater, WaterLens" },
 	{ "Ground and plants", "Terrain, POM, Grass, Plants" },
 	{ "Characters", "Skin, Cloth, PipboyFit, BloodFlow, HandBlood, Blood" },

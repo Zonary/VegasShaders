@@ -1328,6 +1328,45 @@ LSample OldSample(uint code, uint tri, vec2 bary) {
 	if (y.lamp >= LampCount()) y.lamp = -1;   // (hangfix: within this frame's lamps, as the remap gives them)
 	return y;
 }
+// UNOFFICIAL 2026-11-15 PTRestirCGNS (rt-reuse; docs/next/RT-REUSE-CGNS.md): Compatibility-Guided Neighbor Selection (Junkins, Kettunen, Lin,
+// Ramamoorthi and Wyman, HPG 2026; written from the paper's description and its BSD-3 Falcor sample github.com/orion-junkins/ReSTIR-CGNS,
+// read for the formula only). Frame row texel 299.x (core\RtPathTrace.cpp kCgnsTexel) = K candidates, 0 off. K points in the same disk as
+// the random picks, each scored by its surface last frame against this hit, h = exp(-|x - y| / s) x max(n_x . n_y, 0)^8 with
+// s = sqrt(0.05 sr / pi) x the hit's distance (the paper's Omega 0.05, beta 8); `want` of them drawn without replacement in proportion to h
+// (Efraimidis-Spirakis keys log(u) / h, the largest kept). It depends on the surfaces only, never on the samples, so the pairwise MIS below
+// takes a picked neighbour as it takes a random one; fewer picks are thrown away by the plane / normal tests at edges.
+const int kCgnsTexel = 299;
+int RestirCgnsK() { return int(clamp(FrameTexel(kCgnsTexel).x, 0.0, 31.0) + 0.5); }
+int RestirCgnsPick(vec2 at, vec3 here, vec3 n, float dist, float radius, int want, int K, vec3 pe, vec3 pf, vec3 pr, vec3 pu,
+	out ivec2 picks[kRestirNeighbours]) {
+	float keys[kRestirNeighbours];
+	int got = 0;
+	if (want <= 0) return 0;
+	K = max(K, want);   // (never fewer candidates than neighbours)
+	const float sc = max(0.12615663 * dist, 1.0e-3);   // sqrt(0.05 / pi)
+	for (int k = 0; k < K; k++) {
+		const float r = radius * sqrt(Rand()), a = 6.2831853 * Rand();
+		const float u = Rand();
+		const ivec2 px = ivec2(floor(at + r * vec2(cos(a), sin(a))));
+		if (any(lessThan(px, ivec2(0))) || any(greaterThanEqual(px, ivec2(p.size.xy)))) continue;
+		const uint w = ReservoirWord(FrameParity() ^ 1, px);
+		if (scratch.words[w] == 0u) continue;   // no surface there last frame
+		const float oldDist = uintBitsToFloat(scratch.words[w + 2u]);
+		const vec3 oldN = OctDecode(unpackSnorm2x16(scratch.words[w + 3u]));
+		const vec2 ouv = (vec2(px) + 0.5) / p.size.xy;
+		const vec3 oldPoint = pe + normalize(pf + pr * (2.0 * ouv.x - 1.0) - pu * (2.0 * ouv.y - 1.0)) * oldDist;
+		float c = max(dot(oldN, n), 0.0);
+		c *= c; c *= c; c *= c;
+		const float h = exp(-length(oldPoint - here) / sc) * c;
+		if (!(h > 1.0e-8)) continue;
+		const float key = log(max(u, 1.0e-30)) / h;
+		if (got < want) { picks[got] = px; keys[got] = key; got++; continue; }
+		int low = 0;
+		for (int j = 1; j < got; j++) if (keys[j] < keys[low]) low = j;
+		if (key > keys[low]) { picks[low] = px; keys[low] = key; }
+	}
+	return got;
+}
 vec3 RestirDirect(vec3 hit, vec3 lift, vec3 n, vec3 v, Surface s, int k0, float total, float w0) {
 	const float maxM = FrameTexel(10).x;
 	// (perf-ptcost) PTRestirDIRays (LoadCostKeys): 0 / 1 / 3 visibility in the targets (the shadow rays below; 0 and 3 skip the temporal
@@ -1401,15 +1440,21 @@ vec3 RestirDirect(vec3 hit, vec3 lift, vec3 n, vec3 v, Surface s, int k0, float 
 		if (depth > 1.0e-3) {
 			const vec2 ndc = vec2(dot(rel, pr) / (dot(pr, pr) * depth), -dot(rel, pu) / (dot(pu, pu) * depth));
 			const vec2 at = (ndc * 0.5 + 0.5) * p.size.xy;
-			const int count = min(1 + int(sp.y + 0.5), 1 + kRestirNeighbours);
+			int count = min(1 + int(sp.y + 0.5), 1 + kRestirNeighbours);
 			const float dist = length(rel);
+			// UNOFFICIAL 2026-11-15 PTRestirCGNS (rt-reuse; docs/next/RT-REUSE-CGNS.md; Junkins et al., HPG 2026): the spatial neighbours picked
+			// from K candidates in the same disk by their surfaces' match (RestirCgnsPick); 0: random as before, the same random numbers
+			const int cgnsK = RestirCgnsK();
+			ivec2 cgnsPx[kRestirNeighbours];
+			if (cgnsK > 0) count = 1 + RestirCgnsPick(at, here, n, dist, sr.x, count - 1, cgnsK, pe, pf, pr, pu, cgnsPx);
 			int nb = 0;
 			LSample nY[kRestirNeighbours];
 			float nW[kRestirNeighbours], nM[kRestirNeighbours];
 			vec3 nPoint[kRestirNeighbours], nN[kRestirNeighbours];
 			for (int i = 0; i < count; i++) {
 				vec2 q = at;
-				if (i > 0) { const float r = sr.x * sqrt(Rand()), a = 6.2831853 * Rand(); q += r * vec2(cos(a), sin(a)); }
+				if (i > 0 && cgnsK > 0) q = vec2(cgnsPx[i - 1]) + 0.5;
+				else if (i > 0) { const float r = sr.x * sqrt(Rand()), a = 6.2831853 * Rand(); q += r * vec2(cos(a), sin(a)); }
 				const ivec2 px = ivec2(floor(q));
 				if (any(lessThan(px, ivec2(0))) || any(greaterThanEqual(px, ivec2(p.size.xy)))) continue;
 				const uint w = ReservoirWord(FrameParity() ^ 1, px);
@@ -1862,6 +1907,14 @@ bool gScreenGrass = false;
 // (2026-11-14 GBufferV2, core/CapturedNormals.h) a MaterialBuffer class with the layout v2's specular bit (+16) taken off; the old layout's
 // classes (below 16) are as they are
 float PtMatClass(float c) { return c >= 16.0 ? c - 16.0 : c; }
+// (2026-11-16 fd-batchCG) GBufferV2's shading normal back from its octahedral pair (Includes/Shadow.hlsl ShadowDecodeNormal; OctDecode
+// above is not in the PT_RESTIR_GI variant)
+vec3 PtGBufferNormal(vec2 e) {
+	vec3 n = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+	const float t = clamp(-n.z, 0.0, 1.0);
+	n.xy += vec2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t);
+	return normalize(n);
+}
 
 bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 	hit = n = vec3(0.0);
@@ -1913,7 +1966,11 @@ bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 	if ((uint(p.accum.w) & 256u) != 0u) {
 		vec4 m = imageLoad(gMaterial, pixel);
 		float cls = PtMatClass(floor(m.r));
-		gScreenGrass = cls == 7.0 && m.a > 0.5 && (abs(m.g - 0.5) < 0.1 || abs(m.g - 4.5) < 0.1);   // (2026-11-12 CapturedGrass; 4.5: GBufferV2's mark)
+		// (2026-11-12 CapturedGrass) the old layout: class 7, written (a), the grass mark g = 0.5. (2026-11-16 fd-batchCG, DEFERRED-GAPS-AUDIT
+		// item 24) GBufferV2, as core/CapturedNormals.h's grass test: class 7 (r > 0.5 is "written"; a is a normal's y there, so not
+		// tested), the mark g = 4.5, or the DeferredFoliage grass record's code g in [32, 1024) (Includes/DeferredPixel.hlsl
+		// FDFoliageGrassCode). The class test stays on both: in the old layout an object's g is its bound radius, often in [32, 1024).
+		gScreenGrass = cls == 7.0 && ((m.a > 0.5 && abs(m.g - 0.5) < 0.1) || abs(m.g - 4.5) < 0.1 || (m.g > 31.99 && m.g < 1024.0));
 		if (cls >= 1.0) {
 			s.metal = clamp(fract(m.r) / 0.49, 0.0, 1.0);   // (2026-11-14: fract, the class may carry GBufferV2's specular bit)
 			s.rough = m.b >= 0.0 ? clamp(m.b, 0.05, 1.0) : cls == 4.0 || cls == 5.0 ? 0.95 : 0.7;
@@ -1924,6 +1981,13 @@ bool ScreenHit(ivec2 pixel, out vec3 hit, out vec3 n, out Surface s) {
 			if (gBumpOn > 0.5 && cls == 4.0 && m.a > 0.995 && m.a < 1.005 && m.g >= 1.99 && m.g <= 4.01 && m.b >= -8.01 && m.b <= -5.99) {
 				const vec2 e = vec2(m.g - 3.0, m.b + 7.0), h = vec2(e.x + e.y, e.x - e.y) * 0.5;
 				gScreenBump = normalize(vec3(h, max(1.0 - abs(h.x) - abs(h.y), 0.0)));
+			}
+			// (2026-11-16 fd-batchCG, DEFERRED-GAPS-AUDIT item 24) GBufferV2 (Includes/CapturedNormals.hlsl, TerrainTemplate.hlsl): the land
+			// writes its blended layers' normal-mapped normal in world axes, full octahedral, x in g and y in a (g 4: none), and its class
+			// always with the specular bit (raw 20). The old layout's land is raw 4 (no bit), so the raw class tells the layouts apart here
+			// (the old form above needs b in [-8, -6], which v2's roughness never is). Decoded as ShadowDecodeNormal.
+			else if (gBumpOn > 0.5 && cls == 4.0 && floor(m.r + 0.01) >= 16.0 && abs(m.g) <= 1.001 && abs(m.a) <= 1.001) {
+				gScreenBump = PtGBufferNormal(clamp(vec2(m.g, m.a), -1.0, 1.0));
 			}
 			// (2026-11-07 ptaaa-materials) the class's material model: 3 cloth (ClothWind), 5 plants (PlantPass), 6 skin (SkinFill)
 			const vec4 keys = MatKeys();

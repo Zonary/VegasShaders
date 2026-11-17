@@ -38,7 +38,11 @@ namespace FoldHighlights {
 
 	// Objects whose light-only pass was folded this frame (state 1), or folded but one of their extra-lamp passes could not be (2: their
 	// highlight passes are drawn after all). Open addressing, tagged with the frame number (no clearing).
-	constexpr unsigned kSlots = 8192;
+	// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 15, the same table as DeferredRenderer::Marked): 32,768 slots (8,192 before)
+	// and the insert failures counted (SlotFailed, on its log line): an object not found keeps its highlight passes.
+	constexpr unsigned kSlots = 32768;	// (a power of two: the hash masks with kSlots - 1)
+	static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be a power of two");
+	inline unsigned long long SlotFailed = 0;
 	inline const void* Key[kSlots] = {};
 	inline unsigned Frame[kSlots] = {};
 	inline UInt8 State[kSlots] = {};
@@ -56,6 +60,7 @@ namespace FoldHighlights {
 				return &State[h];
 			}
 		}
+		if (insert) SlotFailed++;	// (2026-11-16) the table was full along the 64 probes
 		return nullptr;
 	}
 
@@ -71,9 +76,10 @@ namespace FoldHighlights {
 		FrameId++;
 		if (On && ++Frames >= 600) {
 			Logger::Log("UNOFFICIAL FoldHighlights: per frame %.1f light passes and %.1f extra-lamp passes folded, %.1f highlight passes skipped, %.2f objects not "
-				"folded in full (highlights kept); vertex colour flag on %.1f of folded objects, texture pass with it %.1f, disagreeing %.2f; base texture replaced by the game %.2f; most texture stages of the game's extra-lamp passes %u (refused %.2f)",
+				"folded in full (highlights kept); vertex colour flag on %.1f of folded objects, texture pass with it %.1f, disagreeing %.2f; base texture replaced by the game %.2f; most texture stages of the game's extra-lamp passes %u (refused %.2f); table full (objects not noted) %llu",
 				Folded / (double)Frames, LampsFolded / (double)Frames, Skipped / (double)Frames, Broken / (double)Frames,
-				VcFlag / (double)Frames, VcPass / (double)Frames, VcMismatch / (double)Frames, BaseLost / (double)Frames, MaxStages, StageRefused / (double)Frames);
+				VcFlag / (double)Frames, VcPass / (double)Frames, VcMismatch / (double)Frames, BaseLost / (double)Frames, MaxStages, StageRefused / (double)Frames, SlotFailed);
+			SlotFailed = 0;
 			Folded = LampsFolded = Skipped = Broken = Frames = VcFlag = VcPass = VcMismatch = BaseLost = StageRefused = 0;
 		}
 	}

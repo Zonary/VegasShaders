@@ -39,6 +39,7 @@ public:
 	int					historyIndex = 0;		// the one holding last frame's
 	bool				historyValid = false;
 	bool				exteriorBalance = true;	// UNOFFICIAL 2026-11-11 (sungi) [Shaders.AmbientLight.Main] ExteriorBalance (Apply)
+	bool				giGrassBlur = true;	// UNOFFICIAL 2026-11-13 [Shaders.AmbientLight.Main] GIGrassBlur (Blur: the loose blur back where the depth is busy)
 	bool				giSingleHistory = true;	// UNOFFICIAL 2026-11-11 (sungi) [Shaders.AmbientLight.Main] GISingleHistory (GI accumulate)
 	float				debugGIExposure = 1.0f;	// UNOFFICIAL 2026-11-12 [Shaders.AmbientLight.Main] DebugGIExposure (0.01-64; 1 = off): a factor on the bounce-light test views 13-15 only (Render)
 	float				ambientReplace = 0.0f;	// UNOFFICIAL 2026-11-11 (sungi p2) [Shaders.AmbientLight.Main] AmbientReplace (0-1; 0 = off)

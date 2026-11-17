@@ -25,7 +25,13 @@ const char* RtMaterialClassOf(NiGeometry* geometry);	// UNOFFICIAL 2026-11-07 pt
 
 // UNOFFICIAL 2026-11-05 (rtrefl-only: the demo room's ceiling met by no reflection ray) the first 64 distinct meshes a cell that the
 // traced scene leaves out, with why.
+// UNOFFICIAL 2026-11-13 (fork port, RT audit F9) [Main.Main.RayTracing] SceneLogCap: the three per-cell scene loggers below re-arm at every
+// cell and wrote 60,000 flushed lines in 35 minutes outdoors; now each stops after this many lines a session (0 = no cap, as before).
+// Read when the ray tracing helper starts.
+static UInt32 gSceneLogCap = 3000;
 static void LogLeftOut(const NiGeometry* geo, const char* why, int shaderType) {
+	static UInt32 sessionLines = 0;
+	if (gSceneLogCap && sessionLines >= gSceneLogCap) return;
 	static std::vector<std::string> told;
 	static std::unordered_map<const void*, bool> seen;	// geometries met this cell (cheap: this runs for every left-out mesh every frame)
 	static const void* toldCell = nullptr;
@@ -37,12 +43,15 @@ static void LogLeftOut(const NiGeometry* geo, const char* why, int shaderType) {
 	if (shaderType >= 0) key += std::to_string(shaderType) + ")";
 	if (std::find(told.begin(), told.end(), key) != told.end()) return;
 	told.push_back(key);
+	sessionLines++;
 	Logger::Log("RT CORE: left out of the traced scene: %s", key.c_str());
 }
 
 // UNOFFICIAL 2026-11-06 (alpha lamp shadows: VS-AlphaLampTest's chain-link fence cast no traced shadow) the first 64 meshes (by name) a
 // cell that the traced scene takes, alpha-tested ones with their atlas slot and alpha reference: with LogLeftOut, which meshes rays can meet.
 static void LogAlphaTaken(const NiGeometry* geo, int slot, unsigned ref, bool blended) {
+	static UInt32 sessionLines = 0;	// (SceneLogCap)
+	if (gSceneLogCap && sessionLines >= gSceneLogCap) return;
 	static std::unordered_map<const void*, bool> seen;		// geometries met this cell (cheap: this runs for every taken mesh every frame)
 	static std::unordered_map<std::string, bool> names;	// (2026-11-06 b) one line a mesh name + slot: a room's 40 copies of one wall filled the cap
 	static const void* toldCell = nullptr;
@@ -51,6 +60,7 @@ static void LogAlphaTaken(const NiGeometry* geo, int slot, unsigned ref, bool bl
 	if (told >= 64 || seen.size() > 8192 || !seen.emplace(geo, true).second) return;
 	if (!names.emplace(std::string(geo && geo->m_pcName ? geo->m_pcName : "") + "#" + std::to_string(slot), true).second) return;
 	told++;
+	sessionLines++;
 	// (2026-11-06 c, the demo room's missing office-kit ceiling) every taken mesh, not only alpha-tested ones (slot -1 / ref 999: opaque),
 	// with its world bound's centre (camera relative) and radius: which part of a kit piece is the ceiling, and is it taken
 	const NiBound* b = geo ? geo->m_kWorldBound : nullptr;
@@ -71,6 +81,8 @@ static void LogAlphaTaken(const NiGeometry* geo, int slot, unsigned ref, bool bl
 // its bound centre (camera relative, x y z) and radius, its world scale and its parents' names (the NIF's nodes), so a mesh far bigger
 // than it should be, or standing where the game draws nothing, can be named.
 static void LogBigTaken(const NiGeometry* geo) {
+	static UInt32 sessionLines = 0;	// (SceneLogCap)
+	if (gSceneLogCap && sessionLines >= gSceneLogCap) return;
 	const NiBound* b = geo ? geo->m_kWorldBound : nullptr;
 	if (!b || b->Radius < 300.0f) return;
 	static std::unordered_map<const void*, bool> seen;
@@ -79,6 +91,7 @@ static void LogBigTaken(const NiGeometry* geo) {
 	if (Player && Player->parentCell != toldCell) { toldCell = Player->parentCell; seen.clear(); told = 0; }
 	if (told >= 256 || !seen.emplace(geo, true).second) return;
 	told++;
+	sessionLines++;
 	const D3DXVECTOR4& cam = TheRenderManager->CameraPosition;
 	std::string parents;
 	const NiNode* p = geo->m_parent;
@@ -416,8 +429,46 @@ namespace {
 		const char*	earlySecondBy = "none";		// the last user that made one
 		// where the open submit was collected: 0 CollectBeforeShow (RtCore::CollectEarly), the safety nets 1 Exchange, 2 Frame, 3 SubmitEarly
 		// (a frame left it open); 4 dropped by Stop (helper stop / restart / turn off). Last night's logs could not tell the nets apart
-		enum { kAtShow, kAtExchange, kAtFrame, kAtSubmit, kAtStop, kAtCount };
+		// (2026-11-16 fd-batchH) + kAtStart: the next game frame's start (RtCore::UpdateGate), OverlapExchange 2 only
+		enum { kAtShow, kAtExchange, kAtFrame, kAtSubmit, kAtStop, kAtStart, kAtCount };
 		UInt32		earlyCollectedAt[kAtCount] = {};
+		// UNOFFICIAL 2026-11-16 (fd-batchH, docs/next/FD-BATCH-H.md) [Main.Main.RayTracing] OverlapExchange (0 off = the exchange as before):
+		// Frame's exchange signals the helper and is left open in pendingOut / pendingN (the early kick's slot: one frame in flight); the
+		// game's queue waits for it only when the next exchange is recorded (1: at the next RtCore::Frame; 2: at the next game frame's start,
+		// RtCore::UpdateGate), so the helper traces while the game draws. The users' outputs are then the PREVIOUS exchange's results.
+		// A frame with a copy that none of the last few Frame exchanges made (a user came on, a target was made again, a setting changed
+		// what is copied) waits as before, so a user never reads a target its own last trace did not fill.
+		int			overlapMode = 0;			// the key, read at most twice a second (Frame)
+		ULONGLONG	overlapReadAt = 0;
+		bool		overlapCall = false;		// Exchange: Frame's own exchange, overlap allowed (Frame sets it around the call)
+		// (bench 11-16, turn at 30 deg/s: the previous frame's trace read without reprojection showed as double, smeared shadows in the RT
+		// sun's visibility) A frame is left open only while the camera is still: its view turned less than kStillDegrees and moved less than
+		// kStillUnits since the last Frame exchange, so the trace read one frame late was made from (almost) this view. A moving camera waits
+		// as before (exact). overlapTrack: the key is on (the match rule's history is kept then, also while moving)
+		bool		overlapTrack = false;
+		bool		overlapCamKnown = false;
+		D3DXMATRIX	overlapCamView;
+		D3DXVECTOR4	overlapCamPos;
+		UInt32		overlapMoving = 0;			// Frame exchanges that waited because the camera moved (since the last log line)
+		static constexpr float kStillDegrees = 0.1f, kStillUnits = 2.0f;
+		bool		overlapToldWait = false;	// the "30 frames in a row waited" line was written for this key value
+		UInt32		overlapWaitRun = 0;
+		bool		overlapToldOpen = false;	// the "first frame left open" line was written for this key value
+		bool		pendingOverlap = false;		// the open pendingN is an overlapped Frame exchange (not an early submit)
+		UInt32		overlapLateFrame = 0;		// FrameNumber + 1 of the last frame whose Frame exchange was left open (RtCore::OutputsLate)
+		// (bench 11-16: the RT sun traces every other frame, so whole lists never matched twice in a row and no frame was ever left open)
+		// The match rule is per copy: each copy of this exchange (same image, same target, same size) was also made by one of the last
+		// kOverlapKeep Frame exchanges, so its target holds a result of that user's own last trace, never a target nobody filled
+		struct KnownCopy { PendingCopy copy; UInt64 last; };
+		std::vector<KnownCopy> overlapLast;	// copies of the recent Frame exchanges (the match rule above)
+		UInt64		overlapExchanges = 0;		// Frame exchanges counted for the match rule
+		static constexpr UInt64 kOverlapKeep = 4;
+		UInt32		overlapFrames = 0, overlapSync = 0, overlapCollected = 0, overlapDropped = 0;	// since the last log line
+		UInt32		overlapAt[kAtCount] = {};	// where the open exchange was collected (kAtStart / kAtFrame: the planned points; the rest nets)
+		double		overlapWindowMs = 0.0;		// CPU ms from the signal to the collect, summed
+		LONGLONG	overlapSignalQpc = 0;
+		bool		OverlapStandsDown() const;	// a bench env that owns the pending slot or the wait (NVR_RT_EARLY_PT, NVR_RT_WAIT_PREV)
+		void		ReadOverlap();
 		// UNOFFICIAL 2026-11-11 profiler only: a scratch fence whose SignalShared flushes before the collect's WaitShared, so "RT early: collect
 		// wait"'s begin stamp runs before the wait (it read 0.000: both stamps sat in the list the wait gates). Made on first use, dropped in Stop
 		ID3D9NvrExtSharedFence*	profileFlush = nullptr;
@@ -470,6 +521,8 @@ namespace {
 		std::vector<UInt64> slotKey;
 		std::vector<UInt32> slotUse;
 		bool		slotReuse = true;
+		bool		actorFlushPerSpace = true;	// UNOFFICIAL 2026-11-13 (fork port, RT audit F6) [Main.Main.RayTracing] ActorFlushPerSpace
+		UInt64		pipelineRetry = 600;			// UNOFFICIAL 2026-11-13 (fork port, RT audit F12) [Main.Main.RayTracing] AtlasPipelineRetry
 		UInt32		slotCapTest = 0;
 		UInt32		slotsReused = 0, slotsFullTold = 0;
 		static const UInt32 kSlotIdle = 900;
@@ -535,6 +588,13 @@ namespace {
 		UInt8*		texStaging = nullptr;
 		UInt32		texMaxSize = 1024;						// RealTextureMaxSize (0 = auto by video memory): the biggest level sent (bigger textures start at a smaller mip)
 		UInt64		texBudget = 0;							// RealTextureBudgetMB (0 = auto) in bytes, against texRes.alive (the helper's copies, the route's format)
+		// UNOFFICIAL 2026-11-13 (fork port, RT audit F4) [Main.Main.RayTracing] VramWatch with an auto budget: its cap at start (min(lower tier,
+		// 20 % of the process's local budget)) and the live watch
+		bool		texAuto = false, texLuidValid = false;
+		BYTE		texLuid[8] = {};
+		UInt64		texBudgetCap = 0;
+		UInt32		vramShrinks = 0;
+		void		VramWatch(NvrRtFrame& f, UInt64 n);
 		// (2026-11-07, protocol 8, rtgap-textures) the routes (RtTexturePack.h): RGBA8 (the fork's decoding blit) and, with fork 1.8-rt-bc,
 		// BC1 / BC3 / BC5 (the game's blocks as they are); a transfer image each (two halves: exchange parity), its own shelf packing
 		uint32_t	texCapBc = 1024, texCapRgba = 1024;		// the biggest level a route sends
@@ -778,14 +838,18 @@ namespace {
 		if (reused) EvictSlot(at);
 		const UInt32 S = NVR_RT_ALPHA_SLOT_SIZE;
 		static ID3D9NvrExtPipeline* pipelines[2] = {};	// [0] alpha only (RtAlphaToAtlas), [1] alpha + colour (RtTextureToAtlas)
+		// UNOFFICIAL 2026-11-13 (fork port, RT audit F12) [Main.Main.RayTracing] AtlasPipelineRetry: a pipeline that failed to make was tried once
+		// a session (no atlas for the rest of it); now again every this many exchanges (0 = once, as before)
+		static UInt64 pipelineRetryAt[2] = {};
 		static bool triedPipelines[2] = {};
 		const int which = albedoAtlasImage >= 0 ? 1 : 0;
 		ID3D9NvrExtPipeline*& pipeline = pipelines[which];
 		// (2026-11-06) the alpha-only pass always too: it fills the alpha atlas at AlphaDetail texels (the colour pass stays at 64)
 		for (int want = 0; want <= which; want += which ? 1 : 2) {
 		ID3D9NvrExtPipeline*& made = pipelines[want];
-		if (!triedPipelines[want]) {
+		if (!made && (!triedPipelines[want] || (pipelineRetry && frame >= pipelineRetryAt[want]))) {
 			triedPipelines[want] = true;
+			pipelineRetryAt[want] = frame + pipelineRetry;
 			std::vector<char> spirv;
 			ID3D9NvrExt* ext = DxvkCompute::Extension();
 			if (ext && DxvkCompute::LoadSpirv(want ? "RtTextureToAtlas" : "RtAlphaToAtlas", spirv)) {
@@ -1088,7 +1152,39 @@ namespace {
 	}
 
 	// (2026-11-07, protocol 7) the slots made (or short) so far: each one's textures sent (as many as fit this exchange), then its SLOT_TEXTURES op
+	// UNOFFICIAL 2026-11-13 (fork port, RT audit F4) VramWatch: every 120 exchanges with an auto budget, this process's local video memory use
+	// (the game through DXVK) + the helper's real textures and structures against 90 % of the process's budget. Over it: the cap drops to what
+	// is alive minus the excess (at least 256 MB) and idle textures (unused kTexIdle exchanges, least recent first) are released now, up to 64
+	// a call; textures in use stay (new ones then wait: the slots keep the atlas). Under it with 512 MB to spare: the cap climbs back 256 MB a
+	// call to its start value. (A tester's 16 GB card gave the game 12.1 GB; the old 4096 MB tier of copies plus a modded game reached 95 %
+	// and the helper's builds slowed 50-100x.)
+	void Core::VramWatch(NvrRtFrame& f, UInt64 n) {
+		if (!texAuto || !realTextures || (n % 120) != 0) return;
+		unsigned long long budget = 0, usage = 0;
+		if (!RtVideoMemory::Local(texLuid, texLuidValid, budget, usage)) return;
+		const UInt64 helper = texRes.alive + (shared ? (UInt64)shared->geometryBytes : 0);
+		const UInt64 total = usage + helper, limit = budget / 10 * 9, floorBytes = 256ull << 20;
+		if (total > limit) {
+			const UInt64 over = total - limit;
+			const UInt64 cap = (std::max)(floorBytes, texRes.alive > over ? texRes.alive - over : 0ull);
+			if (cap < texBudget) {
+				texBudget = cap;
+				if (vramShrinks++ < 20 || (vramShrinks % 100) == 0)
+					Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT real textures: video memory at %llu of %llu MB (game %llu + helper %llu): auto budget down to %llu MB (VramWatch)",
+						(unsigned long long)(total >> 20), budget >> 20, usage >> 20, (unsigned long long)(helper >> 20), (unsigned long long)(texBudget >> 20));
+			}
+			if (texRes.alive > texBudget) {
+				std::vector<uint32_t> victims;
+				if (!texRes.PickVictims(0, texBudget, n, kTexIdle, victims) || victims.empty())
+					texRes.PickStale(n, kTexIdle, 64, victims);	// (not enough idle ones to reach the cap: the oldest idle ones anyway)
+				for (size_t k = 0; k < victims.size() && k < 64 && f.opCount < NVR_RT_MAX_OPS - 64; k++) ReleaseTexture(victims[k], f, n);
+			}
+		}
+		else if (total + (512ull << 20) < limit && texBudget < texBudgetCap) texBudget = (std::min)(texBudgetCap, texBudget + (256ull << 20));
+	}
+
 	void Core::PumpTextures(NvrRtFrame& f, UInt64 n) {
+		VramWatch(f, n);	// UNOFFICIAL 2026-11-13 (fork port) the auto budget against the process's video memory
 		if (!realTextures || (slotQueue.empty() && looseTextures.empty())) return;
 		LARGE_INTEGER t0, t1, fq;
 		QueryPerformanceCounter(&t0);
@@ -1301,6 +1397,10 @@ namespace {
 			dispUnpin = !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "DisplaceTextureRelease") || node.BoolValue;	// UNOFFICIAL 2026-11-12 (memleak): a missing key = on
 			dispRefs.assign(NVR_RT_MAX_TEXTURES, 0);
 			dispUnpinned = 0;
+			// UNOFFICIAL 2026-11-13 (fork port, RT audit F6 / F9 / F12): missing keys = on / 3000 / 600
+			actorFlushPerSpace = !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "ActorFlushPerSpace") || node.BoolValue;
+			gSceneLogCap = TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "SceneLogCap") ? (UInt32)(std::max)(TheSettingManager->GetSettingI("Main.Main.RayTracing", "SceneLogCap"), 0) : 3000u;
+			pipelineRetry = TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "AtlasPipelineRetry") ? (UInt64)(std::max)(TheSettingManager->GetSettingI("Main.Main.RayTracing", "AtlasPipelineRetry"), 0) : 600;
 			slotCapTest = TheSettingManager->Config.FillNode(&node, "Main.Develop.Main", "RtAtlasSlotCap") ? (UInt32)(std::max)(TheSettingManager->GetSettingI("Main.Develop.Main", "RtAtlasSlotCap"), 0) : 0u;
 			if (slotCapTest) Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT texture table: TEST cap of %u slots (RtAtlasSlotCap), reuse %s, RealTextureKeepFrames %llu", slotCapTest, slotReuse ? "on" : "off", (unsigned long long)texKeepFrames);
 		}
@@ -1322,10 +1422,27 @@ namespace {
 			const int budgetSetting = TheSettingManager->GetSettingI("Main.Main.RayTracing", "RealTextureBudgetMB");
 			char memText[256] = "not asked";
 			RtTexturePack::Caps caps = { 1024u, 1536u, "" };
+			// UNOFFICIAL 2026-11-13 (fork port, RT audit F4) VramWatch (missing key = on): the auto budget's lower tiers (2560 / 2048 / 1024 / 512 MB),
+			// at most 20 % of THIS process's local video memory budget, and watched live (VramWatch above). Off: the old tiers, no watch.
+			SettingManager::Configuration::ConfigNode vwNode;
+			const bool vramWatch = !TheSettingManager->Config.FillNode(&vwNode, "Main.Main.RayTracing", "VramWatch") || vwNode.BoolValue;
 			if (maxSetting <= 0 || budgetSetting <= 0)
-				caps = RtTexturePack::AutoCaps(RtVideoMemory::Dedicated(info.DeviceLUID, info.DeviceLUIDValid != FALSE, info.VendorId, info.DeviceId, memText, sizeof(memText)));
+				caps = RtTexturePack::AutoCaps(RtVideoMemory::Dedicated(info.DeviceLUID, info.DeviceLUIDValid != FALSE, info.VendorId, info.DeviceId, memText, sizeof(memText)), vramWatch);
 			texMaxSize = maxSetting > 0 ? RtTexturePack::ExplicitMaxSize(maxSetting) : caps.maxSize;
 			texBudget = (UInt64)(budgetSetting > 0 ? (std::max)(64, budgetSetting) : (int)caps.budgetMB) << 20;
+			texAuto = vramWatch && budgetSetting <= 0;
+			memcpy(texLuid, info.DeviceLUID, 8); texLuidValid = info.DeviceLUIDValid != FALSE;
+			texBudgetCap = texBudget;
+			vramShrinks = 0;
+			{
+				unsigned long long vb = 0, vu = 0;
+				if (texAuto && RtVideoMemory::Local(texLuid, texLuidValid, vb, vu)) {
+					texBudgetCap = (std::min)(texBudgetCap, (UInt64)(vb / 5) & ~((1ull << 20) - 1));
+					texBudget = texBudgetCap;
+					Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT real textures: auto budget %llu MB = min(tier, 20 %% of the process's local video memory budget %llu MB; %llu MB in use now) (VramWatch)",
+						(unsigned long long)(texBudget >> 20), vb >> 20, vu >> 20);
+				}
+			}
 			// (protocol 8) the BC routes when the fork makes BC shared images (1.8-rt-bc; an older one refuses the format) and
 			// RealTextureCompressed is on (off: everything through RGBA8, the 1.0.6-test7 route, for an A/B)
 			bool bc = false;
@@ -1561,9 +1678,12 @@ namespace {
 		if (why && state != Idle && state != Off) Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT helper stopped: %s.", why);
 		// UNOFFICIAL 2026-11-10 (PT early kick) an open SubmitEarly is dropped, not collected: step 1 below waits for every recorded frame
 		// (lastRecorded includes it) and the shared images go, so its copies out would read nothing. The user keeps last frame's picture.
-		if (pendingN) earlyCollectedAt[kAtStop]++;	// UNOFFICIAL 2026-11-11: a drop, counted apart from the collects
+		if (pendingN && pendingOverlap) overlapDropped++;	// (2026-11-16 fd-batchH) an open OverlapExchange frame: dropped the same way
+		else if (pendingN) earlyCollectedAt[kAtStop]++;	// UNOFFICIAL 2026-11-11: a drop, counted apart from the collects
 		pendingOut.clear();
 		pendingN = 0;
+		pendingOverlap = false;
+		overlapLast.clear();	// (fd-batchH) the next Frame exchange after a start waits (its targets were never filled by this helper)
 		earlyName = nullptr;
 		earlyRiders.clear();	// (2026-11-11 Q1) their copies went with pendingOut
 		submitOnly = false;
@@ -1716,6 +1836,20 @@ namespace {
 			return;
 		}
 		if (state == Running) {
+			// UNOFFICIAL 2026-11-16 [Main.Main.RayTracing] HelperRestarts (port of mrfury97/VegasShaders fef7c30ba, rt-shadows F9; 0 = off, the
+			// default): the helper died while running (a crash or a lost device under GPU pressure): start it again, as an idle stop does, up to
+			// this many times a session, instead of every RT effect falling back for the rest of the session. 0: turned off, as before.
+			static int restarts = 0;
+			if (InterlockedCompareExchange(&tripped, 0, 0)) {
+				const int allowed = (std::min)((std::max)(TheSettingManager->GetSettingI("Main.Main.RayTracing", "HelperRestarts"), 0), 10);
+				if (restarts < allowed) {
+					restarts++;
+					Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT helper lost (%s): starting it again (%d of %d this session; HelperRestarts)", tripReason, restarts, allowed);
+					Stop("the helper is restarted after it was lost");
+					state = Idle;
+					return;
+				}
+			}
 			if (InterlockedCompareExchange(&tripped, 0, 0)) TurnOff(tripReason);
 			else if (shared->state == NVR_RT_STATE_FAILED) TurnOff("the helper stopped (its message is above)");
 		}
@@ -3335,13 +3469,31 @@ namespace {
 		// addresses reused by new ones); the actors still there are posed again from scratch this frame
 		static const void* lastCell = nullptr;
 		const void* cell = Player ? (const void*)Player->parentCell : nullptr;
-		if (cell != lastCell) {
+		// UNOFFICIAL 2026-11-13 (fork port, RT audit F6) ActorFlushPerSpace: outdoors parentCell changes at every cell border, which released and
+		// rebuilt every actor partition (33-230 a frame in a tester's log) at each crossing. On: keyed on the SPACE (indoors the cell, outdoors the
+		// worldspace) plus a camera jump past 8192 units in one frame (a save load or fast travel in the same worldspace). Actors that leave the
+		// loaded grid age out as any geometry (kReleaseAfterFrames). Off: every cell change, as before.
+		static const void* lastSpace = nullptr;
+		static D3DXVECTOR3 lastEye(0.0f, 0.0f, 0.0f);
+		const void* space = cell;
+		bool jumped = false;
+		if (actorFlushPerSpace) {
+			if (Player && Player->GetWorldSpace()) space = (const void*)Player->GetWorldSpace();
+			const D3DXVECTOR3 eye(TheRenderManager->CameraPosition.x, TheRenderManager->CameraPosition.y, TheRenderManager->CameraPosition.z);
+			const D3DXVECTOR3 eyeMove = eye - lastEye;
+			jumped = D3DXVec3LengthSq(&eyeMove) > 8192.0f * 8192.0f;
+			lastEye = eye;
+		}
+		if (space != lastSpace || jumped) {
+			lastSpace = space;
 			for (auto it = geometries.begin(); it != geometries.end(); ) {
 				if (!it->second.skinned) { ++it; continue; }
 				if (it->second.sent) Release(it->second.id);	// (2026-10-30: queued; a full op list used to drop it and the helper kept it)
 				it = geometries.erase(it);
 			}
 			FreeFaces(true);	// (2026-11-07) the heads' states are keyed as their partitions
+		}
+		if (cell != lastCell) {	// (ActorFlushPerSpace: the retry below stays per cell)
 			// UNOFFICIAL 2026-11-12 (RT memory audit): "unreadable" entries are keyed by a texture's address and lived until the helper stopped:
 			// another texture later at that address was left out of the traced scene for the session. Tried again after a cell change.
 			for (auto it = alphaSlots.begin(); it != alphaSlots.end(); ) it = it->second < 0 ? alphaSlots.erase(it) : std::next(it);
@@ -3725,9 +3877,56 @@ namespace {
 		InterlockedExchange64(&c.lastRecorded, (LONG64)n);
 		if (timedIn) timerIn.End();
 		if (timedSubmit) timerSubmit.End();
-		const bool timedTrip = !only && timerTrip.Begin(Device);
+		// UNOFFICIAL 2026-11-16 (fd-batchH) OverlapExchange: Frame's own exchange is left open when each of its copies was also made by one of
+		// the last few Frame exchanges (same image into the same target): the users' targets then hold that exchange's results until this one is collected. Otherwise
+		// (the first frame, a change) it waits as before. overlapCall is only ever set with the key on and no bench env (Frame).
+		bool overlapNow = false;
+		if (c.overlapTrack && !only && !c.submitOnly && recorded) {
+			const UInt64 now = ++c.overlapExchanges;
+			auto same = [](const PendingCopy& a, const PendingCopy& b) { return a.image == b.image && a.target == b.target && a.width == b.width && a.height == b.height; };
+			overlapNow = !c.copiesOut.empty();
+			const PendingCopy* unknown = nullptr;
+			for (const PendingCopy& copy : c.copiesOut) {
+				bool known = false;
+				for (const Core::KnownCopy& k : c.overlapLast) if (same(k.copy, copy) && now - k.last <= Core::kOverlapKeep) { known = true; break; }
+				if (!known && !unknown) unknown = &copy;
+				overlapNow = overlapNow && known;
+			}
+			if (overlapNow && !c.overlapCall) { overlapNow = false; c.overlapMoving++; c.overlapWaitRun = 0; }	// the camera moved: wait (exact)
+			if (overlapNow) c.overlapWaitRun = 0;
+			else if (unknown && !c.overlapToldWait && ++c.overlapWaitRun >= 30) {	// once per key value: why frames keep waiting
+				c.overlapToldWait = true;
+				Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT OverlapExchange %d: 30 frames in a row waited as before; the first copy not made in the last %llu "
+					"exchanges: image %d (%ux%u) of %u copies", c.overlapMode, (unsigned long long)Core::kOverlapKeep, unknown->image, unknown->width, unknown->height,
+					(unsigned)c.copiesOut.size());
+			}
+			for (const PendingCopy& copy : c.copiesOut) {
+				bool found = false;
+				for (Core::KnownCopy& k : c.overlapLast) if (same(k.copy, copy)) { k.last = now; found = true; break; }
+				if (!found) c.overlapLast.push_back({ copy, now });
+			}
+			c.overlapLast.erase(std::remove_if(c.overlapLast.begin(), c.overlapLast.end(), [now](const Core::KnownCopy& k) { return now - k.last > 2 * Core::kOverlapKeep; }), c.overlapLast.end());
+			if (overlapNow) c.overlapFrames++; else c.overlapSync++;
+		}
+		const bool timedTrip = !only && !overlapNow && timerTrip.Begin(Device);
 		c.share->SignalShared(c.inputsReady, n);
-		if (c.submitOnly) {
+		if (overlapNow) {
+			// (fd-batchH) no wait here: the next exchange (or the next frame's start with OverlapExchange 2) collects it first, before any
+			// of its own staging or copies in (the arena rule); Stop drops it
+			c.pendingOut.swap(c.copiesOut);
+			c.pendingN = n;
+			c.pendingOverlap = true;
+			c.overlapLateFrame = TheFrameRateManager->FrameNumber + 1;
+			if (!c.overlapToldOpen) {	// once per key change: the proof that the key took effect (the 600-frame line comes late at low fps)
+				c.overlapToldOpen = true;
+				Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT OverlapExchange %d: the first frame left open (exchange %llu, %u copies out pending; %u frames "
+					"waited before it)", c.overlapMode, (unsigned long long)n, (unsigned)c.pendingOut.size(), c.overlapSync);
+			}
+			LARGE_INTEGER signalled;
+			QueryPerformanceCounter(&signalled);
+			c.overlapSignalQpc = signalled.QuadPart;
+		}
+		else if (c.submitOnly) {
 			// UNOFFICIAL 2026-11-10 (PT early kick) SubmitEarly: no wait here; the copies out wait for CollectEarly (pendingOut), the helper
 			// traces while the game draws the world
 			c.pendingOut.swap(c.copiesOut);
@@ -3913,7 +4112,41 @@ void RtCore::Frame(IDirect3DDevice9* Device) {
 	if (c.earlyName && c.earlyFrame == TheFrameRateManager->FrameNumber + 1) { c.earlySecond++; c.earlySecondBy = by ? by : "?"; }
 	static GpuTimer timer("Ray tracing (copies + helper + waits)");
 	GpuProfileScope gpu(timer, Device);
+	// UNOFFICIAL 2026-11-16 (fd-batchH) [Main.Main.RayTracing] OverlapExchange: off (0, the default) = exactly the exchange above as before
+	c.ReadOverlap();
+	c.overlapTrack = c.overlapMode > 0 && !c.OverlapStandsDown();
+	bool still = false;
+	{	// (fd-batchH) the camera since the last Frame exchange: the view's axes and the eye
+		const D3DXMATRIX& v = TheRenderManager->ViewMatrix;
+		const D3DXVECTOR4& p = TheRenderManager->CameraPosition;
+		if (c.overlapCamKnown && !TheShaderManager->GameState.isCameraCut) {
+			const D3DXMATRIX& o = c.overlapCamView;
+			const float cosLimit = cosf(D3DXToRadian(Core::kStillDegrees));
+			float minDot = 1.0f;
+			for (int k = 0; k < 3; k++)
+				minDot = (std::min)(minDot, v.m[0][k] * o.m[0][k] + v.m[1][k] * o.m[1][k] + v.m[2][k] * o.m[2][k]);	// column k: right / up / forward
+			const float dx = p.x - c.overlapCamPos.x, dy = p.y - c.overlapCamPos.y, dz = p.z - c.overlapCamPos.z;
+			still = minDot >= cosLimit && dx * dx + dy * dy + dz * dz <= Core::kStillUnits * Core::kStillUnits;
+		}
+		c.overlapCamView = v;
+		c.overlapCamPos = p;
+		c.overlapCamKnown = true;
+	}
+	c.overlapCall = c.overlapTrack && still;
 	c.Exchange(Device, nullptr);
+	c.overlapCall = false;
+	c.overlapTrack = false;
+	if (c.overlapMode > 0 && c.overlapFrames + c.overlapSync >= 600) {
+		const UInt32* at = c.overlapAt;
+		Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT OverlapExchange %d: %u frames left open (their users read the previous exchange's results), %u waited "
+			"as before (%u of them because the camera moved; the rest: the first frame or a new copy); signal -> collect %.3f ms avg CPU (%u collected: next frame's start %u, Frame %u, a later "
+			"exchange %u, other %u; dropped by a helper stop %u). GPU wait: F10's \"RT overlap: collect wait\".", c.overlapMode, c.overlapFrames, c.overlapSync, c.overlapMoving,
+			c.overlapCollected ? c.overlapWindowMs / c.overlapCollected : 0.0, c.overlapCollected, at[Core::kAtStart], at[Core::kAtFrame],
+			at[Core::kAtExchange], at[Core::kAtShow] + at[Core::kAtSubmit], c.overlapDropped);
+		c.overlapFrames = c.overlapSync = c.overlapCollected = c.overlapDropped = c.overlapMoving = 0;
+		c.overlapWindowMs = 0.0;
+		for (UInt32& v : c.overlapAt) v = 0;
+	}
 }
 
 // UNOFFICIAL 2026-10-28 (RT reflections): RtCore.h. Frame (earlier in the frame) has already started the helper and checked the screen.
@@ -3943,7 +4176,38 @@ bool RtCore::EarlyPtWanted() {
 	return wanted;
 }
 
+// UNOFFICIAL 2026-11-16 (fd-batchH; RtCore.h)
+bool RtCore::OutputsLate() { return TheCore.overlapLateFrame == TheFrameRateManager->FrameNumber + 1 && TheCore.pendingOverlap; }
+
 namespace {
+	// (fd-batchH) the two bench envs own what OverlapExchange would change: NVR_RT_EARLY_PT the pending slot, NVR_RT_WAIT_PREV the wait
+	bool Core::OverlapStandsDown() const {
+		static const bool waitPrev = getenv("NVR_RT_WAIT_PREV") != nullptr;
+		return waitPrev || RtCore::EarlyPtWanted();
+	}
+
+	void Core::ReadOverlap() {
+		const ULONGLONG now = GetTickCount64();
+		if (overlapReadAt && now - overlapReadAt < 500) return;
+		overlapReadAt = now;
+		SettingManager::Configuration::ConfigNode node;
+		int mode = TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "OverlapExchange") ?
+			TheSettingManager->GetSettingI("Main.Main.RayTracing", "OverlapExchange") : 0;	// (a missing key: off)
+		if (mode < 0 || mode > 2) mode = mode > 2 ? 2 : 0;
+		if (mode != overlapMode) {
+			Logger::Log("UNOFFICIAL Vegas Shaders DXVK: RT OverlapExchange %d (was %d): %s%s", mode, overlapMode,
+				mode == 0 ? "the game's GPU waits for this frame's trace at the RT point, as before" :
+				mode == 1 ? "the frame's exchange is left open and collected at the next frame's RT point; the RT effects show the PREVIOUS frame's trace (unproven)" :
+				"the frame's exchange is left open and collected at the next frame's start; the RT effects show the PREVIOUS frame's trace (unproven)",
+				mode && OverlapStandsDown() ? " (stands down: NVR_RT_EARLY_PT or NVR_RT_WAIT_PREV is set)" : "");
+			overlapMode = mode;
+			overlapToldOpen = false;
+			overlapToldWait = false;
+			overlapWaitRun = 0;
+			overlapLast.clear();	// the first frame after a change waits
+		}
+	}
+
 	bool Core::EarlyThisFrame(const char* name) const {
 		if (earlyFrame != TheFrameRateManager->FrameNumber + 1) return false;
 		if (earlyName && (earlyName == name || (name && !strcmp(earlyName, name)))) return true;
@@ -3956,15 +4220,27 @@ namespace {
 		if (!pendingN) return;
 		const UInt64 n = pendingN;
 		pendingN = 0;
-		if (site >= 0 && site < kAtCount) earlyCollectedAt[site]++;
+		// (2026-11-16 fd-batchH) an OverlapExchange frame: its own counters and timer, so the "RT early" line stays the early kick's
+		const bool overlapped = pendingOverlap;
+		pendingOverlap = false;
 		LARGE_INTEGER now, freq;
 		QueryPerformanceCounter(&now);
 		QueryPerformanceFrequency(&freq);
-		earlyOverlapMs += 1000.0 * (double)(now.QuadPart - earlySignalQpc) / (double)freq.QuadPart;	// signal -> collect: the overlap window
-		earlyCollected++;
+		if (overlapped) {
+			if (site >= 0 && site < kAtCount) overlapAt[site]++;
+			overlapWindowMs += 1000.0 * (double)(now.QuadPart - overlapSignalQpc) / (double)freq.QuadPart;
+			overlapCollected++;
+		}
+		else {
+			if (site >= 0 && site < kAtCount) earlyCollectedAt[site]++;
+			earlyOverlapMs += 1000.0 * (double)(now.QuadPart - earlySignalQpc) / (double)freq.QuadPart;	// signal -> collect: the overlap window
+			earlyCollected++;
+		}
 		if (state != Running || !share || !outputReady) { pendingOut.clear(); return; }	// (Stop clears it first; belt and braces)
 		static GpuTimer timerCollect("  RT early: collect wait");
-		const bool timed = timerCollect.Begin(Device);
+		static GpuTimer timerOverlap("  RT overlap: collect wait");	// (fd-batchH) the game's queue waiting for the previous frame's trace
+		GpuTimer& collectTimer = overlapped ? timerOverlap : timerCollect;
+		const bool timed = Device && collectTimer.Begin(Device);
 		// UNOFFICIAL 2026-11-11 only while the GPU profiler runs (timed: GpuTimer::Enabled, not loading): SignalShared is the ext's one flush
 		// (it submits everything recorded so far), so the begin stamp above runs BEFORE the wait instead of in the list the wait gates. A scratch
 		// fence nobody waits on (the D3D9 event query's flush never reported done under the fork: Stop's note). Normal play: nothing changes.
@@ -3974,7 +4250,7 @@ namespace {
 			if (profileFlush) share->SignalShared(profileFlush, ++profileFlushValue);
 		}
 		share->WaitShared(outputReady, n);
-		if (timed) timerCollect.End();
+		if (timed) collectTimer.End();
 		for (const PendingCopy& copy : pendingOut) {
 			const RECT used = { 0, 0, (LONG)(copy.width ? copy.width : imageSizes[copy.image].first),
 				(LONG)(copy.height ? copy.height : imageSizes[copy.image].second) };
@@ -4087,6 +4363,10 @@ const char* RtCore::StatusText() {
 bool RtCore::Gated() { return TheGate.gated; }
 
 bool RtCore::UpdateGate(bool Exterior) {
+	// UNOFFICIAL 2026-11-16 (fd-batchH) OverlapExchange 2: last frame's open exchange is collected here, at the game frame's start (once a frame,
+	// render thread, before the shadow maps and the world): the world's draws that read last frame's trace (the forward lamp shadows'
+	// reprojection) then see the exchange their camera was stamped for, as without the key. Mode 1 collects at the next RtCore::Frame.
+	if (TheCore.pendingN && TheCore.pendingOverlap && TheCore.overlapMode == 2) TheCore.CollectEarly(TheRenderManager->device, Core::kAtStart);
 	MasterGate& g = TheGate;
 	SettingManager::Configuration::ConfigNode node;
 	const bool interiors = !TheSettingManager->Config.FillNode(&node, "Main.Main.RayTracing", "RTInteriors") || node.BoolValue;	// (a missing key: on)

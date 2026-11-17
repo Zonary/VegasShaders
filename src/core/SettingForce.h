@@ -36,6 +36,14 @@ namespace SettingForce {
 		// UNOFFICIAL 2026-11-14 (the orchestrator's call, FD-LOD-RESULTS.md "not decided"): mode 2 lights outdoors, where fp16 distance is too
 		// coarse for sun shadows; the depth route (DeferredDepth 2: the INTZ copy -> fp32 view z) worked on both runtimes (FD-PHASE0-RESULTS.md Q2)
 		{ "Main.Main.Quality", "DeferredDepth", 2, 2 },
+		// UNOFFICIAL 2026-11-16 (owner: patches of land see-through with terrain blending on) a value forced OFF: terrain blending's Smooth fade
+		// turns SRCALPHA / INVSRCALPHA on for every land draw (TerrainShaders::PrepareBlending), and D3D9 blends each render target by its OWN
+		// alpha. In mode 2 the land's lighting-free record writes the code 1 + keep into COLOR1.a (TerrainTemplate.hlsl FD_LF_CODE), so its
+		// albedo and that code were blended by a weight of 1..2 over whatever was drawn first (the buried rocks and land pieces), on the whole
+		// land, not only the seam: DeferredSun then lit those pixels from a mixed record. Smooth 0 is the dither (clip), with alpha 1 and no
+		// blend: each texel holds either the land's record or the object's. TAA / FSR / DLSS average the stipple (SharedNoise moves it while
+		// they resolve). Mode 1 has no land record (the land writes its albedo alpha 1 there, a replace): mode 2 only.
+		{ "Shaders.Terrain.Blending", "Smooth", 0, 2 },
 	};
 
 	// The forced value of section / key, when the table applies. Called with State already decided.

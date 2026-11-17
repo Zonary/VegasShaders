@@ -67,9 +67,17 @@ namespace PbrPop {
 
 		// One object pass about to be drawn (RenderPassStandard/Skinned hooks): its fade in pixel c211.x; FoldHighlights' switches for the
 		// draw in y (fold) and z (with the vertex colour), 0 for every draw it does not fold.
+		// (2026-11-16 fd-batchE, docs/next/FD-BATCH-E.md) z is now the vertex colour flag for EVERY lit draw (the property's Vertex_Colors: the
+		// game's TEXTURE pass is then TEXTURE_Vc), not only the folded ones: the deferred records of the light-only base pass (AD) take the
+		// vertex colour into their G-buffer albedo by it (ObjectTemplate.hlsl OBJ_AD_GBUFFER, ParallaxTemplate.hlsl PAR_AD_GBUFFER). Every
+		// other reader of z is unchanged by it: the fold reads it only with y 1 (and FoldHighlights gives the same flag), and the blended
+		// mark tests (z 3 / -1: CapturedNormals::CoverageBegin) read 0 and 1 alike.
 		inline void ForDraw(IDirect3DDevice9* device, const NiGeometry* geometry, float fold = 0.0f, float vertexColor = 0.0f) {
-			if (!Compiled && !FoldCompiled) return;
-			const float fade = Compiled && On ? GameSpecularFade(LitProperty(geometry)) : 1.0f;
+			// (fd-batchE: no early return when SpecularFade and FoldHighlights are both compiled out: the deferred AD records still read z (x 1 = full
+			// highlight, y 0 = no fold: what those shaders read with the two compiled out); the upload happens only when a value changes)
+			const BSShaderProperty* property = LitProperty(geometry);
+			if (fold <= 0.0f) vertexColor = property && (property->ulFlags[1] & BSShaderProperty::Vertex_Colors) ? 1.0f : 0.0f;
+			const float fade = Compiled && On ? GameSpecularFade(property) : 1.0f;
 			if (fade == Sent && fold == SentFold && vertexColor == SentVc && MaterialW == SentW) return;
 			Sent = fade; SentFold = fold; SentVc = vertexColor; SentW = MaterialW;
 			const float value[4] = { fade, fold, vertexColor, MaterialW };

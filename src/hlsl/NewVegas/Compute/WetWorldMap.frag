@@ -20,7 +20,8 @@ layout(push_constant) uniform Push {
     uint sMipWrap;      // not used by these passes
     uint sMipClamp;     // not used by these passes
     uint passIndex;     // 0 WetMap, 1 blur across, 2 blur down
-    uint pad[3];
+    uint gbufferV2;     // UNOFFICIAL 2026-11-16 fd-batchCG: 1 = the material buffer is in layout v2 (core/CapturedNormals.h V2Compiled)
+    uint pad[2];
 } pc;
 
 layout(location = 0) in vec2 vUV;
@@ -32,16 +33,29 @@ layout(location = 0) out vec4 o_color;
 // line (what the wet pass may put on this pixel: 1 everything, 1.5 everything but the puddle's own mirror image, 0.5 the wet look
 // without puddles, 0 nothing). c.wetWorldLook: y the mode (0 off, 1 ground-like, 2 land only) + 4 with WeaponRainHandOff, z
 // PuddlesMinObjectSize, w 1 while the Reflections effect owns the puddles' mirror image.
+// UNOFFICIAL 2026-11-16 fd-batchCG (DEFERRED-GAPS-AUDIT item 4): + the GBufferV2 decode of WetWorld.fx.hlsl's GBUFFER_V2 branch, chosen
+// by pc.gbufferV2 (the texel alone cannot tell the layouts apart: a v2 object without the specular bit reads as an old class).
 float GetSurfaceWetClass(vec2 uv, float vmMask) {
     float wetClass = 1.0;
     float weaponOff = step(3.5, c.wetWorldLook.y);
     float mode = c.wetWorldLook.y - 4.0 * weaponOff;
     if (mode > 0.5) {
         vec4 material = textureLod(sampler2D(t_material, NVR_SAMPLER(pc.sPoint)), uv, 0.0);
-        float share = clamp(material.a, 0.5, 1.0);
-        float written = step(0.5, material.a) * step(0.5, material.r);
-        float kind = floor(material.r / share + 0.01);
-        float radius = material.g / share;
+        float written, kind, radius;
+        if (pc.gbufferV2 != 0u) {
+            // GBufferV2 (core/CapturedNormals.h): r the shading model (+16 specular), written = r > 0.5; a is a normal's y and the bound
+            // radius is gone: every object counts as large enough (PuddlesMinObjectSize has no effect with it)
+            written = step(0.5, material.r);
+            kind = floor(material.r + 0.01);
+            kind -= 16.0 * step(15.5, kind);
+            kind = (kind == 8.0 || kind == 9.0) ? 2.0 : kind;	// hair, eyes: an actor's, as worn gear
+            radius = c.wetWorldLook.z;
+        } else {
+            float share = clamp(material.a, 0.5, 1.0);
+            written = step(0.5, material.a) * step(0.5, material.r);
+            kind = floor(material.r / share + 0.01);
+            radius = material.g / share;
+        }
         float isActor = (kind == 2.0 || kind == 6.0) ? 1.0 : 0.0;
         float isLand = (kind == 4.0) ? 1.0 : 0.0;
         float isObject = (kind == 1.0) ? 1.0 : 0.0;

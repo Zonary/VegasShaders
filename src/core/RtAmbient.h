@@ -125,6 +125,19 @@ namespace RtAmbient {
 		// Enabled / GI / Sky / RadianceCache / CacheExteriors on: the user's strength / quality keys stay. AmbientLight forces its own side (ExteriorBalance,
 		// AmbientReplace, AlbedoBuffer, the Status switch, the grid fallback; AmbientLight.cpp SunGIFrame). GIDenoiseSunGI (default true; missing key: true):
 		// with SunGI the GI denoiser gets the sun-GI settings (AmbientOcclusion.cpp RtDenoisedGI); false = the old settings, for the A/B.
+		// UNOFFICIAL 2026-11-13 (rtgi-review, RTGIReview/REVIEW.md) GIDenoiseTune (0-2; RtDenoisedGI, with SunGI outdoors). The review's other fixes have no key any more
+		// (settings cleanup 2026-11-13): the history cut by energy (R2), the trace input from one pixel (R4), the hit textures' mip (R19) and the denoiser's
+		// guide worked out once (B2) are simply how it works; GICandidates and GISpatialVisibility were measured useless and are gone.
+		int		GIDenoiseTune = 2;
+		// UNOFFICIAL 2026-11-16 (rtgi-review; user: grass still sparkles in the shade) GIGrassDenoise (0-3, RtDenoisedGI with the guide): RtDenoise Settings.Soft:
+		// 1 = the GI denoiser keeps its history on grass, 2 = its a-trous passes smooth across the blades, 3 = both (default).
+		int		GIGrassDenoise = 3;
+		// UNOFFICIAL 2026-11-13 (rtgi-review B3, REVIEW.md R3 / R18) GISamplePoints (default false until benched; a missing key: false): ReSTIR GI with the
+		// sample's geometry (RtAOTrace.comp ReuseGIPoints): cosine at the receiving surface, Jacobian and one visibility ray on spatial reuse. GIValidate
+		// (default true, with GISamplePoints): 1 texel in 8 a frame re-traces the ray to its kept sample point and drops the history when the geometry changed.
+		bool	GISamplePoints = false;
+		bool	GIScreenAmbientOut = false;	// UNOFFICIAL 2026-11-13 (rtgi-review B6, R5) with GIScreenLight and AmbientReplace (SunGI) outdoors: on-screen bounce hits lose the game's ambient share and gain the cache's irradiance, as off-screen hits (RtAOTrace.comp Bounce)
+		bool	GIValidate = true;
 		bool	SunGI = false;
 		bool	GIDenoiseSunGI = true;
 		// UNOFFICIAL 2026-11-12 RoomGI: [Shaders.AmbientLight.Main] RoomGI, the one switch for the interior bounce (missing key: off), SunGI's counterpart.
@@ -242,6 +255,12 @@ namespace RtAmbient {
 			Current.SkyMissNightAmbient = TheSettingManager->Config.FillNode(&node, s, "SkyMissNightAmbient") ? std::clamp(node.FloatValue, -1.0f, 1.0f) : -1.0f;
 			Current.GISunDuskFade = TheSettingManager->Config.FillNode(&node, s, "GISunDuskFade") ? std::clamp(node.FloatValue, -1.0f, 1.0f) : -1.0f;
 			Current.GILeafTransmission = TheSettingManager->Config.FillNode(&node, s, "GILeafTransmission") ? std::clamp(node.FloatValue, 0.0f, 0.9f) : 0.0f;
+			// UNOFFICIAL 2026-11-13 (rtgi-review)
+			Current.GIDenoiseTune = TheSettingManager->Config.FillNode(&node, s, "GIDenoiseTune") ? std::clamp((int)node.IntValue, 0, 2) : 2;
+			Current.GIGrassDenoise = TheSettingManager->Config.FillNode(&node, s, "GIGrassDenoise") ? std::clamp((int)node.IntValue, 0, 3) : 3;
+			Current.GISamplePoints = TheSettingManager->Config.FillNode(&node, s, "GISamplePoints") && node.BoolValue;
+			Current.GIScreenAmbientOut = TheSettingManager->Config.FillNode(&node, s, "GIScreenAmbientOut") && node.BoolValue;
+			Current.GIValidate = !TheSettingManager->Config.FillNode(&node, s, "GIValidate") || node.BoolValue;
 			if (Current.SunGI && !InteriorNow) Current.Enabled = Current.GI = Current.Sky = Current.RadianceCache = Current.CacheExteriors = true;
 			// UNOFFICIAL 2026-11-12 (sungi p6, user screenshot: the GI-only view lit a shaded shack evenly, cream all over, the sunlit floor patch no
 			// brighter than the far corners) GIAmbient lights EVERY bounce hit with the game's ambient, with no visibility test: inside a room each

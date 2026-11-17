@@ -154,6 +154,7 @@ public:
 		int		Albedo = 0;			// RRAlbedo: 0 flat grey 0.5, 1 the picture's own chroma at a fixed luminance, 2 TESR_AlbedoBuffer where written (2026-10-31 AlbedoBuffer)
 		float	Roughness = 0.6f;	// RRRoughness [0-1]: where no TESR_MaterialBuffer roughness exists
 		int		Normals = 0;		// RRNormals: 0 camera-relative world space, 1 view space
+		bool	MirrorMotion = false;	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) [Main.Main.RayTracing] RRMirrorMotion: PSR motion at flat path-traced mirrors
 	};
 	RRSettingsStruct	RRSettings;
 	bool				rrAlbedoMissingLogged = false;	// UNOFFICIAL 2026-10-31 AlbedoBuffer: RRAlbedo 2 without the buffer, said once
@@ -235,6 +236,10 @@ private:
 	ID3D9NvrExtPipeline*	rrGuides = nullptr;
 	ExtPass			rrComposite;
 	ExtUniformBuffer	rrPrepUniforms, rrGuidesUniforms;
+	ID3D9NvrExtPipeline*	rrGuidesMirror = nullptr;	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) DlssRRGuides-mirror.spv (RRMirrorMotion), made on its first use
+	ExtUniformBuffer	rrGuidesMirrorUniforms;
+	bool		rrMirrorTried = false;
+	UInt32		rrMirrorLogs = 0;
 	bool		rrTried = false;		// RR's pipelines created (or failed) once
 	bool		rrFailed = false;		// RR is off for the session (logged)
 	UInt32		rrLogged = 0;			// the frame checks' reasons already logged (each once)
@@ -283,6 +288,7 @@ private:
 		bool		Failed = false;			// RenderScale is off for the session (logged)
 		bool		Whole = false;			// UpscaleRun found the world drawn at full resolution anyway (nothing to put back)
 		UInt32		DrawsSmall = 0, DrawsFull = 0, DrawsOther = 0;	// this world scene's passes by viewport (NoteWorldDraw)
+		UInt32		DrawsElsewhere = 0;		// UNOFFICIAL 2026-11-16: ... with the whole viewport of another render target (the game's water refraction copy): left as drawn
 		bool		MixedLogged = false;
 		UInt32		Frames = 0, SkippedFrames = 0, LoggedSkips = 0;
 		float		LoggedScale = 0.0f;

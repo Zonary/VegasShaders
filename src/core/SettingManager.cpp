@@ -58,7 +58,7 @@ template <> std::string SettingManager::ToString<int>(const int number) {
 }
 
 // The user config's [_Unofficial] SettingsVersion this build brings it up to (UpdateOldDefaults, below).
-static const int UnofficialSettingsVersion = 85;  // (85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
+static const int UnofficialSettingsVersion = 89;  // (89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
 
 // UNOFFICIAL 2026-10-30: a setting is read only when the defaults file lists it (FillNode), so a line in the user's toml that
 // this build does not know (a key from a newer or an older build, a typo) silently did nothing. Each one is logged once per
@@ -775,6 +775,64 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 	// [Main.Main.Quality] DeferredRenderer 0 -> 2. The key never shipped in a public release (added 2026-11-14, default 0), so only files saved
 	// by the development and playtest builds hold the old 0. A saved 1 or 2 is a choice and stays.
 	if (version < 85) replace("Main.Main.Quality", "DeferredRenderer", 0, 2, true);
+	// 86 (2026-11-16, owner decision): SMAA and DitherBuster are off by default ([Shaders.SMAA.Status] / [Shaders.DitherBuster.Status]
+	// Enabled true -> false). A menu save holds the old true, which moves to false once; a saved false stays.
+	if (version < 86) {
+		for (const char* section : { "Shaders.SMAA.Status", "Shaders.DitherBuster.Status" }) {
+			tomlValue* saved = UserSection(section);
+			if (saved && saved->contains("Enabled") && saved->at("Enabled").is_boolean() && saved->at("Enabled").as_boolean()) {
+				(*saved)["Enabled"] = false;
+				changed += std::string(changed.empty() ? "" : ", ") + section + ".Enabled true -> false";
+			}
+		}
+	}
+	// 87 (2026-11-16, owner decision: "smooth cutouts should be part of the default if we're going to ship it with taa on"): [Shaders.TAA.Cutouts]
+	// Enabled false -> true (Mode 2, like the game's MSAA). A menu save holds the old false, which moves to true once. It is a restart key, read
+	// when the shaders are first compiled, which is after this step: it applies from this start. It does nothing without TAA / FSR / DLSS.
+	if (version < 87) {
+		tomlValue* saved = UserSection("Shaders.TAA.Cutouts");
+		if (saved && saved->contains("Enabled") && saved->at("Enabled").is_boolean() && !saved->at("Enabled").as_boolean()) {
+			(*saved)["Enabled"] = true;
+			changed += std::string(changed.empty() ? "" : ", ") + "Shaders.TAA.Cutouts.Enabled false -> true (Smooth Cutouts; a restart key: compiled in from this start)";
+		}
+	}
+	// 88 (2026-11-16, owner decision after the fd-fwdgroups pictures, docs/next/FD-FORWARD-GROUPS.md section 6): skin and hair join the
+	// deferred renderer by default (glass too at first, held back on 2026-11-17, on again in 89: below): [Main.Main.Quality] DeferredSkin false -> true,
+	// DeferredSkinSSS 0 -> 2 (with [Shaders.Skin.SSS] Kernel 1, the separable kernel) and DeferredHair false -> true. The keys never shipped in
+	// a public release (added 2026-11-15, test builds only); a menu save holds the old values, which move once. A saved non-default value stays.
+	// 2026-11-17 (owner: "glass off for now", claude/test-1117): [Main.Main.Quality] DeferredTransparents 1 turned pale glass bottles silver
+	// (docs/next/BOTTLE-GLOW.md), so its default went back to 0 and 88 no longer moves a saved 0 to 1. Editing 88 itself was safe then: no
+	// settings file outside the bench had been saved at 88. Glass is turned on again by migration 89 (below), not here: test-1117's first zip
+	// (rev1) ran this 88, so a file it saved is at 88 with DeferredTransparents 0, and only a newer step reaches it.
+	if (version < 88) {
+		replace("Main.Main.Quality", "DeferredSkinSSS", 0, 2, true);
+		replace("Shaders.Skin.SSS", "Kernel", 0, 1, true);	// the old default 0 (Burley) leaves a dark patch under a moustache
+		tomlValue* saved = UserSection("Main.Main.Quality");
+		for (const char* key : { "DeferredSkin", "DeferredHair" }) {
+			if (saved && saved->contains(key) && saved->at(key).is_boolean() && !saved->at(key).as_boolean()) {
+				(*saved)[key] = true;
+				changed += std::string(changed.empty() ? "" : ", ") + "Main.Main.Quality." + key + " false -> true";
+			}
+		}
+	}
+	// 89 (2026-11-17, owner: "Turn glass on", claude/test-1117 rev2): [Main.Main.Quality] DeferredTransparents 0 -> 1, glass under the deferred
+	// renderer on by default again. The silver bottles that held it back came from the forward+ lamp walk (Includes/ForwardPlus.hlsl FPLampSum):
+	// D3DX compiled its `if (k >= count) break` as a break that never fires in 20 records, so the walk ran past the froxel's lamp list and added
+	// lamps several times over; the list length is now the loop's own bound (claude/fd-glassglow 0e065a3a + 3479ea34, here 9046dea41 + debca731f;
+	// docs/next/FD-GLASSGLOW.md). A menu save holds the old 0 (the default from 2026-11-15 and again from 11-17 until this step), which moves to 1
+	// once, whether the file was saved at 85 (before 88) or at 88 (test-1117 rev1). A saved 1 stays. It is a restart key read when the shaders
+	// are first compiled, which is after this step: the glass records are compiled in from this start.
+	if (version < 89) {
+		tomlValue* saved = UserSection("Main.Main.Quality");
+		if (saved && saved->contains("DeferredTransparents")) {
+			const tomlValue& value = saved->at("DeferredTransparents");
+			if ((value.is_integer() && value.as_integer() == 0) || (value.is_floating() && value.as_floating() == 0.0)) {
+				(*saved)["DeferredTransparents"] = 1;
+				changed += std::string(changed.empty() ? "" : ", ") +
+					"Main.Main.Quality.DeferredTransparents 0 -> 1 (glass under the new renderer, settings step 89: the silver-bottle fix is in; a restart key: compiled in from this start)";
+			}
+		}
+	}
 	if (!changed.empty())
 		Logger::Log("UNOFFICIAL settings: old defaults saved by an earlier build moved to the new defaults: %s. "
 			"Change them in the menu and press Save if you want the old values back.", changed.c_str());

@@ -245,7 +245,7 @@ namespace FlashlightDeferred {
 		IDirect3DBaseTexture9* tex[6] = {};
 		for (int s = 0; s < 6; s++) d->GetTexture(kStages[s], &tex[s]);
 		// every constant the pass sets, saved and put back
-		struct Range { UINT reg, count; float v[16][4]; } saved[] = { { 0, 15 }, { 32, 5 }, { 135, 1 }, { 168, 1 }, { 191, 1 }, { 205, 1 }, { 211, 1 }, { 223, 1 } };
+		struct Range { UINT reg, count; float v[16][4]; } saved[] = { { 0, 16 }, { 32, 5 }, { 135, 1 }, { 168, 1 }, { 191, 1 }, { 205, 1 }, { 211, 1 }, { 223, 1 } };	// (c15: fd-batchA FL_Model, 2026-11-16)
 		for (Range& r : saved) d->GetPixelShaderConstantF(r.reg, &r.v[0][0], r.count);
 		// 2026-11-04 depth-tested (not written) at each pixel's G-buffer surface, the shader's own depth (FlashlightDeferred.hlsl): what was
 		// drawn over that surface without writing the G-buffer (hair) is not lit as the surface behind it. The game's depth runs either way
@@ -302,12 +302,18 @@ namespace FlashlightDeferred {
 		const D3DXMATRIX& iv = TheRenderManager->InvViewMatrix;
 		const float tanX = fabsf(TheRenderManager->InvProjMatrix._11), tanY = fabsf(TheRenderManager->InvProjMatrix._22);
 		const D3DXMATRIX& proj = NiDX9Renderer::GetSingleton()->projMatrix;
+		// UNOFFICIAL 2026-11-16 fd-batchA item 7 ([Shaders.Flashlight.Deferred] JitterExact, live): the view ray through the projection the list was
+		// drawn with, TAA's jitter (_31 / _32) included, as Includes/DeferredDepth.hlsl DDRay and DeferredLamps::Apply: the shader's ray is
+		// Fwd + Right (ndc.x tanX) + Up (ndc.y tanY), so the jitter goes into the forward row (c4); the shader is unchanged. (The depth test's
+		// dot(position, FL_Fwd) moves by under 0.1 % of the view z with it, far inside its 1 % + 2 unit pull.) Off: the unjittered ray, as before.
+		const bool jitterExact = TheSettingManager->GetSettingI("Shaders.Flashlight.Deferred", "JitterExact") != 0;
+		const float jx = jitterExact ? proj._31 * tanX : 0.0f, jy = jitterExact ? proj._32 * tanY : 0.0f;
 		const float own[11][4] = {
 			{ proj._33, proj._43, 0.01f, 2.0f },	// FL_Depth: the depth of a view z, and the pull toward the camera (1 % and 2 units)
 			{ 1.0f / (float)vp.Width, 1.0f / (float)vp.Height, (float)vp.X, (float)vp.Y },
 			{ iv._11, iv._12, iv._13, tanX },
 			{ iv._21, iv._22, iv._23, tanY },
-			{ iv._31, iv._32, iv._33, linear ? 1.0f : 0.0f },	// w: the frame is linear (the light added ONE / ONE unless a debug view)
+			{ iv._31 - iv._11 * jx - iv._21 * jy, iv._32 - iv._12 * jx - iv._22 * jy, iv._33 - iv._13 * jx - iv._23 * jy, linear ? 1.0f : 0.0f },	// w: the frame is linear (the light added ONE / ONE unless a debug view)
 			{ params[0].x, params[0].y, params[0].z, params[0].w },
 			{ params[1].x, params[1].y, params[1].z, params[1].w },
 			{ params[2].x, params[2].y, params[2].z, params[2].w },
@@ -317,6 +323,10 @@ namespace FlashlightDeferred {
 			{ cookieStrength, (float)debugView, f->Deferred.Falloff, f->Settings.NearFade } };	// (w: UNOFFICIAL 2026-11-11 NearFade, was 0)
 		d->SetPixelShaderConstantF(0, own[0], 11);
 		d->SetPixelShaderConstantF(11, (const float*)&TheShaderManager->SpotLightWorldToLightMatrix[0], 4);	// row_major in the pass
+		// UNOFFICIAL 2026-11-16 fd-batchA item 6 ([Shaders.Flashlight.Deferred] SpecularBit, live; FlashlightDeferred.hlsl FL_Model): the record's
+		// specular bit picks the beam's model (PBRDiffuse on the records the game draws without a highlight), as the lamp pass does
+		const float model[4] = { TheSettingManager->GetSettingI("Shaders.Flashlight.Deferred", "SpecularBit") != 0 ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+		d->SetPixelShaderConstantF(15, model, 1);
 
 		d->SetVertexShader(nullptr);
 		d->SetPixelShader(Pass->ShaderHandle);

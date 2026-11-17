@@ -1,4 +1,5 @@
 #include "ShaderRecord.h"	// (also reached through Framework.h; kept for the IDE)
+#include "../effects/Puddles/PuddleMap.h"	// 2026-11-12 Puddles map mode
 #include "FrameWorker.h"	// UNOFFICIAL 2026-11-03 SkyOnWorker (SetCT joins the sky's projection)
 #include "LinearSceneShaders.h"	// UNOFFICIAL 2026-10-28 LinearScene
 #include "CapturedNormals.h"	// UNOFFICIAL 2026-10-28 CapturedNormals
@@ -21,6 +22,7 @@
 #include <unordered_set>	// SetCT's once-only "not bound" notes
 #include "GpuProfiler.h"
 #include "LinearPreDecode.h"	// UNOFFICIAL 2026-10-17
+#include "BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (SUN_CONTACT_FORWARD; fork port 2026-11-13)
 #include "ReflMaterial.h"	// UNOFFICIAL 2026-10-20 MaterialAware reflections
 #include "AlphaHash.h"	// UNOFFICIAL 2026-11-03 SmoothCutouts (ALPHA_HASH_ON)
 #include "LandLight.h"	// UNOFFICIAL 2026-10-25 (SunFar)
@@ -309,6 +311,8 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// alters the preprocessed source, so CheckPreprocessResult recompiles on next load.
 	const bool forwardShadows = TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.Main", "ForwardShadows") != 0;
 	AppendDefine("FORWARD_SHADOWS", forwardShadows ? "1" : "0");
+	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (core/BendContact.h): the lookup in GetSunShadow, only when on at start
+	if (BendContact::WantedAtStart()) AppendDefine("SUN_CONTACT_FORWARD", "1");
 
 	// UNOFFICIAL sun shadow cross-fade (SunSmoothing CrossFade): compiled in only when on, so that otherwise the
 	// shaders are exactly what they were. Read here for the same reason as FORWARD_SHADOWS; takes effect on restart.
@@ -395,6 +399,10 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// UNOFFICIAL 2026-10-29: 2 = with MaterialBuffer; 2026-10-31: 3 = with AlbedoBuffer too (COLOR1; docs/next/DEFERRED-RENDERING-PLAN.md rung A)
 	// UNOFFICIAL 2026-11-14: 4 = GBufferV2 too (the MaterialBuffer's layout v2: core/CapturedNormals.h V2CompiledIn; a new value, no new define)
 	if (CapturedNormals::CompiledIn()) AppendDefine("CAPTURED_NORMALS_ON", CapturedNormals::V2CompiledIn() ? "4" : CapturedNormals::AlbedoCompiledIn() ? "3" : CapturedNormals::MaterialCompiledIn() ? "2" : "1");
+	// UNOFFICIAL 2026-11-16 fd-batchE ([Main.Main.Quality] DeferredADFog, restart, default off; docs/next/FD-BATCH-E.md item 19): the light-only
+	// base pass (AD) sends the game's fog amount and its deferred records keep 1 - that fog (ObjectTemplate.hlsl / ParallaxTemplate.hlsl
+	// AD_FOG_KEEP_ON). Defined only when on, so the define lists (and the shader cache's keys) are as before with it off.
+	if (CapturedNormals::AlbedoCompiledIn() && TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredADFog")) AppendDefine("AD_FOG_KEEP_ON", "1");
 	// UNOFFICIAL 2026-11-14 DeferredDistant (core/DeferredDistant.h, TerrainLODTemplate.hlsl): the far land writes the G-buffer. Defined for that
 	// template only and only with the switch on at startup, so that otherwise every define list (and the shader cache's keys) is as before.
 	if (Template.Name && !strcmp(Template.Name, "TerrainLODTemplate") && DeferredDistant::CompiledIn()) AppendDefine("DISTANT_GBUFFER", "1");
@@ -527,6 +535,8 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// UNOFFICIAL 2026-11-03 SmoothCutouts (Includes/AlphaHash.hlsl, core/AlphaHash.h): the hashed alpha test, compiled in only when on at
 	// startup (defined only then: the define list, and so the shader cache's keys, stay as they were with it off).
 	if (AlphaHash::CompiledIn()) AppendDefine("ALPHA_HASH_ON", "1");
+	// UNOFFICIAL 2026-11-16 FarCoverage (Includes/AlphaHash.hlsl AlphaCutCoverage): far cut-outs keep their coverage; likewise only when on at startup.
+	if (AlphaHash::CoverageCompiledIn()) AppendDefine("ALPHA_COVERAGE_ON", "1");
 
 	// (2026-11-15 fd-smoothsun) not while the deferred sun pass carries the fade itself (core/SunFadeDeferred.h): the forward records then
 	// keep their constant and sampler room (Terrain Blending, Wetness Effects, RT sun shadows' ForwardLookup) and take each step as it comes
@@ -572,7 +582,7 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	// object, parallax and land pixel shaders. Defined only when on, and last, as above.
 	// (2026-11-12 ShaderFallback: left out of every family when the land cannot carry it; WetnessEffectsShaders::UpdateConstants then
 	// switches the collection off for the session, so Wet World's screen pass draws the wetness.)
-	if (TheSettingManager->GetSettingI("Shaders.WetnessEffects.Status", "Enabled") && !ShaderFallback::Dropped(ShaderFallback::Wetness, fallbackFamily)) AppendDefine("WETNESS_EFFECTS", "1");
+	if (TheSettingManager->GetSettingI("Shaders.WetnessEffects.Status", "Enabled") && !ShaderFallback::Dropped(ShaderFallback::Wetness, fallbackFamily)) AppendDefine("WETNESS_EFFECTS", TheSettingManager->GetSettingI("Shaders.Puddles.Status", "Enabled") ? (PuddleMap::ModeAtStart() ? "3" : "2") : "1");	// (2026-11-13 fork port: 2 = Puddles compiled in, Includes/Wetness.hlsl PUDDLES_COMPILED; 3 = its map mode, effects/Puddles/PuddleMap.h)
 	// UNOFFICIAL 2026-10-24 SmoothObjectNormals ([Shaders.PBR.Main], restart): the object and skin shaders' shadow lookups and sky ambient take
 	// the vertex normal instead of the per-triangle one (Includes/Shadow.hlsl ShadowFacingNormal). 0: the shaders exactly as before.
 	AppendDefine("OBJECT_SMOOTH_NORMALS", TheSettingManager->GetSettingI("Shaders.PBR.Main", "SmoothObjectNormals") ? "1" : "0");
@@ -785,6 +795,7 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 					record->CreateCT(source, table);
 					// UNOFFICIAL 2026-10-27 displacement shadows (core/DisplaceShadows.h): the land pixel shaders and their layer counts, so the
 					// land's own draws can be told apart (their per-layer height flags are taken there for the land's shadow draws).
+					if (pixelProfile && Template.Name && !strcmp(Template.Name, "TerrainTemplate")) static_cast<ShaderRecordPixel*>(record)->IsLand = true;	// 2026-11-12 Puddles ObjectPuddles
 					if (pixelProfile && Template.Name && !strcmp(Template.Name, "TerrainTemplate"))
 						DxvkCompute::NoteLandPixelShader(static_cast<ShaderRecordPixel*>(record)->ShaderHandle, Template.Defines);
 					// UNOFFICIAL 2026-10-28 LinearScene (core/LinearScene.h): the pixel shaders that can give linear light (LinearSceneOut).
@@ -803,7 +814,8 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 							// no writer); the ONLY_LIGHT / DIFFUSE records are counted apart (their albedo is the texture a later pass multiplies in)
 							if (CapturedNormals::AlbedoCompiledIn()) {
 								const bool specOnly = hasDefine(Template, "ONLY_SPECULAR");
-								const bool lightOnly = hasDefine(Template, "ONLY_LIGHT") || hasDefine(Template, "DIFFUSE");
+								// (2026-11-16 fd-batchE: + the parallax light-only base pass, whose records name it AD, never ONLY_LIGHT; it writes its texture now)
+								const bool lightOnly = hasDefine(Template, "ONLY_LIGHT") || hasDefine(Template, "DIFFUSE") || hasDefine(Template, "AD");
 								if (!specOnly) CapturedNormals::NoteAlbedoWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle, lightOnly);
 							}
 						}
@@ -1237,6 +1249,7 @@ void __fastcall NiD3DVertexShaderEx::Free(NiD3DVertexShaderEx* Shader) {
 * Hook: picks the shader record whose handle this pass uses, and makes it current.
 */
 void NiD3DPixelShaderEx::SetupShader(IDirect3DPixelShader9* BoundHandle) {
+	ShaderRecordPixel::Current = nullptr;	// 2026-11-12 (Puddles first-person fix) set below when one of ours is bound
 	auto useGameShader = [this] { ShaderHandle = (IDirect3DPixelShader9*)ShaderHandleBackup; };
 
 	// UNOFFICIAL 2026-10-17 grass study, diagnostic (only while the F10 GPU profile is on, a few lines a run): the device's
@@ -1296,6 +1309,7 @@ void NiD3DPixelShaderEx::SetupShader(IDirect3DPixelShader9* BoundHandle) {
 		auto found = PointShadowForward::ExteriorRecords.find(this);
 		if (found != PointShadowForward::ExteriorRecords.end()) {
 			ShaderHandle = found->second->ShaderHandle;
+			ShaderRecordPixel::Current = found->second;
 			if (BoundHandle != ShaderHandle) found->second->SetCT();
 			return;
 		}
@@ -1330,12 +1344,14 @@ void NiD3DPixelShaderEx::SetupShader(IDirect3DPixelShader9* BoundHandle) {
 	if (!Player->GetWorldSpace()) {
 		if (ShaderRecordPixel* deferred = DeferredLamps::Choose(this)) {
 			ShaderHandle = deferred->ShaderHandle;
+			ShaderRecordPixel::Current = deferred;
 			if (BoundHandle != ShaderHandle) deferred->SetCT();
 			return;
 		}
 	}
 	if (ShaderRecordPixel* record = PickRecord(this, Player->GetWorldSpace() != nullptr)) {
 		ShaderHandle = record->ShaderHandle;
+		ShaderRecordPixel::Current = record;
 		if (BoundHandle != ShaderHandle) record->SetCT();
 	}
 	else useGameShader();
@@ -1369,6 +1385,17 @@ void __fastcall NiD3DPixelShaderEx::Free(NiD3DPixelShaderEx* Shader) {
 // Vertex records never clear the texture stages in SetCT; pixel records do.
 ShaderRecordVertex::ShaderRecordVertex(const char* RecordName) : ShaderHandle(nullptr) { Name = RecordName; ClearSamplers = false; }
 ShaderRecordPixel::ShaderRecordPixel(const char* RecordName) : ShaderHandle(nullptr) { Name = RecordName; ClearSamplers = true; }
+
+ShaderRecordPixel* ShaderRecordPixel::Current = nullptr;
+
+int ShaderRecordPixel::PuddleDataRegister() {
+	if (PuddleDataReg == -2) {
+		PuddleDataReg = -1;
+		for (UInt32 i = 0; i < FloatShaderValuesCount; i++)
+			if (FloatShaderValues[i].Name && !strcmp(FloatShaderValues[i].Name, "TESR_PuddleData")) { PuddleDataReg = (int)FloatShaderValues[i].RegisterIndex; break; }
+	}
+	return PuddleDataReg;
+}
 
 // UNOFFICIAL 2026-10-13: no handle when the driver refused the shader (LoadShader deletes the record then): releasing
 // nothing crashed the game at startup instead of falling back to the game's own shader.

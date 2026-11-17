@@ -239,6 +239,7 @@ void TerrainShaders::UpdateSettings() {
 	const float shapeY = heightEdge == 2 ? -(BlendingSettings.HeightBlend + 10.0f) : heightEdge == 1 ? -BlendingSettings.HeightBlend : BlendingSettings.HeightBlend;
 	BlendingConstants.Shape = D3DXVECTOR4(BlendingSettings.GroundWidth, shapeY, BlendingSettings.SlopeBlend, BlendingSettings.MinPixels);
 	// UNOFFICIAL 2026-10-13 (user: blend so it does not need TAA): Smooth (on by default) fades the land by blending; off, the dither.
+	// (2026-11-16) DeferredRenderer 2 reads it as 0 (core/SettingForce.h): the blend would weight the land's G-buffer by its data alphas.
 	BlendingConstants.Extra.w = TheSettingManager->GetSettingI("Shaders.Terrain.Blending", "Smooth") ? 1.0f : 0.0f;
 }
 

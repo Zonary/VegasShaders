@@ -684,6 +684,7 @@ static bool sceneRestirLamps(Ctx& c) {
 struct FragPass {
 	ID3D9NvrExtPipeline* pipe = nullptr;
 	UINT images = 0, push = 0;
+	UINT callerImages = 0;	// (2026-11-15 GIGrassDenoise port) > 0: the callers pass this many; the slots after it get images[2] (the depth) as a stand-in
 };
 static ID3D9NvrExtSampler* gPointClamp = nullptr;
 static bool makeFrag(Host& h, const std::string& file, UINT images, UINT pushSize, FragPass& out) {

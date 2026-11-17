@@ -92,6 +92,13 @@ public:
 	// this user's Record went with this game frame's SubmitEarly (true from the submit to the frame's end, also after the collect):
 	// RtCore::Frame does not record it again
 	static bool			SubmittedEarlyThisFrame(const User* user);
+	// UNOFFICIAL 2026-11-16 (fd-batchH, docs/next/FD-BATCH-H.md) [Main.Main.RayTracing] OverlapExchange (0 off, the default; 1 collect at the
+	// next frame's RT point; 2 collect at the next frame's start): Frame's exchange signals the helper without the game's GPU waiting for it;
+	// it is collected (the wait + the copies out) before the next exchange records anything. True from Frame until that collect when this
+	// frame's exchange was left open: the Point-0 users' targets then hold the PREVIOUS exchange's results (traced with the camera, jitter
+	// and constants their previous Record used). Only while the camera is still (< 0.1 deg, < 2 units since the last Frame exchange) and every copy was made by one of the last 4 Frame exchanges; otherwise it waits as before (false).
+	// No user reads this yet: a user that reprojects its result (stamps a camera in Record) needs it to keep last frame's stamp.
+	static bool			OutputsLate();
 	// The eye in scene space. The scene is world minus TheRenderManager->CameraPosition, the NiCamera's world translation (the eye), so
 	// this is (0, 0, 0). Use it for every ray origin from the camera: Pointers::Generic::CameraLocation is NOT the eye (it read ~0
 	// in the game while the eye was 71000 units away: every ray started outside the scene, FORK-RT-SUN.md rtsun-4).

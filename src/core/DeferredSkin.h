@@ -102,7 +102,10 @@ namespace DeferredSkin {
 		if (LiveFrame == DeferredRenderer::FrameId) return;
 		LiveFrame = DeferredRenderer::FrameId;
 		// (+ the skin lamp pass loaded: the lamp pass compiled with FD_SKIN leaves the deferred skin's pixels to it)
-		const bool live = DeferredRenderer::Live && !Records.empty() && WantedAtStartup() && DeferredLamps::SkinPass && !RtPathTrace::Replacing();
+		// (2026-11-16 fd-fwdgroups) + [Main.Main.Quality] DeferredSkinLive (live, test only, default true): the one-launch A/B for the bench, the
+		// skin forward vs deferred with everything else deferred in both halves
+		const bool live = DeferredRenderer::Live && !Records.empty() && WantedAtStartup() && DeferredLamps::SkinPass && !RtPathTrace::Replacing() &&
+			TheSettingManager->GetSettingI(kSection, "DeferredSkinLive") != 0;
 		if (live != Live) Logger::Log("UNOFFICIAL DeferredSkin: %s (%u records)", live ? "live: the full and many-lamp skin draw their deferred records; DeferredSun / DeferredLamps light them" :
 			"not live (the renderer forward this frame, or the path tracer replaces the picture): the skin draws forward", Loaded);
 		Live = live;
@@ -305,13 +308,14 @@ namespace DeferredSkin {
 		if (!CopyFrame(d, target) || !EnsureTarget(d, t, D3DFMT_A16B16G16R16F, LightTex, LightSurf, LightDesc)) { target->Release(); return; }
 		static GpuTimer timer("Deferred skin SSS");
 		GpuProfileScope gpu(timer, d);
-		float savedC[2 + kSssTaps][4];
-		d->GetPixelShaderConstantF(0, &savedC[0][0], 2 + kSssTaps);
+		float savedC[3 + kSssTaps][4];	// (+ c26 SSS_Debug, 2026-11-16)
+		d->GetPixelShaderConstantF(0, &savedC[0][0], 3 + kSssTaps);
 		// the constants: scatter distances in world units (1 unit = 1/70 m: 14.29 mm), the pixels a world unit covers at view z 1, the angle
 		const float radius = (std::max)(0.1f, TheSettingManager->GetSettingF("Shaders.Skin.SSS", "Radius"));
 		float dmm[3] = { TheSettingManager->GetSettingF("Shaders.Skin.SSS", "ScatterRed"), TheSettingManager->GetSettingF("Shaders.Skin.SSS", "ScatterGreen"), TheSettingManager->GetSettingF("Shaders.Skin.SSS", "ScatterBlue") };
 		for (float& v : dmm) v = (std::max)(0.05f, v) * radius / 14.2857f;
-		float c[2 + kSssTaps][4] = {};
+		float c[3 + kSssTaps][4] = {};
+		c[2 + kSssTaps][0] = (float)TheSettingManager->GetSettingI("Shaders.Skin.SSS", "DebugView");	// (2026-11-16) 1 the prep's light, 2 covered skin red
 		SssTaps(dmm, &c[2]);
 		const float tanY = fabsf(TheRenderManager->InvProjMatrix._22);
 		const bool turn = TemporalBackbone::Shared() ? TemporalBackbone::TemporalResolve() : false;
@@ -322,13 +326,13 @@ namespace DeferredSkin {
 		c[1][1] = (std::max)(0.1f, TheSettingManager->GetSettingF("Shaders.Skin.SSS", "DepthFollow"));
 		c[1][2] = std::clamp(TheSettingManager->GetSettingF("Shaders.Skin.SSS", "AlbedoDetail"), 0.0f, 1.0f);
 		c[1][3] = linearZ ? 1.0f : 0.0f;
-		d->SetPixelShaderConstantF(0, &c[0][0], 2 + kSssTaps);
+		d->SetPixelShaderConstantF(0, &c[0][0], 3 + kSssTaps);
 		ClearAlone(d, LightSurf);
 		IDirect3DBaseTexture9* prepTex[6] = { FrameCopyTex, CapturedNormals::AlbedoTexture, SpecTex, CapturedNormals::Texture, CapturedNormals::MaterialTexture, linearZ ? DeferredDepth::LinearTexture : nullptr };
 		Quad(d, LightSurf, SssPrep->ShaderHandle, prepTex, 6);
 		IDirect3DBaseTexture9* blurTex[4] = { LightTex, FrameCopyTex, CapturedNormals::AlbedoTexture, SpecTex };
 		Quad(d, target, SssBlur->ShaderHandle, blurTex, 4);
-		d->SetPixelShaderConstantF(0, &savedC[0][0], 2 + kSssTaps);
+		d->SetPixelShaderConstantF(0, &savedC[0][0], 3 + kSssTaps);
 		target->Release();
 		StatSss++;
 	}

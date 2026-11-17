@@ -44,6 +44,11 @@ namespace {
 		// (share of the view depth) a point must be to what last frame's trace saw at its place to take the traced visibility
 		bool	forwardLookup = true;
 		float	forwardTolerance = 0.02f;
+		// UNOFFICIAL 2026-11-16 ports of mrfury97/VegasShaders fef7c30ba / d593ff599 (rt-shadows F2-F7), each OFF by default (a missing key: off)
+		bool	traceFixes = false;		// TraceFixes: geometric normal, slope-scaled start offsets, independent disc samples (RtSunShadow.comp, contactGate.w)
+		bool	nearestBlocker = false;	// NearestBlocker: the penumbra sized by the nearest blocker (a full traversal; alpha.w 2)
+		bool	denoiserFixes = false;	// DenoiserFixes: hard edges keep 8 frames + 0.75 px blur, a reset when the sun jumps, history by screen motion
+		bool	realSun = false;		// RealSun: while the traced lookup runs, every sun shadow follows the real sun (no SunSmoothing steps)
 	} S;
 
 	// The trace pass's uniform block (RtSunShadow.comp, std140)
@@ -146,6 +151,11 @@ namespace {
 		// UNOFFICIAL 2026-11-13 ForwardLookup
 		S.forwardLookup = TheSettingManager->GetSettingI(kSection, "ForwardLookup") != 0;
 		S.forwardTolerance = (std::min)((std::max)(TheSettingManager->GetSettingF(kSection, "ForwardDepthTolerance"), 0.002f), 0.2f);
+		// UNOFFICIAL 2026-11-16 (ports of mrfury97's fef7c30ba / d593ff599)
+		S.traceFixes = TheSettingManager->GetSettingI(kSection, "TraceFixes") != 0;
+		S.nearestBlocker = TheSettingManager->GetSettingI(kSection, "NearestBlocker") != 0;
+		S.denoiserFixes = TheSettingManager->GetSettingI(kSection, "DenoiserFixes") != 0;
+		S.realSun = TheSettingManager->GetSettingI(kSection, "RealSun") != 0;
 	}
 
 	const D3DXVECTOR4* Constant(const char* name) {
@@ -256,7 +266,7 @@ namespace {
 		c.alpha[0] = RtCore::AlphaTested() ? 1.0f : 0.0f;
 		c.alpha[1] = (float)(frames & 1023);								// the jitter's frame
 		c.alpha[2] = tanf(0.5f * S.sunAngle * 0.0174532925f);				// the sun cone's half-angle tangent (0: hard)
-		c.alpha[3] = (wantHit && hitSurface) || helperDenoise ? 1.0f : 0.0f;	// 2026-10-31 Penumbra / 2026-11-07 ShadowDenoiser: the blocker distances (binding 7)
+		c.alpha[3] = (wantHit && hitSurface) || helperDenoise ? (S.nearestBlocker ? 2.0f : 1.0f) : 0.0f;	// 2026-10-31 Penumbra / 2026-11-07 ShadowDenoiser: the blocker distances (binding 7); 2 (2026-11-16 NearestBlocker, port of mrfury97's F7): the nearest one
 		// 2026-11-07 (rtgap-tess; docs/next/RT-DETAIL-GAPS.md section 1) (1a) the bumps' slack: rays start the Strength further off the surface
 		// while the tessellated bumps are drawn. (1b) ContactShadows: in Mode 1 only (Mode 0 keeps the cascades, which hold the bumps' own
 		// shadows with CastShadows, and the raster contact shadows: a march here would darken twice); where the raster contact shadows run
@@ -276,6 +286,7 @@ namespace {
 				else contact.strength = 0.0f;
 			}
 			RtTessContact::ContactVecs(contact, c.contact, c.contactGate);
+			c.contactGate[3] = S.traceFixes ? 1.0f : 0.0f;	// UNOFFICIAL 2026-11-16 TraceFixes (port of mrfury97's fef7c30ba F4-F6; the slot was always 0)
 		}
 		c.range[0] = S.range; c.range[1] = 0.15f * S.range; c.range[2] = 255.0f; c.range[3] = S.debugView == 3 ? 1.0f : S.debugView == 5 ? 2.0f : S.debugView == 6 ? 3.0f :
 			S.debugView == 9 ? 5.0f : S.debugView == 10 ? 6.0f : 0.0f;	// 9, 10 (2026-10-30): CloudShadows checks
@@ -363,6 +374,12 @@ namespace {
 				const UInt32 frameNow = TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0;
 				RtShadowDenoise::View before = denoiseView;
 				before.valid = denoiseView.valid && lastW == tw && lastH == th && frameNow - lastFrame <= 2;
+				// UNOFFICIAL 2026-11-16 DenoiserFixes (port of mrfury97's fef7c30ba): the sun moved more than a degree since the last frame
+				// (waiting, sleeping, a time jump): every shadow moved, the history restarts
+				static D3DXVECTOR3 lastDenoiseSun(0.0f, 0.0f, 0.0f);
+				const D3DXVECTOR3 sunNow(c.sun[0], c.sun[1], c.sun[2]);
+				if (S.denoiserFixes && D3DXVec3Dot(&sunNow, &lastDenoiseSun) < 0.99985f) before.valid = false;
+				lastDenoiseSun = sunNow;
 				lastW = tw; lastH = th; lastFrame = frameNow;
 				IDirect3DBaseTexture9* motion = Texture("TESR_ObjectMotionBuffer");
 				const D3DXVECTOR4* motionData = Constant("TESR_ObjectMotionData");
@@ -373,8 +390,16 @@ namespace {
 				ds.debugView = S.denoiserDebugView;
 				ds.core = (std::min)((std::max)(TheSettingManager->GetSettingI(kSection, "DenoiserCore"), 0), 2);	// (A/B: 1, 2 = AMD FidelityFX Shadows)
 				RtShadowDenoise::TimeScale(ds, RtDenoise::HistoryClock());	// UNOFFICIAL 2026-11-07 (perf-history) frames at 60 fps -> the same seconds
+				if (S.denoiserFixes) {
+					// UNOFFICIAL 2026-11-16 DenoiserFixes (port of mrfury97's fef7c30ba F3): hard edges keep a real history too (8 frames at 60 fps;
+					// was 1: the one-ray binary sample went straight out where the penumbra was under ~2 pixels: salt noise on lit ground,
+					// crawling edges), and at least a 0.75-pixel blur on an edge (a binary edge's stair-steps)
+					ds.minHistory = (std::min)(ds.maxHistory, RtHistoryTime::Frames(8.0f, RtDenoise::HistoryClock()));
+					ds.minRadius = 0.75f / (float)scale;
+				}
 				RtShadowDenoise::DenoiseConstants d;
 				RtShadowDenoise::Fill(d, now, before, tw, th, rw, rh, 0, 1, frames, ds, moved, c.alpha[2]);
+				d.history[3] = S.denoiserFixes ? 1.0f : 0.0f;	// (2026-11-16, port of mrfury97's d593ff599) the sun history by screen motion
 				d.layerReset[0][0] = before.valid ? 0.0f : 1.0f;
 				const int denoiseImages[5] = { imageDepth, imageNormals, moved ? imageMotion : imageNormals, imageVisibility, imageHit };
 				denoisedInHelper = RtCore::AddPass(denoiseShader, denoiseImages, 5, 0x8, &d, sizeof(d), 1, 1);
@@ -767,6 +792,11 @@ namespace RtSunShadows {
 	}
 
 	bool ForwardCompiled() { return forwardCompiled; }
+
+	// UNOFFICIAL 2026-11-16 RealSun (port of mrfury97/VegasShaders fef7c30ba F2): the traced lookup carries the sun shadow this frame
+	// (Mode 1 through the shaders) and RealSun is on: ShadowsExterior's SmoothedSunDir follows the real sun. Not while the deferred renderer's
+	// sun fade holds the sun in steps (SunFadeDeferred::Live: its steps and fades are built on the held sun).
+	bool RealSun() { return S.realSun && S.enabled && S.mode == 1 && forwardCompiled && RtCore::Running() && TheShaderManager->GameState.isExterior && !SunFadeDeferred::Live(); }
 
 	bool ForwardActive() {
 		const bool mode1 = S.enabled && S.mode == 1 && RtCore::Running() && TheShaderManager->GameState.isExterior && !OldReplace();

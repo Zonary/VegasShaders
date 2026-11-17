@@ -2,7 +2,8 @@
 // UNOFFICIAL 2026-11-15 DeferredTransparents: forward+ for the blended (alpha) draws of the deferred renderer (docs/next/FULL-DEFERRED-RENDERER-
 // PLAN.md phase 5; results and bench request: docs/next/FD-GLASS-RESULTS.md).
 //
-// [Main.Main.Quality] DeferredTransparents (restart to compile the records, then live; test only; default 0; needs DeferredRenderer >= 1, whose
+// [Main.Main.Quality] DeferredTransparents (restart to compile the records, then live; default 1 since 2026-11-17, settings migration 89 (the
+// forward+ walk fix, docs/next/FD-GLASSGLOW.md); 0 before; needs DeferredRenderer >= 1, whose
 // prerequisites make the lamp table with its froxel lists and tile rows and the shadow atlas on both runtimes):
 //  - Why: glass, bottles, windows and light shades draw in the game's sorted blended list (RenderBlendedHook), after the main list's G-buffer
 //    span, so the deferred lamp pass never lights them: they keep the game's own one-pass lamps (the shader's slots: 2 in the ADTS2 / ADTS
@@ -20,9 +21,21 @@
 //    (PointShadowForward's own registers and values; its cache is kept in step).
 //  - Safety net (Skip / AfterDraw): an object whose base pass drew with a forward+ record skips its own lamp passes (and highlight passes after
 //    a SPECULAR base) for the frame, as the deferred renderer does for its deferred records; the census found none in the blended list.
-// Off (0, the default): no record is made, nothing chosen, bound, written into the table or skipped.
+// Off (0): no record is made, nothing chosen, bound, written into the table or skipped.
+// UNOFFICIAL 2026-11-16 fd-fwdgroups (docs/next/FD-FORWARD-GROUPS.md): the same froxel walk for every group the lamp pass cannot reach.
+//  - Outdoors too (mode 2): every eligible shader gets a second record from its DEFAULT overrides (the sun and its shadows kept) +
+//    LAMPS_DEFERRED 4, cache Deferred\GlassExterior\; chosen outdoors while the renderer makes the exterior table (the lamp pass lights the
+//    streets at night from it). Before, outdoor glass kept the game's few lamps.
+//  - The flashlight: ForwardPlusHeader's texels 5-7 (FlashlightDeferred::LightParams); the forward+ records add its cone. Before, a forward+
+//    pane lost the flashlight entirely (the table leaves its game lamp out, the record compiles the draw's lamps out).
+//  - The game's blended hair (namespace Hair below, [Main.Main.Quality] DeferredHair): SM3002 / SM3003.pso get a HAIR_FORWARD_PLUS record,
+//    chosen in the same blended list (Includes/HairForwardPlus.hlsl).
+//  - The deferred leaves' lamps (core/DeferredFoliage.h LampRecords, [Main.Main.Quality] DeferredFoliageLamps): bound here (OnBind).
+// The hair and leaf records read the atlas on s12 (Includes/ForwardPlus.hlsl FP_OWN_SHADOW: s8 is the clouds' shadow in those shaders).
 #include "DeferredRenderer.h"
 #include "ForwardPlusHeader.h"
+#include "FlashlightDeferred.h"
+#include "DeferredFoliage.h"
 
 namespace DeferredTransparents {
 	inline const char* kSection = "Main.Main.Quality";
@@ -36,8 +49,23 @@ namespace DeferredTransparents {
 	}
 
 	inline std::unordered_map<const void*, ShaderRecordPixel*> Records;	// NiD3DPixelShaderEx* -> its forward+ record
+	inline std::unordered_map<const void*, ShaderRecordPixel*> RecordsExterior;	// (2026-11-16) -> its outdoor forward+ record (default overrides)
 	inline std::unordered_set<IDirect3DPixelShader9*> Handles, SpecularHandles;
-	inline unsigned Loaded = 0, Unshadowed = 0, Refused = 0;
+	inline unsigned Loaded = 0, Unshadowed = 0, Refused = 0, LoadedExterior = 0, RefusedExterior = 0;
+	inline bool GlassLive = false;		// this frame: the glass records may be chosen (Live: glass or the hair's)
+
+	// (2026-11-16) the flashlight for ForwardPlusHeader's texels 5-7: FlashlightDeferred::LightParams (camera-relative, as the header's camera),
+	// only while the light pass lights this frame's world (its game lamp is then out of the table)
+	inline bool FlashlightRows(float out[3][4]) {
+		D3DXVECTOR4 params[3];
+		if (!FlashlightDeferred::Usable() || !FlashlightDeferred::LightParams(params)) return false;
+		for (int k = 0; k < 3; k++) { out[k][0] = params[k].x; out[k][1] = params[k].y; out[k][2] = params[k].z; out[k][3] = params[k].w; }
+		return true;
+	}
+	inline void EnableHeader() {
+		ForwardPlusHeader::Enabled = true;
+		ForwardPlusHeader::Flashlight = &FlashlightRows;
+	}
 
 	inline bool Live = false;			// this frame (BeginFrame): on, indoors, the table and its lists possible
 	inline bool InList = false;			// the blended list is drawing (ListScope)
@@ -63,6 +91,25 @@ namespace DeferredTransparents {
 		static D3DXMACRO overrides[14] = {};
 		int n = 0;
 		for (const D3DXMACRO* o = interiorOverrides; o && o->Name && n < 12; o++) overrides[n++] = *o;
+		// (2026-11-16) outdoors: the same from the default record's overrides (none: the sun and its shadows kept), mode 2 only (mode 1 is
+		// interiors only)
+		if (DeferredRenderer::Mode() >= 2 && !RecordsExterior.count(shader)) {
+			ShaderRecordPixel* outdoor = nullptr;
+			for (int level = 4; level <= 5 && !outdoor; level++) {
+				static D3DXMACRO o[2] = {};
+				o[0] = { "LAMPS_DEFERRED", level == 4 ? "4" : "5" };
+				o[1] = { NULL, NULL };
+				ShaderTemplate copy = tmpl;
+				outdoor = (ShaderRecordPixel*)ShaderRecord::LoadShader(name, NULL, copy, level == 4 ? "Deferred\\GlassExterior\\" : "Deferred\\GlassExteriorUnshadowed\\", o);
+			}
+			if (outdoor) {
+				RecordsExterior[shader] = outdoor;
+				Handles.insert(outdoor->ShaderHandle);
+				if (DeferredRenderer::HasDefine(tmpl, "SPECULAR")) SpecularHandles.insert(outdoor->ShaderHandle);
+				LoadedExterior++;
+			}
+			else { RefusedExterior++; Logger::Log("[WARNING] DEFERRED TRANSPARENTS outdoor record %s: did not load: its blended draws outdoors keep the game's lamps", name); }
+		}
 		ShaderRecordPixel* record = nullptr;
 		for (int level = 4; level <= 5 && !record; level++) {
 			overrides[n] = { "LAMPS_DEFERRED", level == 4 ? "4" : "5" };
@@ -76,15 +123,57 @@ namespace DeferredTransparents {
 		Records[shader] = record;
 		Handles.insert(record->ShaderHandle);
 		if (DeferredRenderer::HasDefine(tmpl, "SPECULAR")) SpecularHandles.insert(record->ShaderHandle);
-		ForwardPlusHeader::Enabled = true;
+		EnableHeader();
 		Loaded++;
 		Logger::Log("DEFERRED TRANSPARENTS record %s: loaded (%u loaded, %u of them unshadowed, %u not so far)", name, Loaded, Unshadowed, Refused);
+	}
+
+	// --- (2026-11-16 fd-fwdgroups) the game's blended hair, brows and beards: SM3002 / SM3003.pso's forward+ record (Includes/HairForwardPlus.hlsl)
+	// [Main.Main.Quality] DeferredHair (restart; with the renderer and G-buffer v2: SM3003.vso then hands over the world frame) makes it;
+	// DeferredHairLive (live, test only, default true) is its one-launch A/B. Chosen in the sorted blended list, in the world context, with
+	// this frame's table, indoors and (mode 2) outdoors. The atlas on s12.
+	namespace Hair {
+		inline std::unordered_map<const void*, ShaderRecordPixel*> Records;
+		inline std::unordered_set<IDirect3DPixelShader9*> Handles;
+		inline unsigned Loaded = 0, Refused = 0;
+		inline bool Live = false;
+		inline unsigned long long StatBinds = 0;
+		inline int Wanted = -1;
+		inline bool WantedAtStartup() {
+			if (Wanted < 0) {
+				const bool key = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredHair") != 0;
+				Wanted = key && DeferredRenderer::On() && CapturedNormals::V2CompiledIn() ? 1 : 0;
+			}
+			return Wanted != 0;
+		}
+		inline bool IsHair(const char* name) { return name && (!_stricmp(name, "SM3002.pso") || !_stricmp(name, "SM3003.pso")); }
+		// ShaderManager::LoadShader (pixel), after the shader's own records
+		inline void Load(NiD3DPixelShaderEx* shader, const char* name, ShaderTemplate tmpl) {
+			if (!shader || !IsHair(name) || !shader->ShaderProg[ShaderRecordType::Default] || !WantedAtStartup() || Records.count(shader)) return;
+			static const D3DXMACRO overrides[2] = { { "HAIR_FORWARD_PLUS", "1" }, { NULL, NULL } };
+			ShaderRecordPixel* record = (ShaderRecordPixel*)ShaderRecord::LoadShader(name, NULL, tmpl, "Deferred\\Hair\\", overrides);
+			if (!record || !record->ShaderHandle) {
+				Refused++;
+				Logger::Log("[WARNING] DEFERRED HAIR forward+ record %s: did not load (see the device's line above): the game's hair keeps its own lamps", name);
+				return;
+			}
+			Records[shader] = record;
+			Handles.insert(record->ShaderHandle);
+			EnableHeader();
+			Loaded++;
+			Logger::Log("DEFERRED HAIR forward+ record %s: loaded (the game's blended hair lit by every lamp of its froxel; %u loaded, %u not)", name, Loaded, Refused);
+		}
 	}
 
 	// Once a frame (Render.cpp, after DeferredRenderer::BeginFrame).
 	inline void BeginFrame() {
 		FrameId++;
-		if (!WantedAtStartup() || Records.empty()) { Live = false; return; }
+		{	// (2026-11-16) the hair's forward+: with the renderer live (indoors; outdoors in mode 2) and the table's lists and tile rows made
+			const bool exterior = TheShaderManager->GameState.isExterior;
+			Hair::Live = Hair::WantedAtStartup() && !Hair::Records.empty() && DeferredRenderer::Live && (!exterior || DeferredRenderer::Mode() >= 2) &&
+				TheSettingManager->GetSettingI(kSection, "DeferredHairLive") != 0 && ManyLamps::FroxelRows() && ManyLamps::TileRowsWanted() && !ManyLamps::TableFailed;
+		}
+		if (!WantedAtStartup() || Records.empty()) { GlassLive = false; Live = Hair::Live; return; }
 		static bool told = false;
 		if (!told) {
 			told = true;
@@ -92,16 +181,19 @@ namespace DeferredTransparents {
 				Loaded, Unshadowed, Refused, ManyLamps::FroxelRows() ? "with froxel lists" : "WITHOUT froxel lists (nothing to read: off)",
 				ManyLamps::TileRowsWanted() ? "made" : "NOT made (no header: off)", PointShadowForward::AtlasRuns() ? "made" : "not made (unshadowed)");
 		}
-		Live = TheSettingManager->GetSettingI(kSection, kKey) != 0 && !TheShaderManager->GameState.isExterior && ManyLamps::FroxelRows() &&
-			ManyLamps::TileRowsWanted() && !ManyLamps::TableFailed;
+		// (2026-11-16) outdoors too, in mode 2 with the outdoor records (the renderer live: the lamp pass makes the exterior table)
+		const bool exterior = TheShaderManager->GameState.isExterior;
+		GlassLive = TheSettingManager->GetSettingI(kSection, kKey) != 0 && (!exterior || (DeferredRenderer::Mode() >= 2 && DeferredRenderer::Live && !RecordsExterior.empty())) &&
+			ManyLamps::FroxelRows() && ManyLamps::TileRowsWanted() && !ManyLamps::TableFailed;
+		Live = GlassLive || Hair::Live;
 		if (!GpuTimer::Enabled) { StatFrames = 0; return; }
 		if (++StatFrames < 240) return;
 		const double f = (double)StatFrames;
-		Logger::Log("DEFERRED TRANSPARENTS %u frames, %s: blended lists %.2f a frame (%.2f without this frame's table: the game's lamps), forward+ binds %.1f, draws %.1f, "
-			"lamp / highlight passes skipped %.2f, binds left alone outside the world context %.1f; header writes %u (%u with lists)",
-			StatFrames, Live ? "live" : "off", StatLists / f, StatListsRefused / f, StatBinds / f, StatDraws / f, StatSkipped / f, StatOtherContext / f,
-			ForwardPlusHeader::Writes, ForwardPlusHeader::ValidWrites);
-		StatFrames = 0; StatBinds = StatDraws = StatLists = StatListsRefused = StatOtherContext = StatSkipped = 0;
+		Logger::Log("DEFERRED TRANSPARENTS %u frames, glass %s, hair %s: blended lists %.2f a frame (%.2f without this frame's table: the game's lamps), forward+ binds %.1f (hair %.1f), draws %.1f, "
+			"lamp / highlight passes skipped %.2f, binds left alone outside the world context %.1f; header writes %u (%u with lists); records %u indoor, %u outdoor, %u hair",
+			StatFrames, GlassLive ? "live" : "off", Hair::Live ? "live" : "off", StatLists / f, StatListsRefused / f, StatBinds / f, Hair::StatBinds / f, StatDraws / f, StatSkipped / f, StatOtherContext / f,
+			ForwardPlusHeader::Writes, ForwardPlusHeader::ValidWrites, Loaded, LoadedExterior, Hair::Loaded);
+		StatFrames = 0; StatBinds = StatDraws = StatLists = StatListsRefused = StatOtherContext = StatSkipped = 0; Hair::StatBinds = 0;
 		ForwardPlusHeader::Writes = ForwardPlusHeader::ValidWrites = 0;
 	}
 
@@ -129,8 +221,19 @@ namespace DeferredTransparents {
 	// NiD3DPixelShaderEx::SetupShader.
 	inline ShaderRecordPixel* Choose(const void* shader) {
 		if (!Live || !InList || !ListReady) return nullptr;
-		auto found = Records.find(shader);
-		if (found == Records.end()) return nullptr;
+		if (Hair::Live && !Hair::Records.empty()) {	// (2026-11-16) the game's blended hair
+			auto hair = Hair::Records.find(shader);
+			if (hair != Hair::Records.end()) {
+				if (!BindWorld) { StatOtherContext++; return nullptr; }
+				Hair::StatBinds++;
+				return hair->second;
+			}
+		}
+		if (!GlassLive) return nullptr;
+		const bool exterior = TheShaderManager->GameState.isExterior;
+		const auto& map = exterior ? RecordsExterior : Records;
+		auto found = map.find(shader);
+		if (found == map.end()) return nullptr;
 		if (!BindWorld) { StatOtherContext++; return nullptr; }
 		StatBinds++;
 		return found->second;
@@ -140,9 +243,11 @@ namespace DeferredTransparents {
 	inline void OnBind(IDirect3DPixelShader9* handle) {
 		BoundOurs = Live && handle && Handles.count(handle) != 0;
 		BoundSpecular = BoundOurs && SpecularHandles.count(handle) != 0;
-		if (!BoundOurs) return;
+		// (2026-11-16) the hair's and the deferred leaves' forward+ records: the atlas on s12 (their s8 is the clouds' shadow)
+		const bool own = handle && ((Hair::Live && Hair::Handles.count(handle) != 0) || (DeferredFoliage::LampsLive && DeferredFoliage::LampHandles.count(handle) != 0));
+		if (!BoundOurs && !own) return;
 		PointShadowForward::Bind(3, ManyLamps::Table, true, true);
-		PointShadowForward::Bind(8, PointShadowForward::AtlasTexture ? (IDirect3DBaseTexture9*)PointShadowForward::AtlasTexture : (IDirect3DBaseTexture9*)ManyLamps::Table, true, false);
+		PointShadowForward::Bind(own ? 12 : 8, PointShadowForward::AtlasTexture ? (IDirect3DBaseTexture9*)PointShadowForward::AtlasTexture : (IDirect3DBaseTexture9*)ManyLamps::Table, true, false);
 		float k[2][4] = {};
 		if (PointShadowForward::Active && PointShadowForward::AtlasTexture) memcpy(k[0], PointShadowForward::Params, sizeof(k[0]));	// x 0: TableLampShadow lights every lamp
 		k[1][1] = PointShadowForward::NearFade;

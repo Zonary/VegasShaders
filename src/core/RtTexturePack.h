@@ -51,9 +51,18 @@ namespace RtTexturePack {
 	// where a 32-bit process cannot read that (DXGI's SIZE_T), the local budget divided by 0.92 (Windows gives a process ~90-95 % of the
 	// card): the tiers' bounds sit half a GB to a GB under the card sizes so a 16 / 12 / 8 GB card lands in its tier either way.
 	struct Caps { uint32_t maxSize; uint32_t budgetMB; const char* tier; };
-	inline Caps AutoCaps(uint64_t memory) {
+	// UNOFFICIAL 2026-11-13 (fork port, RT audit) lower: the lower budget tiers of [Main.Main.RayTracing] VramWatch (2560 / 2048 / 1024 / 512 MB;
+	// the helper's copies share the GPU with the game's own textures: a heavily modded game had 11.6 of 12.1 GB local in use with 3.7 GB of
+	// copies). The max sizes stay. false: the old tiers.
+	inline Caps AutoCaps(uint64_t memory, bool lower = false) {
 		const uint64_t GB = 1ull << 30;
 		if (!memory) return { 1024u, 1536u, "unknown video memory: the 8 GB tier" };
+		if (lower) {
+			if (memory >= 15 * GB) return { 2048u, 2560u, "16 GB+" };
+			if (memory >= 11 * GB) return { 2048u, 2048u, "12 GB+" };
+			if (memory >= 7 * GB) return { 1024u, 1024u, "8 GB+" };
+			return { 512u, 512u, "under 8 GB" };
+		}
 		if (memory >= 15 * GB) return { 2048u, 4096u, "16 GB+" };
 		if (memory >= 11 * GB) return { 2048u, 3072u, "12 GB+" };
 		if (memory >= 7 * GB) return { 1024u, 1536u, "8 GB+" };

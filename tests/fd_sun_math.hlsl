@@ -2,11 +2,19 @@
 // pixel through the object templates' sun term (Includes/Object.hlsl getSunLighting, its variant fixed at compile time by SPECULAR, after
 // SetDiffuseEnergyKeep as the templates call it) and through the pass's (getSunLightingModel, the variant chosen per pixel), compiled
 // from the real include files. FD_PASS 1 = the pass's form (FD_SPEC its per-pixel choice), else the template's.
+// (2026-11-16 fd-sunvis) FD_FADE 1: SpecularFade's highlight fade, the template's PBR_SPEC_FADE (NVR_SpecFade.x, c211) against the pass's
+// FD_SUN_SPEC_FADE (Includes/Object.hlsl getSunLightingModel), both at FD_Spec.y.
 #define LINEAR_LIGHTING
+float4 FD_Spec : register(c0);	// x the pass's specular choice (1 PBRSun, 0 PBRDiffuse), y the fade (FD_FADE)
+#if defined(FD_FADE) && FD_FADE
+    #if FD_PASS
+        #define FD_SUN_SPEC_FADE FD_Spec.y
+    #else
+        #define PBR_SPEC_FADE
+    #endif
+#endif
 #include "includes/Helpers.hlsl"
 #include "includes/Object.hlsl"
-
-float4 FD_Spec : register(c0);	// x the pass's specular choice (1 PBRSun, 0 PBRDiffuse)
 
 float Hash(float2 p, float k) { return frac(sin(dot(p, float2(12.9898f, 78.233f)) + k * 37.719f) * 43758.5453f); }
 float3 Dir(float2 p, float k) {

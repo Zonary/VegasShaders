@@ -223,7 +223,7 @@ PixResult main(PixVaryings pa, float2 vpos_s : VPOS) {
 #ifdef ALPHA_HASH_ON
     // UNOFFICIAL 2026-11-03 SmoothCutouts (Includes/AlphaHash.hlsl): on a hashed draw the cut takes noise; mode 2 the coverage the
     // game's transparency multisampling gives grass (its TMS build: alpha x 1.75). The pattern is shifted off the fade dither's.
-    const float grass_width = max(fwidth(base_rgb.a) * TESR_AlphaHash.z, 1.0f / 255.0f);
+    const float grass_width = max(fwidth(base_rgb.a) * (TESR_AlphaHash.z - 16.0f * AlphaHashStyle()), 1.0f / 255.0f);
     if (NVR_AlphaHashDraw) {
         if (TESR_AlphaHash.x > 0.5f) {
             const float coverage = TESR_AlphaHash.x > 1.5f ? saturate(base_rgb.a * 1.75f) : saturate((base_rgb.a - AlphaTestRef.x) / grass_width + 0.5f);

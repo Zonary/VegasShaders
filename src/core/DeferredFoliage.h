@@ -19,6 +19,14 @@
 //    record (CapturedNormals::GrassLateOk: only for its old readers, the path tracer and the RT GI).
 //  - A foliage record still bound at the span's end goes back to its forward handle (DeferredLamps::ForwardOf, DeferredRenderer::AtSpanEnd).
 // Off: no record is made, nothing is chosen; every shader and record as before.
+// UNOFFICIAL 2026-11-16 fd-fwdgroups [Main.Main.Quality] DeferredFoliageLamps (restart to compile, then live; test only, default off;
+// docs/next/FD-FORWARD-GROUPS.md): the leaves' lamps. The lamp pass never lights a leaf (its record writes a forward code: the bent normal and
+// the leaf model are not in the G-buffer), so a deferred leaf kept the game's one point lamp (BSSM_LEAVES_ADPt; none in _AD) beside ground lit
+// by every lamp. With the key the leaf's deferred record has a twin (LEAF_FORWARD_PLUS 1, Includes/Leaf.hlsl, cache Deferred\FoliageLamps\)
+// that takes the vertex shader's own lamp out and adds every lamp of the pixel's froxel from the frame's lamp table (Includes/ForwardPlus.hlsl),
+// atlas-shadowed, with the leaf vertex shader's lamp model on the bent normal (handed over by STLEAF001/003.vso with G-buffer v2). Chosen while
+// the key is on and this frame's table holds this frame's froxel lists (else the plain record: never a leaf half-lit). The table and atlas are
+// bound by DeferredTransparents::OnBind (s3, s12, c180 / c181).
 #include "CapturedNormals.h"
 #include "DeferredLamps.h"
 #include "DeferredSun.h"
@@ -49,7 +57,17 @@ namespace DeferredFoliage {
 	inline std::unordered_set<IDirect3DPixelShader9*> Handles;
 	inline unsigned Loaded = 0, Refused = 0;
 	inline bool Live = false;
-	inline unsigned long long StatFrames = 0, StatBinds = 0, StatLeafBinds = 0, StatGrassBinds = 0, StatOutside = 0;
+	inline unsigned long long StatFrames = 0, StatBinds = 0, StatLeafBinds = 0, StatGrassBinds = 0, StatOutside = 0, StatLampBinds = 0;
+	// (2026-11-16) DeferredFoliageLamps
+	inline std::unordered_map<const void*, ShaderRecordPixel*> LampRecords;
+	inline std::unordered_set<IDirect3DPixelShader9*> LampHandles;
+	inline bool LampsLive = false;
+	inline unsigned LampLoaded = 0;
+	inline int LampsWanted = -1;
+	inline bool LampsWantedAtStartup() {
+		if (LampsWanted < 0) LampsWanted = TheSettingManager->GetSettingI(kSection, "DeferredFoliageLamps") != 0 ? 1 : 0;
+		return LampsWanted != 0;
+	}
 
 	inline bool IsLeaf(const char* name) {
 		return name && (!_stricmp(name, "STLEAF2000.pso") || !_stricmp(name, "STLEAF2000TMS.pso") || !_stricmp(name, "STLEAF2001.pso") || !_stricmp(name, "STLEAF2001TMS.pso"));
@@ -75,12 +93,29 @@ namespace DeferredFoliage {
 		if (forward && forward->ShaderHandle) DeferredLamps::ForwardOf[record->ShaderHandle] = forward->ShaderHandle;	// the span-end swap (DeferredRenderer::AtSpanEnd)
 		Loaded++;
 		Logger::Log("UNOFFICIAL DeferredFoliage record %s: loaded (%u loaded, %u not so far)", name, Loaded, Refused);
+		if (IsLeaf(name) && LampsWantedAtStartup()) {	// (2026-11-16) the twin with the froxel's lamps
+			static const D3DXMACRO lampOverrides[3] = { { "FOLIAGE_DEFERRED", "1" }, { "LEAF_FORWARD_PLUS", "1" }, { NULL, NULL } };
+			ShaderRecordPixel* lamps = (ShaderRecordPixel*)ShaderRecord::LoadShader(name, NULL, tmpl, "Deferred\\FoliageLamps\\", lampOverrides);
+			if (lamps && lamps->ShaderHandle) {
+				LampRecords[shader] = lamps;
+				LampHandles.insert(lamps->ShaderHandle);
+				Handles.insert(lamps->ShaderHandle);
+				CapturedNormals::FoliageDeferredHandles.insert(lamps->ShaderHandle);
+				DeferredSun::FoliageHandles.insert(lamps->ShaderHandle);
+				if (forward && forward->ShaderHandle) DeferredLamps::ForwardOf[lamps->ShaderHandle] = forward->ShaderHandle;
+				ForwardPlusHeader::Enabled = true;
+				LampLoaded++;
+				Logger::Log("UNOFFICIAL DeferredFoliageLamps record %s: loaded (the leaf lit by every lamp of its froxel)", name);
+			}
+			else Logger::Log("[WARNING] UNOFFICIAL DeferredFoliageLamps record %s: did not load: the leaves keep the game's lamp", name);
+		}
 	}
 
 	// DeferredRenderer::BeginFrame, once a frame (before CapturedNormals::BeginFrame reads CapturedNormals::FoliageDeferred).
 	// rendererLive: the renderer is live this frame in mode 2 (which needs DeferredSun outdoors).
 	inline void BeginFrame(bool rendererLive) {
 		Live = rendererLive && !Records.empty() && WantedAtStartup() && !RtPathTrace::Replacing();
+		LampsLive = Live && !LampRecords.empty() && TheSettingManager->GetSettingI(kSection, "DeferredFoliageLamps") != 0 && ManyLamps::FroxelRows() && ManyLamps::TileRowsWanted();
 		CapturedNormals::FoliageDeferred = Live;
 		{
 			static int last = -1;
@@ -94,9 +129,9 @@ namespace DeferredFoliage {
 		if (!GpuTimer::Enabled) { StatFrames = 0; return; }
 		if (++StatFrames < 240) return;
 		const double f = (double)StatFrames;
-		Logger::Log("DEFERRED FOLIAGE %u frames: deferred binds %.1f a frame (leaves %.1f, grass %.1f), foliage binds outside the span or without records (forward) %.1f",
-			(unsigned)StatFrames, StatBinds / f, StatLeafBinds / f, StatGrassBinds / f, StatOutside / f);
-		StatFrames = StatBinds = StatLeafBinds = StatGrassBinds = StatOutside = 0;
+		Logger::Log("DEFERRED FOLIAGE %u frames: deferred binds %.1f a frame (leaves %.1f, of them with the froxel's lamps %.1f, grass %.1f), foliage binds outside the span or without records (forward) %.1f",
+			(unsigned)StatFrames, StatBinds / f, StatLeafBinds / f, StatLampBinds / f, StatGrassBinds / f, StatOutside / f);
+		StatFrames = StatBinds = StatLeafBinds = StatGrassBinds = StatOutside = StatLampBinds = 0;
 	}
 
 	// NiD3DPixelShaderEx::SetupShader: the deferred record while the G-buffer span is open and this frame's foliage records are written.
@@ -107,6 +142,12 @@ namespace DeferredFoliage {
 		if (!CapturedNormals::InSpan || !(leaf ? CapturedNormals::LeafNow : CapturedNormals::GrassNow)) { StatOutside++; return nullptr; }
 		StatBinds++;
 		if (leaf) StatLeafBinds++; else StatGrassBinds++;
+		// (2026-11-16) the twin with the froxel's lamps, only with this frame's table and lists finished (else the plain record)
+		if (leaf && LampsLive && ManyLamps::Table && !ManyLamps::TableFailed && ManyLamps::TableFrame == ManyLamps::FrameId && ManyLamps::ListsFrame == ManyLamps::FrameId &&
+			!ManyLamps::TableJob.pending) {
+			auto lamps = LampRecords.find(shader);
+			if (lamps != LampRecords.end()) { StatLampBinds++; return lamps->second; }
+		}
 		return found->second;
 	}
 }

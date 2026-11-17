@@ -741,7 +741,10 @@ void ReflectionsEffect::UpdateConstants() {
 	Constants.Data.x = (exterior ? Settings.GroundSheen : Settings.InteriorFloors) * reflectivity;
 	Constants.Data.y = exterior ? wet * Settings.RainWetness : 0.0f;
 	// UNOFFICIAL 2026-10-19: the rain wets only open ground (the ortho map's roof test, as Wet World): kept up while it rains here.
-	Constants.Data4.y = Constants.Data.y > 0.0f ? 1.0f : 0.0f;
+	// 2026-11-08 Puddles: and while standing water is left (the passes mirror it after the rain, Reflections.glsl PuddleStanding).
+	PuddlesShaders* puddles = TheShaderManager->Shaders.Puddles;
+	PuddlesActive = exterior && puddles && puddles->ReflectionsWanted();
+	Constants.Data4.y = Constants.Data.y > 0.0f || PuddlesActive ? 1.0f : 0.0f;
 	if (Constants.Data4.y > 0.0f) TheShaderManager->orthoRequired = true;
 	Constants.Data.z = Settings.Roughness;
 	Constants.Data.w = Settings.WetRoughness;
@@ -810,7 +813,7 @@ bool ReflectionsEffect::ShouldRender() {
 	// over it (wet roads, polished floors and metal reflecting twice). On: no Reflections pass while the traced picture replaces the scene.
 	if (RtPathTrace::Replacing() && TheSettingManager->GetSettingI("Main.Main.RayTracing", "PTReflectionsOff") != 0) return false;
 	const NormalsEffect* normals = TheShaderManager->Effects.Normals;
-	const bool surfaces = Constants.Data.x > 0.0f || Constants.Data.y > 0.0f || (Constants.Material.x > 0.0f && Constants.Material.z > 0.0f);
+	const bool surfaces = Constants.Data.x > 0.0f || Constants.Data.y > 0.0f || PuddlesActive || (Constants.Material.x > 0.0f && Constants.Material.z > 0.0f);
 	// UNOFFICIAL 2026-11-04 (tester: no RT gun reflection): the first-person weapon's RT reflection is traced inside this pass, so on
 	// dry ground with GroundSheen 0 (nothing else on screen reflects) it was skipped with it. RT Weapon above 0 keeps the pass on while
 	// the weapon rays can run (RtTrace's weaponFrame: the helper up, not a rect frame). Weapon 0 or RT off: as before.
@@ -1212,6 +1215,7 @@ namespace {
 		D3DXVECTOR4	renderScale;	// UNOFFICIAL 2026-11-03 TESR_RenderScale: xy the rect frame's scale, zw 1 / xy; 1 in a native frame
 		D3DXVECTOR4	flashPos, flashDir, flashColor, flashLook;	// UNOFFICIAL 2026-11-07 (perf-reflfix2) KeepFlashlight (ReflectionsComposite.frag)
 		D3DXVECTOR4	mirrorLamp, sunDirection;	// UNOFFICIAL 2026-11-08 (perf-reflfix3) MirrorLampHighlight (ReflLampHighlight.glsl)
+		D3DXVECTOR4	puddle, puddle2;	// 2026-11-08 Puddles (PuddlesShaders::ReflectionData): the standing water's field (Reflections.glsl PuddleStanding)
 	};
 	ReflUniforms ReflUploaded;	// what the uniform buffer holds (one effect instance)
 	struct ReflPush { D3DXVECTOR4 cube; UInt32 linearIndex, pointIndex, mipIndex, pass; };
@@ -1445,13 +1449,16 @@ bool ReflectionsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* R
 	// this build registers it and it is made; looked up once, by name, so a build without it simply leaves this off.
 	static IDirect3DBaseTexture9** materialBuffer = nullptr;
 	static bool materialLooked = false;
-	if (Settings.MaterialBufferRoughness && !materialLooked) {
+	// 2026-11-12 Puddles: the reflection pass also reads the surfaces' standing-water mask from it (Reflections.glsl PuddleStanding)
+	PuddlesShaders* puddlesMask = TheShaderManager->Shaders.Puddles;
+	const bool puddleMask = puddlesMask && puddlesMask->ReflectionsWanted() && !CapturedNormals::AlbedoCompiledIn();	// (test-after-110 merge: the mask is written only with the first layout; 3 / 4 keep the normal in a, so the field is used)
+	if ((Settings.MaterialBufferRoughness || puddleMask) && !materialLooked) {
 		materialLooked = true;
 		std::string name = "TESR_MaterialBuffer";
 		materialBuffer = TheTextureManager->GetTextureSlotByName(name);
 		Logger::Log("UNOFFICIAL Reflections MaterialBufferRoughness: %s", materialBuffer ? "TESR_MaterialBuffer found" : "no TESR_MaterialBuffer in this build: off");
 	}
-	IDirect3DBaseTexture9* matbuf = Settings.MaterialBufferRoughness && materialBuffer ? *materialBuffer : nullptr;
+	IDirect3DBaseTexture9* matbuf = (Settings.MaterialBufferRoughness || puddleMask) && materialBuffer ? *materialBuffer : nullptr;
 	// UNOFFICIAL 2026-10-30 CloudSky: the cloud sky probe (VolumetricClouds RenderSkyProbe), outdoors, while it is fresh.
 	VolumetricCloudsEffect* clouds = TheShaderManager->Effects.VolumetricClouds;
 	IDirect3DTexture9* cloudSky = Settings.CloudSky && clouds && clouds->Enabled && clouds->SkyProbeReady() && TheShaderManager->GameState.isExterior ?
@@ -1461,7 +1468,8 @@ bool ReflectionsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* R
 		auto found = TheShaderManager->ConstantsTable.find("TESR_CloudsLayout");
 		if (found != TheShaderManager->ConstantsTable.end() && found->second) cloudBrightness = found->second->w;
 	}
-	uniforms.material2 = D3DXVECTOR4(matbuf ? 1.0f : 0.0f, cloudSky ? 1.0f : 0.0f, cloudBrightness, Settings.RtWeaponMetal);	// w: WeaponMetal (2026-10-30)
+	// x: bit 1 the roughness the shaders lit with (MaterialBufferRoughness), bit 2 the puddle mask (2026-11-12)
+	uniforms.material2 = D3DXVECTOR4((matbuf && Settings.MaterialBufferRoughness ? 1.0f : 0.0f) + (matbuf && puddleMask ? 2.0f : 0.0f), cloudSky ? 1.0f : 0.0f, cloudBrightness, Settings.RtWeaponMetal);	// w: WeaponMetal (2026-10-30)
 	// UNOFFICIAL 2026-10-31 SkyPanorama: the passes after it this frame read the panorama on t_cloudSky (y 2); its own pass reads the probe.
 	IDirect3DBaseTexture9* skySlot = cloudSky;
 	if (panoReady && techniqueIndex != 10) { skySlot = pano[panoIndex]; uniforms.material2.y = 2.0f; }
@@ -1499,6 +1507,8 @@ bool ReflectionsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* R
 		uniforms.mirrorLamp = D3DXVECTOR4(1.0f - Settings.MirrorLampHighlight, 12.0f, RtSunAmount() > 0.0f ? 1.0f : 0.0f, 0.0f);
 		uniforms.sunDirection = D3DXVECTOR4(toSun.x, toSun.y, toSun.z, 0.0f);
 	}
+	// 2026-11-08 Puddles: the puddles' field, so the SSR and RT reflections mirror them (zero: off).
+	if (PuddlesShaders* puddles = TheShaderManager->Shaders.Puddles) puddles->ReflectionData(uniforms.puddle, uniforms.puddle2);
 	ID3D9NvrExtBuffer* buffer = extUniforms.Buffer;
 	if (!buffer || memcmp(&uniforms, &ReflUploaded, sizeof(uniforms))) {
 		buffer = ExtUniforms(extUniforms, &uniforms, sizeof(uniforms));

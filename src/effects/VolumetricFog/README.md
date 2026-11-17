@@ -418,3 +418,13 @@ about 120 and two reads for one it passes through (two atan, two sincos, two exp
 
 ## Idle targets (2026-11-12)
 With `[Main.Main.Performance] TargetReleaseSeconds` above 0 (default 20) the texture manager keeps 1 x 1 stand-ins in place of this effect's render targets while it is off (not made at start-up when it starts off; released that many seconds after it is switched off; made again, zero filled, before the frame draws when it is switched on). Which targets and why that is safe here: the two fog buffers are used only from Render (RenderDedicated), behind the switch. A new reader or writer of these targets outside the effect's own switch, or a copy of their pointers kept past a frame, breaks this: then answer false in `TargetParkable` (the header). See `core/TextureManager.h`.
+
+## FoggyWeatherImpact (UNOFFICIAL 2026-11-13, modern lighting)
+
+One WeatherImpact for every weather cannot serve both ends: a clear weather whose fog far is 45000 with a power of 0.6 already greys trees at 50 m at 0.5, and at 0.2 a foggy weather loses its fog. With `[Shaders.VolumetricFog.Main] FoggyWeatherImpact` at 0 or more (default -1: off, as before), the share of the weather's own fog follows the weather's fog distance, outdoors:
+
+- `Sky::fogFarPlane` (the game's own blend of day / night and old / new weather) at `ClearWeatherFar` (26000) or farther: WeatherImpact as set.
+- At `FoggyWeatherFar` (12000) or nearer: FoggyWeatherImpact.
+- Between: eased (smoothstep on the distance's logarithm).
+
+It is worked out on the CPU each frame (`VolumetricFogEffect::UpdateConstants`, `TESR_VolumetricFogDensity.y`): no shader or SPIR-V change, the D3D9 and Vulkan paths read the same constant. Indoors and with LegacyFog: WeatherImpact as set. Bench (Zone, slot A): clear, part-cloud and overcast weathers (far 28000-56000) unchanged; foggy1 (far 10500) at 1.0: ground median L 28 -> 35, shade -1.84 -> -1.31 stops, pines fade in depth steps; 0 flicker spikes in 600 foggy frames.

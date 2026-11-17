@@ -130,7 +130,7 @@ parts than before; with Vegas Shaders' generated maps nothing changes.
 
 | Mode | A pixel's metal share | Code |
 |---|---|---|
-| default (`[Shaders.PBR.EnvMaps] FromGameData` false) | an `_rmaos` map's G with `MetalFromMap`; else a material class's; else the guess from grey colour and the normal map's alpha, times `[Shaders.PBR.Metal]` World / FirstPerson | `getMetalStrength`, `getDerivedMetallic` |
+| default (`[Shaders.PBR.EnvMaps] FromGameData` false) | an `_rmaos` map's G with `MetalFromMap`; else a material class's; else the guess from grey colour and the normal map's alpha (bare alpha: `GreyMetal` on the first-person weapon, `WorldGreyMetal` on the world, default 0 since 2026-11-16 so bare rock and concrete are not metal), times `[Shaders.PBR.Metal]` World / FirstPerson | `getMetalStrength`, `getDerivedMetallic` |
 | `FromGameData` true (restart; then live) | the game's env-map data: Environment_Mapping flag + its `_m` mask (texture slot 5) = env-map scale x mask; flag, no mask = scale x (`FromGameDataNoMask`: 1 the whole surface, 0 the normal map's alpha, the game's own rule); no flag = 0, whatever the colour; an `_rmaos` map's G over all of it; times World / FirstPerson. Material classes' metal is not used | `NVR_EnvData` (c94), `Render.cpp` RmaosDraw |
 
 Facts the design rests on (decomp of 1.4.0.525, 2026-11-09): the flag is BSShaderProperty flags word 0 bit 7; the strength is the

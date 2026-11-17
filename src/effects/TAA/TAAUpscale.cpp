@@ -208,6 +208,22 @@ void TAAEffect::NoteWorldDraw(bool firstPerson) {
 	UpscaleStruct& up = taa->Up;
 	if (port.X == 0 && port.Y == 0 && port.Width == up.RenderWidth && port.Height == up.RenderHeight) up.DrawsSmall++;
 	else if (port.X == 0 && port.Y == 0 && port.Width == up.Width && port.Height == up.Height) {
+		// UNOFFICIAL 2026-11-16 (owner: "in interior cells, water reflections seem to be broken. almost like the old reflection clip plane
+		// but somehow even more bizarre looking"; docs/next/INTERIOR-WATER.md): only a pass into the world's own target belongs in the
+		// render viewport. Before its water passes the game copies the world's target into its water refraction texture
+		// (BSShaderAccumulator::FinishAccumulating_Standard_PostResolveDepth -> ImageSpaceManager::RenderEffect -> ImageSpaceShader::Render
+		// -> BSBatchRenderer::RenderPassImmediately: through this same pass hook, in the world context). That texture has the screen's
+		// size, so its whole viewport looked like a reset one, and the copy was put into the render viewport: the whole target squeezed
+		// into RenderScale of the copy, the world's picture into RenderScale squared. The water shaders, which read the copy at the
+		// projected position x TESR_RenderScale (the world target's own layout), then showed the room magnified and, past RenderScale of
+		// the frame in x or y, flat blue (indoors) or white (the Strip fountain). A world-scene pass into another target keeps the viewport
+		// it has. First-person passes (the weapon, v2) are put into the render rect as before, without this test.
+		if (!firstPerson) {
+			IDirect3DSurface9* target = nullptr;
+			TheRenderManager->device->GetRenderTarget(0, &target);
+			if (target) target->Release();	// (compared only: the device holds it)
+			if (target != up.Target) { up.DrawsElsewhere++; return; }
+		}
 		// Something reset the viewport to the whole target mid-scene (a SetRenderTarget without the game's SetCameraData after it):
 		// this world pass is put back into the render viewport, where the rest of the scene is.
 		up.DrawsFull++;
@@ -261,7 +277,7 @@ bool TAAEffect::UpscaleBegin(bool firstWorld) {
 	Up.Active = false;
 	UpscaleReleaseTargets();
 	RenderScaleConstant = D3DXVECTOR4(1.0f, 1.0f, 1.0f, 1.0f);
-	Up.DrawsSmall = Up.DrawsFull = Up.DrawsOther = 0;
+	Up.DrawsSmall = Up.DrawsFull = Up.DrawsOther = Up.DrawsElsewhere = 0;
 	// A second world scene in the same frame (rare: menus' 3D backgrounds) is drawn as it always was; the frame's upscale (and
 	// TAA's skip of its resolve) belongs to the first one, so Upscaled is kept.
 	if (!firstWorld) { if (FSRSettings.Enabled && FSRSettings.RenderScale < 0.999f) Up.SkippedFrames++; return false; }
@@ -477,6 +493,13 @@ bool TAAEffect::UpscaleCheckDrawn(IDirect3DDevice9* Device) {
 		Logger::Log("UNOFFICIAL RenderScale: of this world scene's passes %u used the render viewport (0,0 %ux%u), %u the whole screen and %u another "
 			"(logged once; whole-screen ones found the viewport reset mid-scene and were put back into the render one). The scene ended with %u,%u %ux%u.",
 			drawsSmall, Up.RenderWidth, Up.RenderHeight, drawsFull, drawsOther, (unsigned)drawn.X, (unsigned)drawn.Y, (unsigned)drawn.Width, (unsigned)drawn.Height);
+	}
+	// UNOFFICIAL 2026-11-16 (NoteWorldDraw): passes into another target with its whole viewport (the game's water refraction copy), once
+	static bool elsewhereLogged = false;
+	if (Up.DrawsElsewhere > 0 && !elsewhereLogged) {
+		elsewhereLogged = true;
+		Logger::Log("UNOFFICIAL RenderScale: %u pass(es) of this world scene drew into another render target than the world's with its whole viewport "
+			"(the game's water refraction copy): left as drawn, so the copy keeps the world target's layout (logged once).", Up.DrawsElsewhere);
 	}
 	return true;
 }

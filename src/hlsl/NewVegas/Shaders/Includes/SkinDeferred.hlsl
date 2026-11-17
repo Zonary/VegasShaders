@@ -111,7 +111,12 @@ float3 FDSkinSunTransmission(float3 P, float3 Ngeo, float3 L, float3 albedo, flo
     const float t = max(ls.z - occluder, 0.0f) * worldPerDepth;
     const float3 d = max(TESR_SkinSSS.xyz, 1.0e-3f);
     const float3 through = 0.25f * exp(-t / d) + 0.75f * exp(-t / (3.0f * d));
-    return albedo * through * (farSide * TESR_SkinMaterial.w) * light;
+    // (2026-11-16 fd-fwdgroups, batch 8's hard orange edge across the backlit scalp) Where the point is itself the nearest surface toward the
+    // sun (t ~ 0: it is lit directly, its light is the diffuse term's), "through" was 1; one texel further round the head the map's nearest
+    // surface jumps to the far side and t to the head's width: full transmission next to none, a hard line. Light comes through only past a
+    // thickness: a ramp over the red scatter distance from t = 0, so both sides of that line meet at 0 (the ear, ~0.5-1 unit thin, keeps it).
+    const float entered = saturate(t / max(d.r, 1.0e-3f));
+    return albedo * through * (entered * farSide * TESR_SkinMaterial.w) * light;
 }
 #endif
 

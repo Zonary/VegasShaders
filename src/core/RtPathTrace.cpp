@@ -137,6 +137,7 @@ namespace {
 												// thing they reflect (RtPathTrace.comp gReflAlbedo, RtDenoise Settings.MirrorSurface); 0 = as before
 		int		denoiseUnderRr = 0;
 		float	denoiseHistoryFix = 3.0f;	// (ptaaa-denoiser) PTDenoiseHistoryFix: RtDenoise Settings.HistoryFix (newly seen pixels: no speckles)
+		float	denoiseConfidence = 0.0f;	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) PTDenoiseConfidence: RtDenoise Settings.Confidence (0 off)
 		float	denoiseMeanVariance = 2.0f;	// (ptaaa-denoiser) PTDenoiseMeanVariance: RtDenoise Settings.MeanVariance (fine shadows kept)
 		int		denoiseAntiFirefly = -1;	// (ptaaa-denoiser) PTDenoiseAntiFirefly: -1 auto (on under PTRealtime), 0 off, 1 on
 		float	denoiseFireflyK = 2.0f;	// PTDenoiseFireflyK (test key): its k
@@ -184,6 +185,10 @@ namespace {
 		// targets unshadowed + one shadow ray for the chosen sample (1 = a ray inside every target, as before; 2 / 3 test variants),
 		// PTBounceLights 0 = one light sample a bounce hit (1 = the sun, the lamp and the emissive point each, as before). A missing key: 0
 		int		restirDIRays = 0;
+		// UNOFFICIAL 2026-11-15 (rt-reuse, docs/next/RT-REUSE-CGNS.md) test switches for both reservoirs (PTRestirDI, PTRestirGI): PTRestirCGNS
+		// compatibility-guided neighbour picks from this many candidates (0 off), PTRestirDupMap ReSTIR GI's duplication count (off)
+		int		restirCGNS = 0;
+		bool	restirDupMap = false;
 		int		bounceLights = 0;
 		int		gameLamps = 4;			// PTGameLamps (2026-11-03 rtspec): the lamps as the game lights them: 1 its falloff ((1 - (d/r)^2)^2.2), 2 its colour
 										// (colour x dimmer decoded together), 3 both, 4 the game's own lamp table (its lamps, reach and colour) + its falloff,
@@ -257,8 +262,11 @@ namespace {
 	static_assert(2 * kGlassSurfaceTexel >= RtRestirRow::kRowFloatsAll && kGlassSurfaceTexel < kLightTexels, "PTGlassSurface's frame row texel: after the energy table, inside the row");
 	// UNOFFICIAL 2026-11-13 the flashlight's keys (RtPathTrace.comp kFlashOwnTexel / kFlashRasterTexel / kFlashRasterTexel2: keep them equal):
 	// 305.x PTFlashOwnPixels, 305.y the lamps' light scale for PTFlashRasterShape, 306.x its decode exponent (0 = off), 306.y the physical
-	// lamp shape's exponent (0 = that shape off), 298.x the shape's 1 / Falloff^2, 298.y its strength. 299-304 stay unused.
+	// lamp shape's exponent (0 = that shape off), 298.x the shape's 1 / Falloff^2, 298.y its strength. 300-304 stay unused.
 	constexpr int kFlashOwnTexel = 305, kFlashRasterTexel = 306, kFlashRasterTexel2 = 298;
+	// UNOFFICIAL 2026-11-15 (rt-reuse) PTRestirCGNS's candidates for ReSTIR DI: texel 299.x (RtPathTrace.comp kCgnsTexel: keep them equal), y 0
+	constexpr int kCgnsTexel = 299;
+	static_assert(kCgnsTexel > kFlashRasterTexel2 && kCgnsTexel < kFlashOwnTexel && kCgnsTexel < kLightTexels, "PTRestirCGNS's frame row texel");
 	RtRestirRow::State restirState;
 	// (2026-11-07) the scratch store's layout: the ReSTIR DI reservoirs (two sets of w x h x 4 words) at word 0, the radiance cache from here
 	// (2026-11-07 ptaaa-emissive: two sets of w x h x 6 words, was x 4: an emissive sample's triangle and barycentrics)
@@ -391,6 +399,7 @@ namespace {
 		S.denoiseMirrorSurface = f("PTDenoiseMirrorSurface", 0.0f, 1.0f);	// UNOFFICIAL 2026-11-09 (pt-mirrors; a missing key: 0, off)
 		S.denoiseUnderRr = i("PTDenoiseUnderRr", 0, 1);
 		S.denoiseHistoryFix = f("PTDenoiseHistoryFix", 0.0f, 16.0f);
+		S.denoiseConfidence = f("PTDenoiseConfidence", 0.0f, 16.0f);	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs; a missing key: 0, off)
 		S.denoiseMeanVariance = f("PTDenoiseMeanVariance", 0.0f, 64.0f);
 		S.denoiseAntiFirefly = i("PTDenoiseAntiFirefly", -1, 1);
 		S.denoiseFireflyK = f("PTDenoiseFireflyK", 0.0f, 64.0f);
@@ -443,6 +452,8 @@ namespace {
 		{ SettingManager::Configuration::ConfigNode cn; S.denoiseCeiling = TheSettingManager->Config.FillNode(&cn, kSection, "PTDenoiseCeiling") ? (std::min)((std::max)(cn.FloatValue, 0.0f), 60000.0f) : 200.0f; }	// UNOFFICIAL 2026-11-11 (a missing key: the documented 200; 0 = the old 60000)
 		{ SettingManager::Configuration::ConfigNode ln; S.restirDILampMatch = TheSettingManager->Config.FillNode(&ln, kSection, "PTRestirDILampMatch") ? (std::min)((std::max)(ln.FloatValue, 0.0f), 256.0f) : 32.0f; }	// UNOFFICIAL 2026-11-10 (BUG FIX: a missing key reads the documented 32; 0 = the old exact match)
 		S.restirDIRays = i("PTRestirDIRays", 0, 3);	// (2026-11-07 perf-ptcost)
+		S.restirCGNS = i("PTRestirCGNS", 0, 31);	// UNOFFICIAL 2026-11-15 (rt-reuse; a missing key: 0, off)
+		S.restirDupMap = i("PTRestirDupMap", 0, 1) != 0;
 		S.bounceLights = i("PTBounceLights", 0, 1);
 		// UNOFFICIAL 2026-11-07 (ptaaa-materials, RT-PATH-TRACING.md "materials") the material models (a missing key: 0, off)
 		S.materials.glass = (float)i("PTGlass", 0, 2);
@@ -1152,6 +1163,8 @@ namespace {
 					// UNOFFICIAL 2026-11-11 PTEarlyLook slice 2 (RtPathTrace.comp gEarlyLook): 1 = the display's alpha is the first hit's view z / farZ
 					// (0 a miss, -1 a glow the game draws) instead of 1. Written every frame (the lock discards), 0 outside early-look frames.
 					row[2 * kEarlyLookTexel] = earlyDepth ? 1.0f : 0.0f; row[2 * kEarlyLookTexel + 1] = 0.0f;
+					// UNOFFICIAL 2026-11-15 (rt-reuse) PTRestirCGNS for ReSTIR DI (RtPathTrace.comp RestirCgnsK): written every frame (the lock discards)
+					row[2 * kCgnsTexel] = (float)S.restirCGNS; row[2 * kCgnsTexel + 1] = 0.0f;
 					// UNOFFICIAL 2026-11-11 texel 31 (RtPathTrace.comp FlashShape): the flashlight's NearFade (x) and HotspotLimit (y) as its light pass
 					// takes them (FlashlightEffect::ApplyLook: Main or Interiors), only while lamp 0 is the flashlight (texel 15 holds its cone code);
 					// 0 = off, as every other frame (the lock discards: written every frame)
@@ -1335,7 +1348,8 @@ namespace {
 			// UNOFFICIAL 2026-11-09 (rt-review; docs/next/RT-PT-REVIEW-2026-11-09.md P1, P6) the reservoirs of another rect (a RenderScale
 			// change, rect <-> native) hold other texels: no history that frame, as ReSTIR DI's row does it (RtRestirRow.h)
 			if (giPrevSize[0] != tw || giPrevSize[1] != th) giHistory = false;
-			r.rect[2] = (float)((flags & 1u ? 1u : 0u) | (giHistory ? 2u : 0u) | 4u);
+			r.rect[2] = (float)((flags & 1u ? 1u : 0u) | (giHistory ? 2u : 0u) | 4u
+				| (S.restirDupMap ? 8u : 0u) | ((unsigned)S.restirCGNS << 4));	// UNOFFICIAL 2026-11-15 (rt-reuse) RtRestirGI.comp DupMap / CgnsCandidates; both off: as before
 			r.rect[3] = S.denoiseCeiling;	// UNOFFICIAL 2026-11-11 PTDenoiseCeiling (was unused; 0 = no ceiling)
 			memcpy(r.prevForward, giPrevCamera[0], 16); memcpy(r.prevRight, giPrevCamera[1], 16); memcpy(r.prevUp, giPrevCamera[2], 16);
 			// (P1) last frame's eye in THIS frame's scene space, minus this frame's eye. The scene is camera-relative, so that is the camera's
@@ -1612,6 +1626,7 @@ namespace {
 			settings.ObjectMotion = S.denoiseObjectMotion;	// (2026-11-07 ptaaa-denoiser)
 			settings.MovingHistory = S.denoiseObjectMotion ? S.denoiseMovingHistory : 0;
 			settings.HistoryFix = S.denoiseHistoryFix;	// (2026-11-07 ptaaa-denoiser) the lead's RT playground: speckle trails behind a moving lamp / object
+			settings.Confidence = S.denoiseConfidence;	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) the diffuse chain only (RtDenoise::Run skips it in the specular mode)
 			settings.MeanVariance = S.denoiseMeanVariance;	// (2026-11-07 ptaaa-denoiser) the playground's chain-link wire shadow
 			settings.AntiFirefly = S.denoiseAntiFirefly > 0 ? S.denoiseFireflyK + (S.denoiseFireflyK > 0.0f ? 128.0f * (float)S.denoiseFireflySpread : 0.0f) : 0.0f;	// (2026-11-09: + 128 x PTDenoiseFireflySpread, the shaders' packing)
 			//	// (2026-11-07 ptaaa-denoiser) the playground's fireflies
@@ -2080,6 +2095,10 @@ namespace RtPathTrace {
 		*Albedo = FirstSurface();	// (2026-11-11 PTEarlyLook: the merged one in its frames; its negative alpha = the G-buffer's own guide there)
 		if (splitThisFrame) { *SpecularRG = specAlbedoA; *SpecularBRough = specAlbedoB; }
 		return true;
+	}
+	IDirect3DTexture9* RrSpecular() {	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs)
+		IDirect3DTexture9 *a = nullptr, *rg = nullptr, *b = nullptr;
+		return RrGuides(&a, &rg, &b) && splitThisFrame && S.denoiseMirrorSurface > 0.0f ? specTexture : nullptr;
 	}
 
 	std::string StatusText() {

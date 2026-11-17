@@ -83,6 +83,8 @@
 //                                       when: always called (nothing outside a storm)
 //  37  GodRays                          God rays
 //                                       when: always called
+//  37b SunGlare                         The sun's lens glare (halo, starburst, streak) on the HDR picture
+//                                       when: SunGlare on, outdoors by day, the sun in front of the camera (ShouldRender)
 //  38  RayReconstruction                DLSS Ray Reconstruction point
 //                                       when: Effects.TAA (off: nothing)
 //  39  LumaExposureBloom                Average luma (compute or D3D9), exposure, bloom buffers
@@ -160,6 +162,7 @@
 #include "PixelInspector.h"	// UNOFFICIAL 2026-10-26 (debugging tool)
 #include "PointShadowSlots.h"
 #include "PointShadowForward.h"
+#include "DeferredLamps.h"	// UNOFFICIAL 2026-11-16 fd-batchA item 2 (LampShadowsDrawn)
 #include "CapsuleShadows.h"	// UNOFFICIAL 2026-10-31 CapsuleShadows
 #include "BackDepth.h"	// UNOFFICIAL 2026-10-31 BackDepth
 #include "EffectSelfTest.h"
@@ -168,6 +171,7 @@
 #include "../effects/CoverMap/CoverMap.h"	// UNOFFICIAL 2026-10-27 Persistent wetness and snow
 #include "RtCore.h"	// UNOFFICIAL 2026-10-28 (NVR DXVK) the ray tracing core
 #include "RtSunShadows.h"	// UNOFFICIAL 2026-10-28 RT sun shadows
+#include "BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (fork port 2026-11-13)
 #include "RtFogVisibility.h"	// UNOFFICIAL 2026-11-07 (ptaaa-fog) RT fog visibility
 #include "RtPathTrace.h"	// UNOFFICIAL 2026-11-02 the reference path tracer
 #include "Upscaler.h"	// UNOFFICIAL 2026-10-30 DLSS Ray Reconstruction
@@ -297,10 +301,15 @@ void ShaderManager::PreStep_ShadowPlan(ChainContext& ctx) {
 	// cleared to "no shadow" for the effects that read it (indoors only Underwater).
 	// (Only while the PBR object shaders, which draw the forward shadows, are on and were drawing this frame: with PBR off
 	// the old screen-space shadows run instead of none at all.)
+	// UNOFFICIAL 2026-11-16 fd-batchA item 2 (docs/next/FD-BATCH-A.md; [Shaders.ShadowsInteriors.Deferred] ReplaceScreenShadows): the deferred lamp
+	// pass shadows its lamps from the atlas too, and in the deferred renderer the forward lamp-shadow shaders are not bound in a frame without
+	// skin, glass or the weapon (their deferred records are): the screen-space shadows were then laid over a room already shadowed (doubled,
+	// soft and darker, flipping as an NPC or the weapon came into view). Off: as before.
 	const bool forwardInterior = !GameState.isExterior && Effects.ShadowsInteriors->Enabled && PointShadowForward::Active &&
-		PointShadowForward::BoundThisFrame && Shaders.PBR && Shaders.PBR->Enabled;
+		(PointShadowForward::BoundThisFrame || DeferredLamps::LampShadowsDrawn()) && Shaders.PBR && Shaders.PBR->Enabled;
 	const bool keepDarkening = !forwardInterior || Effects.ShadowsExteriors->Settings.Interiors.Forward.KeepDarkening;
 	ctx.forwardInterior = forwardInterior;
+	DeferredLamps::NoteScreenShadows(!GameState.isExterior, PointShadowForward::BoundThisFrame, !forwardInterior);	// UNOFFICIAL 2026-11-16 fd-batchA item 2 diagnostic (F10 profile only)
 	ctx.keepDarkening = keepDarkening;
 }
 
@@ -479,7 +488,14 @@ void ShaderManager::PreStep_ShadowPasses(ChainContext& ctx) {
 				// the forward lookups are off for the fade: it gets the forward value, as without the switch.
 				const float forwardWas = sunShadows->Constants.ForwardData.x;
 				if (sunShadows->SunFaded && sunShadows->Settings.Exteriors.ForwardShadows) sunShadows->Constants.ForwardData.x = 0.0f;
+				// UNOFFICIAL 2026-11-06 forward Bend contact shadows (core/BendContact.h): Bend's march for next frame's lit shaders;
+				// when it ran, the old pass writes "no contact" (its ScreenSpaceData.x test) so nothing is darkened twice.
+				const bool bendRan = fusedForwardContact && sunShadows->Constants.ScreenSpaceData.x != 0.0f && BendContact::Produce(Device);
+				if (!bendRan) BendContact::Invalidate();	// the old pass has the contact this frame: next frame's lit shaders take none
+				const float screenSpaceWas = sunShadows->Constants.ScreenSpaceData.x;
+				if (bendRan) sunShadows->Constants.ScreenSpaceData.x = 0.0f;
 				RenderEffectToRT(sunShadows->Textures.ShadowPassSurface, Effects.SunShadows, false, sharpContact ? 2 : fusedForwardContact ? 1 : 0);
+				sunShadows->Constants.ScreenSpaceData.x = screenSpaceWas;
 				sunShadows->Constants.ForwardData.x = forwardWas;
 				RtSunShadows::Apply(Device);	// UNOFFICIAL 2026-10-28: the traced sun visibility into the red channel (nothing when not traced)
 			}
@@ -503,6 +519,7 @@ void ShaderManager::PreStep_ShadowPasses(ChainContext& ctx) {
 		// others), so reset it to the neutral "no shadow" value rather than leaving
 		// stale exterior data for them to read.
 		if (!shadowBufferClear) { Effects.ShadowsExteriors->clearShadowsBuffer(); shadowBufferClear = true; }
+		BendContact::Invalidate();	// UNOFFICIAL 2026-11-06: no Bend result made (the effect's UpdateConstants may not run either)
 	}
 }
 
@@ -1127,6 +1144,19 @@ void ShaderManager::PreStep_GodRays(ChainContext& ctx) {
 	}
 }
 
+// UNOFFICIAL 2026-11-13 (modern lighting): the sun's lens glare, one pass into the current image (effects/SunGlare).
+void ShaderManager::PreStep_SunGlare(ChainContext& ctx) {
+	static GpuTimer sunGlareTimer("Sun glare");
+	IDirect3DDevice9* Device = ctx.Device;
+	IDirect3DSurface9* RenderTarget = ctx.RenderTarget;
+	IDirect3DSurface9* SourceSurface = ctx.SourceSurface;
+	if (!Effects.SunGlare) return;
+	{
+		GpuProfileScope gpu(sunGlareTimer, Device);
+		{ Effects.SunGlare->Render(Device, RenderTarget, TheTextureManager->RenderedSurface, 0, true, SourceSurface); PixelInspector::AfterFrame(Effects.SunGlare); }
+	}
+}
+
 void ShaderManager::PreStep_RayReconstruction(ChainContext& ctx) {
 	IDirect3DDevice9* Device = ctx.Device;
 	IDirect3DSurface9* RenderTarget = ctx.RenderTarget;
@@ -1592,6 +1622,7 @@ static const EffectChain::Step PreTonemapSteps[] = {
 #endif
 	{ "Sandstorm", EffectChain::PreTonemap, &ShaderManager::PreStep_Sandstorm },
 	{ "GodRays", EffectChain::PreTonemap, &ShaderManager::PreStep_GodRays },
+	{ "SunGlare", EffectChain::PreTonemap, &ShaderManager::PreStep_SunGlare },
 	{ "RayReconstruction", EffectChain::PreTonemap, &ShaderManager::PreStep_RayReconstruction },
 	{ "LumaExposureBloom", EffectChain::PreTonemap, &ShaderManager::PreStep_LumaExposureBloom },
 	{ "LensAndPreTonemapLUT", EffectChain::PreTonemap, &ShaderManager::PreStep_LensAndPreTonemapLUT },

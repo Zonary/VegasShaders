@@ -18,6 +18,9 @@
 #include "includes/Terrain.hlsl"	// shared code
 #ifdef PS
     #define SHADOW_CLOUD_IN 1   // UNOFFICIAL 2026-11-04 ForwardCloudShadows (Includes/Shadow.hlsl): the clouds' shadow on the sun term (compiled in only when on at startup)
+    #define SHADOW_SUN_CONTACT_ALWAYS 1
+    #define SHADOW_SUN_CONTACT_IN 1     // UNOFFICIAL 2026-11-06 forward contact shadows (Includes/Shadow.hlsl; only with Bend on at start), land registers s13 / c183-c187
+    #define SHADOW_SUN_CONTACT_LAND 1
 #endif
 #include "includes/Shadow.hlsl"	// shared code
 #include "includes/TerrainErosion.hlsl"
@@ -239,6 +242,11 @@ PS_OUTPUT main(PS_INPUT pin) {
         // RoughnessScale: Includes/Terrain.hlsl getSunLighting), and without GBufferV2 the normal map's normal in the older deferred code
         po.capturedPad1.a = FD_LF_CODE(FD_LF_SPEC, 1.0f - pin.fogTerm.a);
         po.capturedPad2.b = saturate((1.0f - nrm.a) * TESR_TerrainData.y);
+        #if CAPTURED_NORMALS_ON >= 4
+        // (2026-11-16 batch D, DEFERRED-GAPS-AUDIT item 11) the far land's mark in r's fraction (Includes/DeferredPixel.hlsl
+        // FD_FAR_LAND_MARK): still model 4; DeferredSun gives it no ShadowBounce, which this shader's forward record never had
+        po.capturedPad2.r += FD_FAR_LAND_MARK;
+        #endif
         #if CAPTURED_NORMALS_ON == 3
         {
             const float2 fdOct = ShadowEncodeNormal(normalize(nrm.xyz));

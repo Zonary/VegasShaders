@@ -49,9 +49,12 @@ void WetWorldEffect::UpdateConstants() {
 			if (state == 0) Logger::Log("UNOFFICIAL WetWorld PuddlesLandOnly: off (0): puddles and wetness by the old guess alone (faces up, lies in a hollow).");
 			else if (state == 1) Logger::Log("UNOFFICIAL WetWorld PuddlesLandOnly: cannot run: the material buffer holds nothing this frame ([Main.Main.Quality] "
 				"MaterialBuffer off, or native D3D9 with the game's MSAA): the old guess stays.");
-			else Logger::Log("UNOFFICIAL WetWorld PuddlesLandOnly: running, mode %d (%s)%s; PuddlesMinObjectSize %.0f; WeaponRainHandOff %s; ReflectionsOwnPuddles %s.", mode,
+			// (2026-11-16 fd-batchCG) the layout the shaders decode, both runtimes (the fork's wet map reads v2 too now); v2 holds no object size
+			else Logger::Log("UNOFFICIAL WetWorld PuddlesLandOnly: running, mode %d (%s)%s; material buffer layout %s; PuddlesMinObjectSize %.0f%s; WeaponRainHandOff %s; ReflectionsOwnPuddles %s.", mode,
 				mode == 2 ? "land only" : "ground-like: land and rigid objects, never people, cloth or plants",
-				mode != puddlesLandOnly ? " (2 was asked: the Terrain shaders are off, so no pixel is marked as land)" : "", puddlesMinObjectSize,
+				mode != puddlesLandOnly ? " (2 was asked: the Terrain shaders are off, so no pixel is marked as land)" : "",
+				CapturedNormals::V2Compiled ? "v2" : "old", puddlesMinObjectSize,
+				CapturedNormals::V2Compiled && mode == 1 ? " (no effect with v2: every rigid object counts as ground)" : "",
 				weaponOff ? "acting" : weaponRainHandOff ? "on, waiting for the HUD raindrops" : "off", Constants.Look.w > 0.5f ? "acting" : reflectionsOwnPuddles ? "on, waiting for Reflections in rain" : "off");
 		}
 		puddleLogState = state;
@@ -165,7 +168,8 @@ static_assert(sizeof(WetWorldUniforms) == 1376, "WetWorldUniforms must match the
 
 // The push block of both passes (32 bytes): the four sampler heap indices (filled in by the extension at offsets 0, 4, 8, 12), then
 // the mode: the map pass's passIndex (0 WetMap, 1 and 2 the blurs), or the wet pass's bits (1 fast, 2 fixTrace).
-struct WetWorldPush { UInt32 samplers[4]; UInt32 mode; UInt32 pad[3]; };
+// (2026-11-16 fd-batchCG) the map passes' next word: 1 = the material buffer is in layout v2 (WetWorldMap.frag gbufferV2; the wet pass ignores it).
+struct WetWorldPush { UInt32 samplers[4]; UInt32 mode; UInt32 gbufferV2; UInt32 pad[2]; };
 
 // The registered constant the D3D9 path uploads from (ShaderManager's table; the same memory).
 static const D3DXVECTOR4* WetRegisteredConstant(const char* name) {
@@ -288,9 +292,10 @@ bool WetWorldEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	// UNOFFICIAL 2026-11-12 PuddlesLandOnly: the D3D9 pass tests TESR_MaterialBufferData itself; here the mode (y, without
 	// WeaponRainHandOff's 4) is sent as 0 while the buffer holds nothing this frame, and the depth texture stands in for it (not read).
 	IDirect3DBaseTexture9* material = CapturedNormals::MaterialTexture;
-	// UNOFFICIAL 2026-11-14 GBufferV2 (core/CapturedNormals.h): the Vulkan wet map reads the old layout only (Compute/WetWorldMap.frag; its .spv
-	// was left as it is): with v2 it gets "no buffer" too and keeps the old guess. The D3D9 pass reads v2 itself (WetWorld.fx.hlsl GBUFFER_V2).
-	if (!material || CapturedNormals::MaterialData.x < 0.5f || CapturedNormals::V2Compiled) {
+	// UNOFFICIAL 2026-11-16 fd-batchCG (DEFERRED-GAPS-AUDIT item 4): the Vulkan wet map reads GBufferV2 too (Compute/WetWorldMap.frag, told by
+	// the map passes' push word gbufferV2), as the D3D9 pass does (WetWorld.fx.hlsl GBUFFER_V2). Before, v2 sent "no buffer" here and the fork
+	// kept the old guess (puddles on people, cloth, plants) while the log said "running".
+	if (!material || CapturedNormals::MaterialData.x < 0.5f) {
 		material = depth;
 		uniforms.wetWorldLook.y = uniforms.wetWorldLook.y >= 3.5f ? 4.0f : 0.0f;
 	}
@@ -311,6 +316,7 @@ bool WetWorldEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 		}
 		WetWorldPush push = {};
 		push.mode = mode;
+		push.gbufferV2 = CapturedNormals::V2Compiled ? 1u : 0u;
 		return ExtFullScreen(Device, RenderTarget, surface, source, pass.Pipeline, resources, n, &push, sizeof(push), last);
 	};
 

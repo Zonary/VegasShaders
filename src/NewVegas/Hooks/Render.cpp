@@ -83,6 +83,9 @@ void HdrOutputNoteDesktop() { HdrOutput::NoteDesktop(); }	// UNOFFICIAL 2026-10-
 #include "../../core/ScopeCamera.h"	// UNOFFICIAL 2026-11-12 [Main.Main.Scope] Detect / OwnCamera / ...: the picture-in-picture scope's scene (ScopeScene below)
 #include "../../core/ScopeFog.h"	// UNOFFICIAL 2026-11-12 [Main.Main.Scope] PostEffects 1: distance fog on that picture
 #include "../../core/ForwardCloudShadows.h"	// UNOFFICIAL 2026-11-04 ForwardCloudShadows: the clouds' shadow in the surface shaders
+#include "../../core/BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (LOD only, per draw; fork port 2026-11-13)
+#include "../../gunfx/GunFX.h"	// 2026-11-16 (gunfx-builtin): GunFX built in: its heat, haze and smoke by direct calls
+#include "../../gunfx/GunFXHost.h"
 
 namespace RmaosDraw { static void Upload(); }	// UNOFFICIAL _rmaos maps (below)
 
@@ -1484,33 +1487,17 @@ namespace ReflectionProbe {
 	}
 }
 
-// GunFX master switches (menu Main > GunFX, all off by default): sent to GunFX.dll, which runs the effects, about five
-// times a second. Bits: 0 puff, 1 heat smoke strand, 2 ejection smoke, 3 barrel glow, 4 heat haze, 5 muzzle blast,
-// 6 energy weapons too (off = no GunFX on lasers, plasma, ...), 7 after-fire trail, 8 volumetric heat smoke/trail.
+// GunFX master switches (menu Main > GunFX, all off by default). Bits: 0 puff, 1 heat smoke strand, 2 ejection smoke, 3 barrel glow,
+// 4 heat haze, 5 muzzle blast, 6 energy weapons too (off = no GunFX on lasers, plasma, ...), 7 after-fire trail, 8 volumetric heat
+// smoke/trail. 2026-11-16 (gunfx-builtin): GunFX is built in (src/gunfx), so this is a direct call, made only when a setting changed
+// (SettingsRevision), not five times a second; GunFXHost also switches off an old GunFX.dll left in the plugins folder, once.
 namespace GunFXSwitches {
-	static void Update() {
-		static ULONGLONG last = 0;
-		const ULONGLONG now = GetTickCount64();
-		if (now - last < 200) return;
-		last = now;
-		typedef void (__cdecl* SetFn)(UInt32);
-		static SetFn set = nullptr;
-		if (!set) {
-			HMODULE gunfx = GetModuleHandleA("GunFX.dll");
-			if (gunfx) set = (SetFn)GetProcAddress(gunfx, "GunFX_SetSwitches");
-			if (!set) return;
-		}
-		static const char* const keys[] = { "Puff", "HeatSmoke", "EjectionSmoke", "BarrelGlow", "HeatHaze", "MuzzleBlast", "EnergyWeapons", "AfterFireTrail", "VolumetricSmoke" };
-		UInt32 bits = 0;
-		for (UInt32 i = 0; i < 9; ++i)
-			if (TheSettingManager->GetSettingI("Main.GunFX.Main", keys[i])) bits |= 1u << i;
-		set(bits);
-	}
+	static void Update() { GunFXHost::FrameStart(); }
 }
 
 namespace BarrelHeat {
-	typedef bool (__cdecl* GetHeatFn)(float out[10], const void* weaponNode);
-	static GetHeatFn GetHeat = nullptr;
+	typedef bool (* GetHeatFn)(float out[10], const void* weaponNode);
+	static const GetHeatFn GetHeat = &GunFX::GetHeatV3;	// (2026-11-16: built in; was GunFX.dll's GunFX_GetHeatV3)
 	static bool Active = false;
 	static bool ProbeFrame = false;
 	// UNOFFICIAL 2026-10-13 (user: the glow disappears in some lighting): the game binds an object shader once and then draws
@@ -1567,10 +1554,6 @@ namespace BarrelHeat {
 		const ULONGLONG now = GetTickCount64();
 		if (now - LastProbe < 1000) return;
 		LastProbe = now;
-		if (!GetHeat) {
-			HMODULE smoke = GetModuleHandleA("GunFX.dll");
-			if (smoke) GetHeat = (GetHeatFn)GetProcAddress(smoke, "GunFX_GetHeatV3");
-		}
 		NiNode* weapon = Player->ActorSkinInfo ? Player->ActorSkinInfo->WeaponNode : nullptr;
 		memset(ProbeHeat, 0, sizeof(ProbeHeat));
 		ProbeBridge = weapon && GetHeat && GetHeat(ProbeHeat, weapon);
@@ -1626,11 +1609,6 @@ namespace BarrelHeat {
 	static void BeginFrame() {
 		FrameHeat = 0.0f;
 		if (!Player) return;
-		if (!GetHeat) {
-			HMODULE smoke = GetModuleHandleA("GunFX.dll");
-			if (smoke) GetHeat = (GetHeatFn)GetProcAddress(smoke, "GunFX_GetHeatV3");
-			if (!GetHeat) return;
-		}
 		SkinInfo* skins[2] = { Player->firstPersonSkinInfo, Player->ActorSkinInfo };
 		for (SkinInfo* skin : skins) {
 			float state[10] = {};
@@ -1672,11 +1650,7 @@ namespace BarrelHeat {
 			NiAVObject* node = geometry;
 			for (int depth = 0; node && depth < 32; ++depth, node = node->m_parent) {
 				if (node == weaponNode) {
-					if (!GetHeat) {
-						HMODULE smoke = GetModuleHandleA("GunFX.dll");
-						if (smoke) GetHeat = (GetHeatFn)GetProcAddress(smoke, "GunFX_GetHeatV3");
-					}
-					if (GetHeat && GetHeat(state, weaponNode)) {
+					if (GetHeat(state, weaponNode)) {
 						BarrelHaze::CaptureWorld(state, firstPerson, weaponNode);
 						const char* failure = "none";
 						const bool aligned = ToGunLocal(geometry, state, failure);
@@ -3643,6 +3617,7 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 	BarrelHeat::SetForDraw(Geometry, VertexShader, PixelShader);
 	HandBlood::SetForDraw();	// UNOFFICIAL: blood on the first-person weapon and gloves
 	if (TheShaderManager->Effects.HudRaindrops) TheShaderManager->Effects.HudRaindrops->SetDrawConstants(ShaderSplit::CurrentContext == ShaderSplit::FirstPerson);	// UNOFFICIAL 2026-11-04: rain drops (Wetness Effects HudRaindrops)
+	if (TheShaderManager->Shaders.Puddles) TheShaderManager->Shaders.Puddles->SetDrawConstants(ShaderSplit::CurrentContext == ShaderSplit::FirstPerson || (Geometry && Geometry->skinInstance));	// UNOFFICIAL 2026-11-12: no standing water on the first-person model or skinned meshes (actors)
 	LampScissor::OnBind(PixelShader, ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL LampScissor
 	HiddenObjectCulling::OnBind(PixelShader);	// UNOFFICIAL HiddenObjectCulling: only lamp-only passes may be skipped
 	// UNOFFICIAL interior forward point-light shadows: the draw's lamps and their cube maps (PointShadowForward.h).
@@ -4341,6 +4316,7 @@ void __cdecl RenderPassStandardHook(void* Pass, UInt32 Arg2, UInt32 Arg3, UInt32
 	NpcCharacterMaps::ForDraw(TheRenderManager->device, (const NiAVObject*)((const PointShadowForward::RenderPassView*)Pass)->geometry, ShaderSplit::CurrentContext == ShaderSplit::World, false);	// UNOFFICIAL 2026-11-08
 	DustDraw::ForDraw(TheRenderManager->device, ShaderSplit::CurrentContext == ShaderSplit::World);	// 2026-11-04: a static mesh in the world scene takes dust
 	BarrelHeat::ForObject((const PointShadowForward::RenderPassView*)Pass);	// UNOFFICIAL GunFX barrel glow, per object
+	BendContact::ForDraw(TheRenderManager->device, ((const PointShadowForward::RenderPassView*)Pass)->geometry, ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL 2026-11-06 LodOnly
 	ForwardShadowsForPass(Pass);
 	if (LampScissor::Before((const PointShadowForward::RenderPassView*)Pass, ShaderSplit::CurrentContext == ShaderSplit::World, BarrelHeat::Active) == LampScissor::Skip) {
 		HiddenObjectCulling::Abandon();	// (a lamp-only pass is never an object's first pass in practice; if it was, its query is not used)
@@ -4444,6 +4420,7 @@ void __cdecl RenderPassSkinnedHook(void* Pass, UInt32 Arg2, UInt32 Arg3, UInt32 
 	NpcCharacterMaps::ForDraw(TheRenderManager->device, (const NiAVObject*)((const PointShadowForward::RenderPassView*)Pass)->geometry, ShaderSplit::CurrentContext == ShaderSplit::World, false);	// UNOFFICIAL 2026-11-08
 	DustDraw::ForDraw(TheRenderManager->device, false);	// 2026-11-04: skinned (people, creatures, armour, arms): no dust
 	BarrelHeat::ForObject((const PointShadowForward::RenderPassView*)Pass);	// UNOFFICIAL GunFX barrel glow, per object
+	BendContact::ForDraw(TheRenderManager->device, ((const PointShadowForward::RenderPassView*)Pass)->geometry, ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL 2026-11-06 LodOnly
 	ForwardShadowsForPass(Pass);
 	ClothWind::PassGeometry = ((const PointShadowForward::RenderPassView*)Pass)->geometry;	// UNOFFICIAL 2026-10-19 cloth: SetShadersHook notes this object
 #if NVR_TEST_TOOLS
@@ -5126,7 +5103,8 @@ void __fastcall RenderWorldSceneGraphHook(Main* This, UInt32 edx, Sun* SkySun, U
 		// UNOFFICIAL 2026-10-20 MaterialAware reflections (core/ReflMaterial.h): blended passes keep off the scene's alpha.
 		ReflMaterial::BeginWorld(TheRenderManager->renderState, TheRenderManager->device, ReflMaterial::CompiledIn() && TheSettingManager->GetSettingI("Shaders.Reflections.Main", "MaterialAware") > 0);
 		// UNOFFICIAL 2026-11-03 SmoothCutouts (core/AlphaHash.h): alpha-tested objects hashed while TAA / FSR / DLSS jitter this scene.
-		AlphaHash::BeginWorld(TheRenderManager->device, FrameWorldCalls == 1, TAA && TAA->IsJitterActive());
+		UINT ahW = 0, ahH = 0; D3DXVECTOR2 ahJitter(0.0f, 0.0f);	// (2026-11-16 HashStyle auto: an upscaler resolves this scene)
+		AlphaHash::BeginWorld(TheRenderManager->device, FrameWorldCalls == 1, TAA && TAA->IsJitterActive(), TAA ? TAA->WorldMipBias() : 0.0f, TAAEffect::WorldDrawnSmall(ahW, ahH, ahJitter));	// (2026-11-16 FarCoverage: + the mip bias)
 		RenderWorldSceneGraph(This, SkySun, IsFirstPerson, WireFrame, Arg4);
 		AlphaHash::EndWorld(TheRenderManager->device);
 		ReflMaterial::EndWorld(TheRenderManager->renderState, TheRenderManager->device);

@@ -2412,7 +2412,17 @@ namespace {
 			std::vector<double> ms(count, 0.0);	// each pipeline's own time (in its worker)
 			const bool serialEnv = getenv("NVR_RT_HELPER_SERIAL") != nullptr;
 			const unsigned cores = std::thread::hardware_concurrency();	// (0: unknown -> 1 worker)
-			const uint32_t want = std::min<uint32_t>(std::min<uint32_t>(count, (uint32_t)std::max<int>(1, (int)cores - 1)), 8u);
+			const uint32_t byCores = std::min<uint32_t>(std::min<uint32_t>(count, (uint32_t)std::max<int>(1, (int)cores - 1)), 8u);
+			// UNOFFICIAL 2026-11-16 (rt-ao-compile) and by free memory: a cold build of one big trace pipeline takes a lot of host memory in the
+			// driver (AMD iGPU, no cache: RtAOTrace 6.0 GB, RtPathTrace 4.1 GB committed), and 8 at once peaked at 12.9 GB: out of memory with
+			// the game running on a 16 GB PC. One worker per kRtBuildBudget of free physical memory over kRtBuildReserve, at least one; the
+			// cached start (every pipeline from NvrRtPipelines.cache) is quick either way.
+			const uint64_t kRtBuildBudget = 6ull << 30, kRtBuildReserve = 2ull << 30;
+			MEMORYSTATUSEX memStatus = { sizeof(memStatus) };
+			const uint64_t availPhys = GlobalMemoryStatusEx(&memStatus) ? memStatus.ullAvailPhys : 0ull;
+			const uint32_t byMemory = availPhys > kRtBuildReserve + kRtBuildBudget ? (uint32_t)std::min<uint64_t>((availPhys - kRtBuildReserve) / kRtBuildBudget, 8ull) : 1u;
+			const uint32_t want = std::max<uint32_t>(1u, std::min<uint32_t>(byCores, byMemory));
+			Log("start pipelines: %u worker(s) at most: %u by the cores, %u by free memory (%llu MB free)", want, byCores, byMemory, (unsigned long long)(availPhys >> 20));
 			uint32_t workers = 0;
 			char mode[160];
 			QueryPerformanceCounter(&wallStart);

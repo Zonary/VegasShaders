@@ -403,11 +403,14 @@ float4 Blur(VSOUT IN, uniform float2 axis) : COLOR0 {
 	float3 bounce = center.rgb * weights[0];
 	float visibility = center.a * weights[0];
 	float2 total = weights[0];	// x occlusion, y bounce
+	float tapDepth[7];	// UNOFFICIAL 2026-11-13 (GIGrassBlur) the taps' depths along the axis, [3] this texel's
+	tapDepth[3] = depth;
 	[unroll] for (int i = 1; i < 4; i++) {
 		[unroll] for (int side = -1; side <= 1; side += 2) {
 			float2 tapUV = IN.UVCoord + axis * NVR_ALLayout.zw * (i * side * BlurStep);
 			tapUV = clampToRectIfOn(tapUV, NVR_ALLayout.zw);	// UNOFFICIAL 2026-10-27 RenderScale v2: no stale texels past the drawn part
-			float dz = abs(readDepthLod(tapUV) - depth);
+			tapDepth[3 + i * side] = readDepthLod(tapUV);
+			float dz = abs(tapDepth[3 + i * side] - depth);
 			float2 w = weights[i] * saturate(1.0f - dz / float2(tolerance, looseTolerance));
 			float4 tap = tex2Dlod(NVR_ALBuffer, float4(tapUV, 0.0f, 0.0f));
 			visibility += tap.a * w.x;
@@ -415,7 +418,33 @@ float4 Blur(VSOUT IN, uniform float2 axis) : COLOR0 {
 			total += w;
 		}
 	}
-	return float4(bounce / total.y, visibility / total.x);
+	// UNOFFICIAL 2026-11-13 (rtgi-review R1) GIDenoisedNoBlur (NVR_ALGI.w 2 or 3): the bounce came through the RT denoiser (its a-trous passes test
+	// depth, normal, brightness and the game's shading): it passes through. This blur's loose depth step (25 %) and missing normal test carried it
+	// across the edges the denoiser had kept. The occlusion is blurred as before.
+	// UNOFFICIAL 2026-11-13 GIGrassBlur (NVR_ALGI.w + 4; user: GI sparkles on grass once the bounce passed through): grass and bushes are blades each at
+	// their own depth, so nothing depth-aware ever averages them (not the denoiser's a-trous, not its history, not the reuse) and every grass texel
+	// kept its own raw sample. Where the depth is busy along this axis (it bends here AND one texel either side: Apply's busy-depth rule for the
+	// occlusion; an object's single edge bends at two texels only) the loose blur is back, by how busy it is. Solid surfaces: as R1 left them.
+	float grassOn = step(3.5f, NVR_ALGI.w);
+	float noBlur = step(1.5f, NVR_ALGI.w - 4.0f * grassOn);
+	float bend = min(abs(tapDepth[2] + tapDepth[4] - 2.0f * depth), min(abs(tapDepth[1] + depth - 2.0f * tapDepth[2]), abs(depth + tapDepth[5] - 2.0f * tapDepth[4])));
+	// (second step) the busy-depth rule alone caught too little (storm weather: the old full blur halved the flicker on grass, the rule alone did not).
+	// Grass is drawn by the game's own shader, so the albedo buffer has no texel for it (alpha 0; NVR_ALFlags.z 1 = it holds this frame's; bound on
+	// s12 for the blur passes too): the share of this texel's 2 x 2 full-size pixels without one is an exact grass mask.
+	// (2026-11-15 Vegas Shaders port) the four reads only while GIGrassBlur runs on a bound albedo buffer: this blur runs for every player with
+	// Ambient light on, RT or not, and the fork read them always (x 0 after).
+	float noAlbedo = 0.0f;
+	[branch] if (grassOn * NVR_ALFlags.z > 0.5f) {
+		float2 halfPx = 0.5f * TESR_ReciprocalResolution.xy;
+		noAlbedo = step(tex2Dlod(NVR_ALAlbedo, float4(IN.UVCoord + float2(-halfPx.x, -halfPx.y), 0.0f, 0.0f)).a, 0.5f)
+			+ step(tex2Dlod(NVR_ALAlbedo, float4(IN.UVCoord + float2(halfPx.x, -halfPx.y), 0.0f, 0.0f)).a, 0.5f)
+			+ step(tex2Dlod(NVR_ALAlbedo, float4(IN.UVCoord + float2(-halfPx.x, halfPx.y), 0.0f, 0.0f)).a, 0.5f)
+			+ step(tex2Dlod(NVR_ALAlbedo, float4(IN.UVCoord + float2(halfPx.x, halfPx.y), 0.0f, 0.0f)).a, 0.5f);
+		noAlbedo *= 0.25f;
+	}
+	float busy = max(saturate(bend / depth * 40.0f - 0.1f), noAlbedo) * grassOn;
+	float3 blurred = bounce / total.y;
+	return float4(lerp(blurred, lerp(center.rgb, blurred, busy), noBlur), visibility / total.x);
 }
 
 // Pass 5 (UNOFFICIAL): this frame's blurred bounce (NVR_ALBuffer) blended into last frame's (NVR_ALHistory); see the top. The
@@ -487,7 +516,7 @@ AccumulateOut Accumulate(VSOUT IN) {
 		float3 marginC = (highC - lowC) * 0.25f;
 		bounceHistory = clamp(bounceHistory, lowC - marginC, highC + marginC);
 		// UNOFFICIAL 2026-11-11 (sungi) GISingleHistory (NVR_ALGI.w, STUDY F7): the RT denoiser's GI has its own history; keep 0 here
-		OUT.bounce = float4(lerp(current.rgb, bounceHistory, NVR_ALGI.w > 0.5f ? 0.0f : keep), viewZ);
+		OUT.bounce = float4(lerp(current.rgb, bounceHistory, frac(NVR_ALGI.w * 0.5f) > 0.25f ? 0.0f : keep), viewZ);	// (2026-11-13: w is 1 GISingleHistory + 2 GIDenoisedNoBlur)
 	}
 	return OUT;
 }

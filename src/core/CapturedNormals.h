@@ -29,6 +29,8 @@
 #include "DrawState.h"	// UNOFFICIAL 2026-10-29 SharedDrawState: the tracked state lives there
 #include "PassSums.h"
 #include "FailOnce.h"	// UNOFFICIAL 2026-11-02 RetryFailedEffects
+#include "FdTestFault.h"	// UNOFFICIAL 2026-11-16 fd-batchB (test only: DebugVar4 904 / 905, the self-check)
+#include "SettingForce.h"	// UNOFFICIAL 2026-11-16 fd-batchB: ShadowContrast refused while the deferred renderer is on (item 23)
 #include "FlashlightLamp.h"	// UNOFFICIAL 2026-11-04 the flashlight's game lamp: which objects the G-buffer holds
 #include "WaterMask.h"	// UNOFFICIAL 2026-11-12 PTGrassOwnPixel: grass without records goes into the path tracer's mask of the game's own pixels
 #include "GpuProfiler.h"	// UNOFFICIAL ShadowContrast step timer	// UNOFFICIAL 2026-10-29 lean hook: AfterStateBlock
@@ -260,6 +262,26 @@ namespace CapturedNormals {
 		}
 		return V2Compiled;
 	}
+	// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 23): ShadowContrast's game-pass route (ContrastStrength above) needs the
+	// DIFFUSE lamp passes to add their lost light into MaterialBuffer's alpha. With the deferred renderer on ([Main.Main.Quality]
+	// DeferredRenderer 1 or 2 at startup) those passes are skipped for every deferred object, and its G-buffer layout v2 (forced on by it)
+	// keeps the shading normal's y in that alpha: the passes still drawn would bend the normal and ApplyContrast would darken by a normal.
+	// Refused while either holds (a startup state, so it does not come and go with DeferredRendererLive), with one log line. The
+	// in-shader half (TESR_ShadowContrast in the one-pass lamp shader, effects/PBR/PBR.cpp) is not touched here: it darkens only the
+	// draws still lit forward, each by its own shadows. Off (ShadowContrast 0, the default): nothing changes.
+	inline bool ContrastLive() {
+		if (ContrastStrength <= 0.0f) return false;
+		const int mode = SettingForce::Mode();
+		if (mode < 1 && !V2Compiled) return true;
+		static bool told = false;
+		if (!told) {
+			told = true;
+			Logger::Log("[WARNING] UNOFFICIAL ShadowContrast ([Shaders.ShadowsInteriors.Forward] ShadowContrast %.2f): refused while %s: its game-pass step needs the lamp passes the "
+				"deferred renderer skips, and writes the alpha that holds the G-buffer's shading normal there. The rest of the look is unchanged (logged once)",
+				ContrastStrength, mode >= 1 ? "the deferred renderer is on (DeferredRenderer 1 or 2)" : "the G-buffer layout v2 is on (GBufferV2)");
+		}
+		return false;
+	}
 	// A MaterialBuffer texel, either layout: written, and its class / shading model (0-15).
 	inline bool MaterialWritten(const float* v) { return V2Compiled ? v[0] > 0.5f : v[3] > 0.5f; }
 	inline int MaterialClass(const float* v) { int c = (int)floorf(v[0] + 0.004f); if (V2Compiled && c >= 16) c -= 16; return c; }
@@ -466,15 +488,27 @@ namespace CapturedNormals {
 	// driver silently dropped that draw: the buffers stopped updating and every effect read stale data). On a few frames (the 60th, 300th
 	// and 1200th captured frame, then every 18,000th) the target is read back, shrunk to 64 x 64 texels: right after the clear it must hold
 	// no written texel (the clear really happened), after the list at least one (the draws really wrote it) when templates drew. A
-	// failure switches the capture off for the session (logged): the readers keep the depth-rebuilt normal. A read-back waits for the GPU
-	// once, on those frames only. One failure switches it off (a dropped draw also drops the scene there: no waiting).
+	// failure switched the capture off for the session (logged): the readers keep the depth-rebuilt normal. A read-back waits for the GPU
+	// once, on those frames only. (Before 2026-11-16 one failure did it at once; now three in a row do, see below.)
+	// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 8): one WRONG check switched the capture off for the session, and with it the
+	// deferred renderer, whatever the frame held (the after-list count takes record codes only: a frame of nothing the check can count reads
+	// as "not written"). Now a WRONG check is checked again kRecheckFrames later; kStrikes WRONG in a row (each half counted apart, a right
+	// one starts it over) is a broken target: off as before, but through a FailOnce latch (CheckFail): tried again after the next cell change
+	// with a check soon after, 3 tries in all ([Main.Main.Misc] RetryFailedEffects false: off for the session, as before). A target the driver
+	// really drops fails every check, so it is still switched off within kStrikes x kRecheckFrames frames.
 	inline IDirect3DSurface9* CheckTarget = nullptr;  inline IDirect3DSurface9* CheckCopy = nullptr;
 	inline UInt32 LiveFrames = 0, CheckFailures = 0;
 	inline bool CheckThisFrame = false, CheckReported = false;
+	constexpr int kStrikes = 3;
+	constexpr UInt32 kRecheckFrames = 30;
+	inline int ClearStrikes = 0, ListStrikes = 0;	// WRONG in a row, per half
+	inline UInt32 RecheckAt = 0;					// a LiveFrames to check again on (0 none)
+	inline FailOnce::Latch CheckFail{ "CapturedNormals self-check" };
 
-	inline bool IsCheckFrame(UInt32 f) { return f == 60 || f == 300 || f == 1200 || (f > 1200 && f % 18000 == 0); }
+	inline bool IsCheckFrame(UInt32 f) { return f == 60 || f == 300 || f == 1200 || (f > 1200 && f % 18000 == 0) || (RecheckAt && f == RecheckAt); }
 
-	// Texels written (alpha 1) in a 64 x 64 point-sampled copy of the target; -1 if it could not be read.
+	// Texels written by a record (alpha 1 .. 2: the world's and the actors' / gear's codes) in a 64 x 64 point-sampled copy of the target;
+	// -1 if it could not be read.
 	inline int CountWritten(IDirect3DDevice9* d) {
 		if (!CheckTarget && (FAILED(d->CreateRenderTarget(64, 64, D3DFMT_A16B16G16R16F, D3DMULTISAMPLE_NONE, 0, FALSE, &CheckTarget, NULL)) ||
 			FAILED(d->CreateOffscreenPlainSurface(64, 64, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM, &CheckCopy, NULL)))) {
@@ -487,18 +521,43 @@ namespace CapturedNormals {
 		int written = 0;
 		for (int y = 0; y < 64; y++) {
 			const UInt16* row = (const UInt16*)((const char*)r.pBits + y * r.Pitch);
-			for (int x = 0; x < 64; x++) if (row[x * 4 + 3] == 0x3C00) written++;	// alpha exactly 1.0 (half float)
+			// a world record's code: 1.0, or (2026-11-16 fd-gaps) 1 + q / 1024 up to 1.468 where a GBufferV2 lighting-free record packs fd-sunvis's
+			// sun share and F0 into the fraction (Includes/DeferredPixel.hlsl FDSunVisCode): half floats 1.0 <= a < 1.5. Counting only exact 1.0
+			// read every such record as unwritten and switched CapturedNormals (and so the deferred renderer) off for the session.
+			// (2026-11-16 fd-batchB) and the actors' / gear's code, 2.0 or 2 - q / 1024 down to 1.53 (FDSunVisCode again): 1.5 <= a <= 2.0, so a
+			// frame that shows only the player's or an NPC's gear is not read as "not written". Half floats 1.0 .. 2.0 = 0x3C00 .. 0x4000.
+			for (int x = 0; x < 64; x++) { const UInt16 a = row[x * 4 + 3]; if (a >= 0x3C00 && a <= 0x4000) written++; }
 		}
 		CheckCopy->UnlockRect();
 		return written;
 	}
 
-	inline void CheckResult(bool ok, const char* what, int count) {
-		Logger::Log("CapturedNormals: self-check at captured frame %u, %s: %d of 4096 texels written -> %s", LiveFrames, what, count, ok ? "ok" : "WRONG");
-		if (ok) return;
+	// afterList: the second half (templates drew, so something must be written), else the first (the clear must have emptied it)
+	inline void CheckResult(bool ok, const char* what, int count, bool afterList) {
+		// (2026-11-16 fd-batchB, test only) DebugVar4 904: this after-list check reads WRONG once; 905: every one while it stays set
+		if (afterList && ok && (FdTestFault::Broken || FdTestFault::Take(904))) {
+			Logger::Log("CapturedNormals: self-check at captured frame %u, %s: %d of 4096 texels written, read as WRONG by test fault %d (DebugVar4)", LiveFrames, what, count, FdTestFault::Broken ? 905 : 904);
+			ok = false;
+		}
+		else Logger::Log("CapturedNormals: self-check at captured frame %u, %s: %d of 4096 texels written -> %s", LiveFrames, what, count, ok ? "ok" : "WRONG");
+		int& strikes = afterList ? ListStrikes : ClearStrikes;
+		if (ok) {
+			if (strikes) Logger::Log("CapturedNormals: self-check %s right again after %d WRONG: the capture stays on", what, strikes);
+			strikes = 0;
+			if (!ClearStrikes && !ListStrikes) RecheckAt = 0;
+			return;
+		}
 		CheckFailures++;
-		Logger::Log("[WARNING] CapturedNormals: the normal target does not update (the driver drops the draws or the clear?): off for the session; the effects keep the depth-rebuilt normals");
+		if (++strikes < kStrikes) {
+			RecheckAt = LiveFrames + kRecheckFrames;
+			Logger::Log("[WARNING] CapturedNormals: self-check %s WRONG (%d in a row): checked again at captured frame %u; %d in a row switch the capture off", what, strikes, RecheckAt, kStrikes);
+			return;
+		}
+		Logger::Log("[WARNING] CapturedNormals: the normal target does not update (the driver drops the draws or the clear?): %d self-checks %s in a row read WRONG; the effects keep the depth-rebuilt normals", strikes, what);
+		ClearStrikes = ListStrikes = 0;
+		RecheckAt = 0;
 		Failed = true;
+		CheckFail.Set(afterList ? "the target holds nothing after the main list (3 checks in a row)" : "the target is not cleared (3 checks in a row)");
 	}
 
 	// 64 x 64 point copy of a target as floats (4096 x 4); false if it could not be read (CheckTarget is CountWritten's).
@@ -1186,7 +1245,7 @@ namespace CapturedNormals {
 			if ((coverage || v2Mark) && !foliage) CoverageBegin(d);
 			if (write && blend && BlendedAlphaOn) BlendedAlphaBegin(d, mask, coverage || foliage || (v2Mark && !LastCodeWriter));
 			// added (ONE / ONE): the alpha adds up across the lamp passes; any other added blend would scale it, so it is left out (counted)
-			if (!write && LastContrastWriter && ContrastStrength > 0.0f && (mask & 7) && blend && dst == D3DBLEND_ONE) {
+			if (!write && LastContrastWriter && ContrastLive() && (mask & 7) && blend && dst == D3DBLEND_ONE) {	// (2026-11-16 ContrastLive: item 23)
 				if (src == D3DBLEND_ONE) contrast = true; else ContrastOtherBlend++;
 			}
 		}
@@ -1513,7 +1572,16 @@ namespace CapturedNormals {
 				GrassState = state;
 			}
 		}
-		if (Failed && MakeFail.failed && !MakeFail.Blocked()) { Failed = false; Recreations = 0; RecreationsSince = LiveFrames; }	// UNOFFICIAL 2026-11-02 RetryFailedEffects (not after the self-check)
+		// UNOFFICIAL 2026-11-02 RetryFailedEffects (2026-11-16 fd-batchB: the self-check's latch too, with a check soon after the retry). Each
+		// latch decides for itself (no short cut: a released one is cleared even while the other still holds).
+		if (Failed && (MakeFail.failed || CheckFail.failed)) {
+			const bool fromCheck = CheckFail.failed;
+			const bool makeHeld = MakeFail.failed && MakeFail.Blocked(), checkHeld = CheckFail.failed && CheckFail.Blocked();
+			if (!makeHeld && !checkHeld) {
+				Failed = false; Recreations = 0; RecreationsSince = LiveFrames;
+				if (fromCheck) { ClearStrikes = ListStrikes = 0; RecheckAt = LiveFrames + 2 * kRecheckFrames; }
+			}
+		}
 		Live = CompiledIn() && !Failed && wanted;
 		if (Live && !Hooked) {
 			Hook(d);
@@ -1602,7 +1670,7 @@ namespace CapturedNormals {
 			if (MsaaSurface) d->StretchRect(MsaaSurface, NULL, TextureSurface, NULL, D3DTEXF_NONE);
 			const int n = CountWritten(d);
 			if (n < 0) { CheckThisFrame = false; if (!CheckReported) { CheckReported = true; Logger::Log("CapturedNormals: self-check could not read the target back (skipped)"); } }
-			else CheckResult(n == 0, "after the clear", n);
+			else CheckResult(n == 0, "after the clear", n, false);
 			if (Failed) { SpanTarget = nullptr; rt0->Release(); return; }
 		}
 		InSpan = true;
@@ -1623,7 +1691,7 @@ namespace CapturedNormals {
 		if (MsaaSurface) d->StretchRect(MsaaSurface, NULL, TextureSurface, NULL, D3DTEXF_NONE);	// the game's MSAA: resolved for the readers
 		if (MaterialMsaa && MaterialSurface) d->StretchRect(MaterialMsaa, NULL, MaterialSurface, NULL, D3DTEXF_NONE);	// UNOFFICIAL MaterialBuffer
 		if (AlbedoMsaa && AlbedoSurface) d->StretchRect(AlbedoMsaa, NULL, AlbedoSurface, NULL, D3DTEXF_NONE);	// UNOFFICIAL 2026-10-31 AlbedoBuffer
-		if (ContrastDrawn && ContrastStrength > 0.0f) ApplyContrast(d, SpanTarget);	// UNOFFICIAL ShadowContrast (the game's lamp passes)
+		if (ContrastDrawn && ContrastLive()) ApplyContrast(d, SpanTarget);	// UNOFFICIAL ShadowContrast (the game's lamp passes; 2026-11-16 ContrastLive: item 23)
 		ContrastDrawn = false;
 		if (MaterialDrawn && !Failed && Drawn) SkinFill(d);	// UNOFFICIAL 2026-10-31 MaterialBufferSkin (after the contrast step: it reads the alpha)
 		if (AlbedoDrawn && !Failed && Drawn) SkinAlbedoFill(d);	// UNOFFICIAL 2026-10-31 AlbedoBuffer: the skin's albedo from the skin blur's target
@@ -1637,7 +1705,7 @@ namespace CapturedNormals {
 		AlbedoData.x = AlbedoDrawn && !Failed ? 1.0f : 0.0f;	// UNOFFICIAL 2026-10-31 AlbedoBuffer
 		if (CheckThisFrame && Drawn) {	// the self-check's second half: templates drew, so something must be written
 			const int n = CountWritten(d);
-			if (n >= 0) CheckResult(n > 0, "after the main list", n);
+			if (n >= 0) CheckResult(n > 0, "after the main list", n, true);
 			// UNOFFICIAL 2026-10-29 MaterialBuffer: what it holds on these frames too (64 x 64 point copy): written texels by class, and the
 			// thickness / roughness ranges seen (a log line only; nothing is switched off by it)
 			D3DLOCKED_RECT r = {};
@@ -1668,6 +1736,7 @@ namespace CapturedNormals {
 			}
 			if (AlbedoDrawn && AlbedoSurface && CheckTarget) AlbedoCheck(d);	// UNOFFICIAL 2026-10-31 AlbedoBuffer
 		}
+		if (CheckThisFrame && !Drawn && ListStrikes) RecheckAt = LiveFrames + kRecheckFrames;	// (2026-11-16 a recheck with no template draw: again later)
 		CheckThisFrame = false;
 		Data.x = Drawn && !Failed ? 1.0f : 0.0f;
 	}

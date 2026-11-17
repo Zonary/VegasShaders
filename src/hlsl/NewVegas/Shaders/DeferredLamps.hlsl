@@ -94,6 +94,9 @@ float4 DL_Shadow : register(c10);	// x the shadow pass's first lamp of the list 
 								// z PrecisionBias x 0.001 (2026-11-01: the shadow lookup's push off the surface per unit of camera distance),
 								// w 1 = this frame's exact linear view z is on s7 (2026-11-14 DL_LINEAR_DEPTH, below)
 float4 DL_Depth  : register(c11);	// (lighting pass) x, y the projection's _33, _43 (depth = x + y / view z), z the share and w the units the surface is pulled nearer
+#if (defined(DL_LAND_SPLIT) && DL_LAND_SPLIT) || defined(DL_LAND_ONLY)
+float4 DL_Land   : register(c14);	// UNOFFICIAL 2026-11-16 fd-batchA (DLLampLand): x 1 = the land loop on, y UsePBR, z the land's metal, w its light scale (decoded)
+#endif
 
 #define LIGHT_COMMON_ROWS DL_Table.x
 #include "includes/LightCommon.hlsl"
@@ -153,6 +156,21 @@ float3 DLLampDiffuse(float3 toLamp, float att, float3 color, float3 V, float3 N,
     return LampAtt(att) * MICRO_SHADOW(N, toLamp) PBRDiffuse(metal, rough, graded, N, V, toLamp, scaled);
 }
 
+#if (defined(DL_LAND_SPLIT) && DL_LAND_SPLIT) || defined(DL_LAND_ONLY)
+// UNOFFICIAL 2026-11-16 fd-batchA item 3 (docs/next/FD-BATCH-A.md; the owner: restore the forward ground look): a land pixel's lamp as the forward
+// land shader lit it (Includes/Terrain.hlsl getPointLightLighting, TerrainTemplate.hlsl's lamp loop; keep in step): the falloff LampAttOther (att
+// as it is at defaults, not the objects' LinFalloff: the wider pool), UsePBR: PBR with the land's metal (TerrainData.x), the roughness it wrote
+// ((1 - gloss) x RoughnessScale) and its light scale (TerrainData.z), the colour NOT graded (the forward land's lamps took the plain base colour;
+// only its sun takes Saturation), no MICRO_SHADOW, no energy keep (the land never took either); UsePBR off: the game's Lambert (its Blinn
+// highlight needs the layers' gloss power, which the G-buffer lacks; DeferredSun.hlsl LandSun does the same). The roughness: b as written; none
+// (the far land's -1) fully rough, as DeferredSun's DSRoughness.
+float3 DLLampLand(float3 toLamp, float att, float3 color, float3 V, float3 N, float3 albedo, float rough, float metal) {
+    const float3 radiance = color * LampAttOther(att);
+    [branch] if (DL_Land.y > 0.5f) return max(0.0f, PBR(DL_Land.z, rough < 0.0f ? 1.0f : rough, albedo, N, V, toLamp, radiance * DL_Land.w));
+    return albedo * shades(N, normalize(toLamp)) * radiance;
+}
+#endif
+
 #if FD_SKIN
 // UNOFFICIAL 2026-11-15 DeferredSkin: SkinTemplate.hlsl's SkinLamp on a deferred skin pixel: SkinLight with the lamp's decoded colour x the skin's
 // falloff (LampAttOther, not the objects' LampAtt), unshadowed (the loop multiplies the lamp's shadow after, as SkinLamp does), + its highlight.
@@ -189,7 +207,11 @@ void DLPixel(PS_IN IN, float4 uv4, out float3 ray, out float3 position, out floa
     // (about 1 / 2000 of it), which TAA's jitter rounds differently every frame, so a lamp right on a surface flipped between lit and shadowed.
     // The position is pushed off the surface by that much once here (outside the lamp loop: no temp registers left in it); the light's falloff
     // moves by the same fraction of a unit. Forward shaders have the exact position.
-    position += ShadowDecodeNormal(stored.rg) * (stored.b * DL_Shadow.z);
+    // (2026-11-17 fd-directlight, docs/next/FD-DIRECTLIGHT.md item 3) not a fraction of a unit since PrecisionBias went to 4 (0.4 % of the
+    // camera distance): 4 units on a wall 1,000 units away. The lighting pass's lamps undo it (DL_LIT_VECTOR, the lamp loop below).
+    // (2026-11-16 fd-roofedge, docs/next/FD-ROOFEDGE.md) the view-faced normal, as before: the object and parallax records now store the smooth
+    // normal faced by the triangle's side; the shadow pushes keep forward's (ShadowFacingNormal, idempotent on every other record's normal)
+    position += ShadowFacingNormal(ShadowDecodeNormal(stored.rg), position) * (stored.b * DL_Shadow.z);
     const float viewZ = dot(position, DL_Fwd.xyz);
     const float2 tile = min(floor(saturate(local) * DL_Debug.zw), DL_Grid.xy - 1.0f);	// (2026-11-15: never past the grid; the tile size keeps it inside)
     const float slice = viewZ < 64.0f ? 0.0f : min(7.0f, floor(log2(viewZ)) - 5.0f);
@@ -242,7 +264,7 @@ float DLShadow(float i, float3 position, float att, float4 uv4) {
     [branch] if (sTile.z > 0.0f) {
 #endif
         const float4 sLight = tex2Dlod(NVR_LampTable, float4(x + 1.0f / LIGHT_COMMON_TEXELS, tileY, 0.0f, 0.0f));
-        shadow = PointShadowCube(sTile, sLight, sTile.w, position, ShadowDecodeNormal(tex2Dlod(DL_Normals, uv4).rg), att POINT_SHADOW_RT_ARG(rtId));
+        shadow = PointShadowCube(sTile, sLight, sTile.w, position, ShadowFacingNormal(ShadowDecodeNormal(tex2Dlod(DL_Normals, uv4).rg), position), att POINT_SHADOW_RT_ARG(rtId));	// (fd-roofedge: view-faced, above)
     }
     return shadow;
 }
@@ -320,14 +342,37 @@ float4 main(PS_IN IN, out float depth : DEPTH DL_SKIN_SPEC_OUT) : COLOR0 {
     #endif
     }
 #endif
+#if (defined(DL_LAND_SPLIT) && DL_LAND_SPLIT) || defined(DL_LAND_ONLY)
+    // UNOFFICIAL 2026-11-16 fd-batchA item 3 (DLLampLand): while the land pass runs (DL_Land.x 1: LandLampModel and the pass loaded), the land's
+    // pixels (class 4 + the specular bit, 20; the far land writes it too) are lit by it (DL_LAND_ONLY, drawn right after this one with the same
+    // state: core/DeferredLamps.h Apply), every other pixel by this one. DL_Land.x 0: this pass lights the land as before.
+    {
+        const bool dlLand = DL_Land.x > 0.5f && abs(floor(material0.r + 0.01f) - 20.0f) < 0.5f;
+    #ifdef DL_LAND_ONLY
+        clip(dlLand ? 1.0f : -1.0f);
+    #else
+        clip(dlLand ? -1.0f : 1.0f);
+    #endif
+    }
+#endif
     const float keep = DL_KEEP(uv4);	// 1 - fog: the share of added light the draw's fog lets through
     clip(keep - 1.0e-4f);
 
     float3 ray, position; float base, count;
     DLPixel(IN, uv4, ray, position, base, count);
-    SetDiffuseEnergyKeep(DL_NORMAL(material0, uv4), -ray, material0.b);
+    SetDiffuseEnergyKeep(DL_NORMAL(material0, uv4), -ray, GBufferRoughness(material0.b));	// (2026-11-16 fd-sunvis: the deferred passes' one roughness decode, Includes/Object.hlsl)
 
     float3 light = 0.0f;
+    // UNOFFICIAL 2026-11-17 fd-directlight (docs/next/FD-DIRECTLIGHT.md item 3): DLPixel's position is pushed off the surface for the shadow
+    // lookups (PrecisionBias, 0.4 % of the camera distance by default), and every lamp used to light that pushed point: on a wall 1,000 units
+    // away, a point 4 units off it, so a lamp standing a few units off the wall lit it at a grazing angle from 4 units nearer the lamp's plane
+    // (Vault 21's uplit wall panel took about 0.6 of forward's lamp light; forward lights the exact surface). The light's direction is taken
+    // from the surface again: the push added back along the shading normal N, faced to the camera (the push went along the smooth normal so
+    // faced; where a normal map tilts N by a, N.L is then off by the push x (1 - cos a), second order). The falloff keeps the pushed point's
+    // (its change is the push's share of the lamp's distance, along the normal: small for the grazing lamps the direction mattered for).
+    // Exact (the smooth normal decoded again per lamp, or the unpushed position kept through the loop) does not fit the pass's temp registers:
+    // X4505 in every variant tried offline (2026-11-17, template_compile, fork and native); this form adds 9 slots and compiles as before.
+    #define DL_LIT_VECTOR(toLamp, N) ((toLamp) + (N) * ((dot((N), ray) > 0.0f ? -DL_Shadow.z : DL_Shadow.z) * dot(position, ray)))
     #define DL_LAMP_LOOP(LIGHT_FN) \
     [loop] for (int k = 0; k < 63; k++) { \
         [branch] if ((float)k >= count) break; \
@@ -345,8 +390,8 @@ float4 main(PS_IN IN, out float depth : DEPTH DL_SKIN_SPEC_OUT) : COLOR0 {
             [branch] if (shadow > 0.0f) { \
                 const float4 m = tex2Dlod(DL_Material, uv4); \
                 const float3 N = DL_NORMAL(m, uv4); \
-                const float3 lit = DL_Debug.x > 0.5f && DL_Debug.x < 1.5f ? color * LampAtt(att) : LIGHT_FN(toLamp, att, color, -ray, N, \
-                    tex2Dlod(DL_Albedo, uv4).rgb, m.b, saturate((m.r - floor(m.r)) / 0.49f)); \
+                const float3 lit = DL_Debug.x > 0.5f && DL_Debug.x < 1.5f ? color * LampAtt(att) : LIGHT_FN(DL_LIT_VECTOR(toLamp, N), att, color, -ray, N, \
+                    tex2Dlod(DL_Albedo, uv4).rgb, GBufferRoughness(m.b), saturate((m.r - floor(m.r)) / 0.49f)); \
                 light += lit * shadow; \
             } \
         } \
@@ -360,6 +405,9 @@ float4 main(PS_IN IN, out float depth : DEPTH DL_SKIN_SPEC_OUT) : COLOR0 {
     { DL_LAMP_LOOP(DLLampSkinSpecular) }
     DL_SKIN_SPEC_SET(float4(light, 1.0f));	// (SSS v2: the highlights alone, before the diffuse half joins them)
     { DL_LAMP_LOOP(DLLampSkinDiffuse) }
+    #elif defined(DL_LAND_ONLY)	// UNOFFICIAL 2026-11-16 fd-batchA item 3: the land pass (its own record, as the skin pass: a third loop, X4505)
+    PBRDiffuseKeep = 1.0f;	// (the land never took the diffuse energy keep)
+    { DL_LAMP_LOOP(DLLampLand) }
     #else
     [branch] if (floor(material0.r + 0.01f) < 15.5f) { DL_LAMP_LOOP(DLLampDiffuse) }
     else { DL_LAMP_LOOP(getPointLightLightingAtt) }
@@ -368,6 +416,7 @@ float4 main(PS_IN IN, out float depth : DEPTH DL_SKIN_SPEC_OUT) : COLOR0 {
     DL_LAMP_LOOP(getPointLightLightingAtt)
 #endif
     #undef DL_LAMP_LOOP
+    #undef DL_LIT_VECTOR
     // the inputs as the pass sees them (written over the frame, blend off: DeferredLamps::Apply)
     // (2026-11-03 rtspec) DebugView 7: the lamps' light ALONE over the frame (the game's ambient, emittance and other light left out), in the
     // frame's encoding: the direct lamp light to set beside the reference path tracer's PTDebugView 3 (with PTReplace: the same post chain)

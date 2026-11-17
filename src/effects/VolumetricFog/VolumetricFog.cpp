@@ -112,6 +112,20 @@ void VolumetricFogEffect::UpdateConstants() {
 	// with it (TESR_FogData.x holds 0.17 x far when the weather's near is negative, as most clear ones are: -10).
 	ApplyLayer();	// UNOFFICIAL 2026-11-01 HeightLayer: every frame (the camera moves)
 
+	// UNOFFICIAL 2026-11-13 (modern lighting) FoggyWeatherImpact: one WeatherImpact for every weather either veils the clear days
+	// (a weather's fog far of 45000 with a power of 0.6 already greys trees at 50 m) or strips the foggy ones. The share follows
+	// the weather's own fog distance instead (Sky::fogFarPlane, the game's blend of the day / night and old / new weather values):
+	// WeatherImpact at ClearWeatherFar and beyond, FoggyWeatherImpact at FoggyWeatherFar and nearer, eased between on the distance's
+	// logarithm. Off (FoggyWeatherImpact < 0) and indoors: WeatherImpact as set.
+	if (TheShaderManager->GameState.isExterior && foggyImpact >= 0.0f && Tes->sky) {
+		const float far_ = (std::max)(Tes->sky->fogFarPlane, 1.0f);
+		float t = (logf(clearFar) - logf(far_)) / (logf(clearFar) - logf(foggyFar));
+		t = std::clamp(t, 0.0f, 1.0f);
+		t = t * t * (3.0f - 2.0f * t);
+		Constants.Density.y = weatherImpactSet + (foggyImpact - weatherImpactSet) * t;
+	}
+	else Constants.Density.y = weatherImpactSet;
+
 	// UNOFFICIAL 2026-11-15 FogWall ([Shaders.VolumetricFog.Interiors] GameFogFloor, read by UpdateSettings; docs/next/FOG-WALL.md):
 	// indoors the camera's far plane is the cell's clip distance (nothing is drawn past it: those pixels keep the cleared background),
 	// and the game's own fog, which the cell's lighting makes full by its fog far (at or before the clip in vanilla cells), hid the cut.
@@ -207,7 +221,11 @@ void VolumetricFogEffect::UpdateSettings(){
 	Constants.Weather.w = F("FogSaturation");
 
 	Constants.Density.x = F("BaseDensity");
-	Constants.Density.y = F("WeatherImpact");
+	Constants.Density.y = weatherImpactSet = F("WeatherImpact");
+	// UNOFFICIAL 2026-11-13 (modern lighting): the foggy weather's share (Main only: outdoors), see UpdateConstants
+	foggyImpact = TheSettingManager->GetSettingF("Shaders.VolumetricFog.Main", "FoggyWeatherImpact");
+	foggyFar = (std::max)(TheSettingManager->GetSettingF("Shaders.VolumetricFog.Main", "FoggyWeatherFar"), 100.0f);
+	clearFar = (std::max)(TheSettingManager->GetSettingF("Shaders.VolumetricFog.Main", "ClearWeatherFar"), foggyFar + 100.0f);
 
 	Constants.Shape.x = shapeFalloff = F("HeightFalloff");
 	Constants.Shape.y = shapeMaxHeight = F("MaxHeight");

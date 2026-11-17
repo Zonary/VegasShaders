@@ -8,6 +8,7 @@
 #include "../../core/ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion (Accumulate's motion input)
 #include "../../core/RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
 #include "../../core/RtAmbient.h"	// UNOFFICIAL 2026-10-28 (fork RT) [Shaders.AmbientOcclusion.RT]
+#include "../../core/GrassMaskedAlbedo.h"	// UNOFFICIAL 2026-11-15 GIGrassBlur's grass mask from the MaterialBuffer's grass mark
 #include "../../core/MixCheck.h"	// UNOFFICIAL 2026-10-30 NvrDxvkMixCheck
 #include "../../core/Upscaler.h"	// UNOFFICIAL 2026-10-30 DLSS RR (RayReconstructionWantsRaw: the RT estimate's blurs and history are skipped)
 #include "../../core/CapturedNormals.h"	// UNOFFICIAL 2026-10-31 AlbedoBuffer (TESR_AlbedoBuffer: the bounce's surface colour)
@@ -69,6 +70,7 @@ void AmbientLightEffect::UpdateSettings() {
 		SettingManager::Configuration::ConfigNode node;
 		exteriorBalance = !TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "ExteriorBalance") || node.BoolValue;
 		giSingleHistory = !TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "GISingleHistory") || node.BoolValue;
+		giGrassBlur = !TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "GIGrassBlur") || node.BoolValue;	// UNOFFICIAL 2026-11-13 (GI sparkles on grass)
 		// UNOFFICIAL 2026-11-11 (sungi p2) AmbientReplace / AmbientFloor (missing key, an older toml: 0 / 0.15)
 		ambientReplace = TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "AmbientReplace") ? std::clamp(node.FloatValue, 0.0f, 1.0f) : 0.0f;
 		ambientFloor = TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "AmbientFloor") ? std::clamp(node.FloatValue, 0.0f, 1.0f) : 0.15f;
@@ -1311,7 +1313,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 	if (giHandle) {
 		// w: UNOFFICIAL 2026-11-11 (sungi) GISingleHistory: the RT denoiser's GI (it keeps its own history): Accumulate keeps no bounce history
 		D3DXVECTOR4 giFlags(giD3D9Texture ? 1.0f : 0.0f, giD3D9Texture && giTest != 1 ? 1.0f : 0.0f, 0.0f,
-			giD3D9Texture && giSingleHistory && giD3D9Texture != rtGI ? 1.0f : 0.0f);	// z: set for Apply (below)
+			(giD3D9Texture && giSingleHistory && giD3D9Texture != rtGI ? 1.0f : 0.0f) + (giD3D9Texture && giD3D9Texture != rtGI ? 2.0f + (giGrassBlur ? 4.0f : 0.0f) : 0.0f));	/* + 4: 2026-11-13 GIGrassBlur */	// z: set for Apply (below); w: + 2 = UNOFFICIAL 2026-11-13 (rtgi-review R1) GIDenoisedNoBlur: Blur passes the denoised bounce through
 		Effect->SetVector(giHandle, &giFlags);
 	}
 	Effect->SetTechnique(technique);
@@ -1409,6 +1411,10 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 	const bool albedoOn = albedoBuffer && CapturedNormals::AlbedoData.x > 0.5f && CapturedNormals::AlbedoTexture != nullptr;
 	// UNOFFICIAL 2026-11-15 DeferredALAlbedo (core/FdIndirect.h): made here, before any pass begins; AlbedoTexture itself while off
 	IDirect3DBaseTexture9* const albedoTexture = albedoOn ? FdIndirect::ALAlbedo(Device) : nullptr;
+	// UNOFFICIAL 2026-11-15 GIGrassBlur's mask (the blur passes read only its alpha): alpha 0 where there is no albedo record (the fork's test) OR the
+	// MaterialBuffer carries the grass mark (our CapturedGrass writes grass records whenever RT GI runs; core/GrassMaskedAlbedo.h). Made here, before
+	// any pass begins, and only while GIGrassBlur can use it.
+	IDirect3DBaseTexture9* const grassMaskTexture = albedoOn && giGrassBlur && giD3D9Texture && giD3D9Texture != rtGI ? GrassMaskedAlbedo::Get(Device) : nullptr;	// (test-after-110: only while the blur passes read the mask, the denoised RT GI's + 4 flag below; was every frame with AlbedoBuffer on, RT GI or not: a full-screen copy for nothing)
 	if (albedoOn && !albedoLogged) { albedoLogged = true; Logger::Log("UNOFFICIAL AmbientLight: AlbedoBuffer on: the bounce takes the surfaces' own colour from TESR_AlbedoBuffer where written (elsewhere, grass for one, the guessed colour capped at %.2f: AlbedoFallbackCap); the balance and Apply passes run as D3D9 passes", albedoFallbackCap > 0.0f ? albedoFallbackCap : 0.6f); }
 	if (flagsHandle) {
 		D3DXVECTOR4 flags(shadow ? 1.0f : 0.0f, noEdgeOutline ? 1.0f : 0.0f, albedoOn ? 1.0f : 0.0f, edgeReject ? 1.0f : 0.0f);
@@ -1480,6 +1486,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 	// UNOFFICIAL 2026-11-11 (sungi) GISingleHistory (STUDY F7): set when this frame's RT GI came through the RT denoiser (its own 16-frame
 	// history): the GI accumulate then keeps no bounce history of its own (the occlusion's stays).
 	bool giDenoised = false;
+	bool giNoBlur = false;	// UNOFFICIAL 2026-11-13 (rtgi-review R1) GIDenoisedNoBlur: the blur passes leave the RT-denoised bounce as it is
 	// UNOFFICIAL 2026-11-03 (RT AO at RenderScale < 1; docs/next/RT-RENDERSCALE.md, phase 1) the RT estimate below as one helper: the Vulkan
 	// passes' Estimate (ExtOn) and, in rect frames, the one Vulkan pass inside the rect-aware D3D9 passes (ExtOnRect). True: drawn.
 	auto estimateRT = [&](IDirect3DSurface9* const* targets) -> bool {
@@ -1500,6 +1507,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 			drawn = ExtDraw(ExtEstimateRT, targets, 1, rtTextures, (UINT)RtAmbient::Current.DebugView | (rtGI ? 0x100u : 0u), reduced);
 			if (drawn && rtGI) giDrawn = true;	// ComputeGI's accumulate and apply take the bounce light from here
 			giDenoised = drawn && rtGIClean && giSingleHistory;	// UNOFFICIAL 2026-11-11 (sungi) GISingleHistory
+			giNoBlur = drawn && rtGIClean;	// UNOFFICIAL 2026-11-13 (rtgi-review R1)
 			// UNOFFICIAL 2026-10-30 DLSS RR (rrRaw above): Accumulate's history share 0 from here on (Estimate has read
 			// NVR_ALTemporal already; the passes after it read only .x's share from it, and .y / .z stay)
 			if (drawn && Upscaler::RayReconstructionWantsRaw()) {
@@ -1610,7 +1618,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 				}
 				else if (p == 2 || p == 3) {
 					IDirect3DBaseTexture9* textures[] = { depth, bufferTexture[p == 2 ? 0 : 1] };
-					drawn = ExtDraw(ExtBlur, targets, 1, textures, p == 3 ? 1 : 0, reduced);
+					drawn = ExtDraw(ExtBlur, targets, 1, textures, (p == 3 ? 1u : 0u) | (giNoBlur ? 2u : 0u) | (giNoBlur && giGrassBlur ? 4u : 0u), reduced);	// (2026-11-13 rtgi-review R1: bit 1)
 				}
 				else if (p == 4) {
 					if (giDrawn && giTest != 1) {	// (ComputeGI) the bounce light kept from frame to frame too, in the bounce history
@@ -1685,10 +1693,11 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 			else if (p == 7) Device->SetTexture(7, historyTexture[writeIndex]);
 			if (applyLike && gridValid) Device->SetTexture(9, gridAccum[gridAccumIndex]);
 			if (applyLike && gridValid && gridColorValid) Device->SetTexture(14, gridAccumColor[gridAccumIndex]);
-			if (applyLike && albedoOn) {	// UNOFFICIAL 2026-10-31 AlbedoBuffer: NVR_ALAlbedo on s12 (the grid passes' NVR_GridSunColor stage, never read here), point sampled
+			if ((applyLike || ((p == 2 || p == 3) && giGrassBlur)) && albedoOn) {	// (2026-11-13 GIGrassBlur, from mrfury97's fork: the blur passes read its alpha as the grass mask)	// UNOFFICIAL 2026-10-31 AlbedoBuffer: NVR_ALAlbedo on s12 (the grid passes' NVR_GridSunColor stage, never read here), point sampled
 				// (2026-11-15 DeferredALAlbedo: albedoTexture is COLOR1 x (1 - metal) x DeferredALAlbedoGain while on, AlbedoTexture itself while off)
-				Device->SetTexture(12, albedoTexture);
-				TheRenderManager->renderState->NoteDeviceTexture(12, albedoTexture);
+				IDirect3DBaseTexture9* const stage12 = (p == 2 || p == 3) && grassMaskTexture ? grassMaskTexture : albedoTexture;	// (2026-11-15: the blur passes: the grass mask)
+				Device->SetTexture(12, stage12);
+				TheRenderManager->renderState->NoteDeviceTexture(12, stage12);
 				const DWORD states[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP},
 					{D3DSAMP_MAGFILTER, D3DTEXF_POINT}, {D3DSAMP_MINFILTER, D3DTEXF_POINT}, {D3DSAMP_MIPFILTER, D3DTEXF_NONE} };
 				for (const auto& s : states) TheRenderManager->SetSamplerState(12, (D3DSAMPLERSTATETYPE)s[0], s[1]);

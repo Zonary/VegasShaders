@@ -1,10 +1,12 @@
 #include "ShadowsExterior.h"
+#include "../Puddles/PuddleMap.h"	// 2026-11-12 Puddles map mode
 #include "../../core/TestTools.h"	// UNOFFICIAL: NVR_TEST_TOOLS (SkipWhenFadedCheck)
 #include "../../core/LampFixtures.h"	// UNOFFICIAL 2026-10-20: LampModelOwnDistance
 #include "../../core/DxvkCompute.h"	// UNOFFICIAL 2026-10-25 (NVR DXVK)
 #include "../../core/SunDepthFit.h"	// UNOFFICIAL 2026-10-27 FitToDepth
 #include "../../core/RtSunShadows.h"	// UNOFFICIAL 2026-10-28 RT sun shadows
 #include "../../core/SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the deferred renderer's sun steps)
+#include "../../core/BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (fork port 2026-11-13)
 
 // UNOFFICIAL 2026-10-16 lamp contact shadows (PointShadows.fx LampContactPS, technique 2; drawn by ShaderManager after the lamp
 // pass): every number the shader needs (see the constants' comments there). Kept out of ShadowsExterior.h (widely included).
@@ -27,6 +29,7 @@ static D3DXVECTOR4 ScreenSpaceFade(0.0f, 0.0f, 0.0f, 0.0f);
 static float ScreenSpaceNearFade = 0.0f;	// the setting (UpdateSettings); ScreenSpaceFade is made from it each frame (UpdateConstants)
 
 void ShadowsExteriorEffect::UpdateConstants() {
+	BendContact::UpdateConstants();	// UNOFFICIAL 2026-11-06: last frame's Bend result, reprojected for this frame's lit shaders
 	// Contact-shadow start and end: NearFade, pushed out to where the land's bumps end while those are on (DxvkCompute::DisplaceContactFade).
 	ScreenSpaceFade = D3DXVECTOR4(ScreenSpaceNearFade * 0.5f, ScreenSpaceNearFade, 0.0f, 0.0f);
 	float displaceBegin = 0.0f, displaceEnd = 0.0f;
@@ -821,6 +824,7 @@ void ShadowsExteriorEffect::RegisterConstants() {
 	// Each name is bound to the memory the shaders read it from, in the order they were always bound.
 	const auto bind = [](const char* name, D3DXVECTOR4* value) { TheShaderManager->RegisterConstant(name, value); };
 	bind("TESR_SmoothedSunDir", &Constants.SmoothedSunDir);
+	BendContact::RegisterConstants();	// UNOFFICIAL 2026-11-06 TESR_ContactReproject, TESR_ContactForwardData
 	bind("TESR_RtSunReplace", RtSunShadows::ReplaceConstant());	// UNOFFICIAL 2026-10-28 RT sun shadows Mode 1
 	// UNOFFICIAL 2026-11-13 ForwardLookup (Includes/Shadow.hlsl RT_SUN_FORWARD)
 	bind("TESR_RtSunRowX", RtSunShadows::ForwardConstant(0));
@@ -915,6 +919,8 @@ static void MakeCascadeSurfaces(ShadowsExteriorEffect& fx, ULONG cascadeSize, UL
 void ShadowsExteriorEffect::RegisterTextures() {
 	TerrainShadows.RegisterTextures();	// UNOFFICIAL 2026-10-19
 	RtSunShadows::RegisterForwardTexture();	// UNOFFICIAL 2026-11-13 ForwardLookup: TESR_RtSunForward (nothing unless compiled in)
+	BendContact::RegisterTextures();	// UNOFFICIAL 2026-11-06 TESR_ContactForward (only when Bend is on at start)
+	PuddleMap::RegisterTextures();		// 2026-11-12 Puddles map mode: TESR_PuddleMap (only in map mode)
 	const ULONG cascadeSize = Settings.ShadowMaps.CascadeResolution;
 	const ULONG cubeSize = Settings.Interiors.ShadowCubeMapSize;
 	const ULONG atlasSize = cascadeSize * 2;
@@ -1497,6 +1503,27 @@ D3DXVECTOR3 ShadowsExteriorEffect::CalculateSmoothedSunDir() {
 	const float jumpLimit = D3DXToRadian(Settings.SunSmoothing.MaxJumpAngle);	// a bigger move than this is applied at once
 
 	const bool quantized = Settings.SunSmoothing.QuantizeSun && yawStep > 0.0f && pitchStep > 0.0f;
+
+	// UNOFFICIAL 2026-11-16 [Shaders.ShadowsExteriors.RT] RealSun (port of mrfury97/VegasShaders fef7c30ba, rt-shadows F2; off by default):
+	// while the traced sun shadow is read by the shaders (RtSunShadows::RealSun) every sun shadow follows the REAL sun, the one the lit
+	// shaders' N.L uses: the 15-degree steps exist to keep shadow-map texels from swimming, which traced shadows do not have; quantized, a
+	// low sun was traced up to 7.5 degrees off the lit one. The cascades take the same sun (they cover past the RT range). Only a light
+	// per-frame ease against jitter; a jump (waiting, sleeping, a load) is taken at once.
+	if (RtSunShadows::RealSun()) {
+		D3DXVECTOR3 sunNow(TheShaderManager->ShaderConst.SunDir);
+		D3DXVECTOR3 eased(Constants.SmoothedSunDir);
+		const float lengthSq = D3DXVec3LengthSq(&eased);
+		if (lengthSq > 0.25f && D3DXVec3Dot(&eased, &sunNow) / sqrtf(lengthSq) > 0.99939f) {	// within 2 degrees
+			D3DXVec3Lerp(&eased, &eased, &sunNow, 0.5f);
+			D3DXVec3Normalize(&eased, &eased);
+		}
+		else eased = sunNow;
+		SunGlideValid = false;
+		SunCrossFading = false;
+		Constants.CrossFade.x = 0.0f;
+		Constants.SmoothedSunDir = D3DXVECTOR4(eased, 0.0f);
+		return eased;
+	}
 	const bool smoothed = Settings.SunSmoothing.SmoothSun && factor > 0.0f;
 
 	D3DXVECTOR3 sunDir(TheShaderManager->ShaderConst.SunDir);

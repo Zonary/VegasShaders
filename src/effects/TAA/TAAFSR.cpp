@@ -43,6 +43,11 @@ namespace {
 	struct RRGuidesConstants {
 		D3DXVECTOR4	right, up, forward, view, options, size;
 	};
+	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) DlssRRGuides-mirror.spv (RRMirrorMotion): + last frame's camera, as FSRPrep has it
+	struct RRGuidesMirrorConstants {
+		RRGuidesConstants	base;
+		D3DXVECTOR4	prevRight, prevUp, prevForward, prevProjection, cameraDelta;
+	};
 
 	// Binding tables: (set, binding) as the SPIR-V declares them (checked with spirv-dis), slot = binding for images,
 	// buffer slot 0 = the constants; sampler POINT (slot 0, push 0).
@@ -56,6 +61,9 @@ namespace {
 	// and DlssRRComposite.frag (RR's output, the frame before RR, the weapon's depth). Same conventions as above.
 	const NVR_EXT_BINDING_DESC RRGuidesBindings[] = { IMG(0), IMG(1), IMG(2), IMG(3), UAV(4), UAV(5), UAV(6), UAV(7), UAV(8), CB(2, 0), POINTS, IMG(9),
 		IMG(10), IMG(11), IMG(12) };	// IMG(9): UNOFFICIAL 2026-10-31 TESR_AlbedoBuffer (RRAlbedo 2); IMG(10-12): 2026-11-07 (ptaaa-denoiser) the path tracer's albedos
+	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) DlssRRGuides-mirror: + UAV(13) FSRPrep's motion image, IMG(14) the path tracer's specular image
+	const NVR_EXT_BINDING_DESC RRGuidesMirrorBindings[] = { IMG(0), IMG(1), IMG(2), IMG(3), UAV(4), UAV(5), UAV(6), UAV(7), UAV(8), CB(2, 0), POINTS, IMG(9),
+		IMG(10), IMG(11), IMG(12), UAV(13), IMG(14) };
 	const NVR_EXT_BINDING_DESC RRCompositeBindings[] = { IMG(0), IMG(1), IMG(2), POINTS };
 #undef IMG
 #undef UAV
@@ -598,9 +606,43 @@ bool TAAEffect::RayReconstruct(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	}
 	guides.options = D3DXVECTOR4(albedoOn ? 2.0f : RRSettings.Albedo >= 1 ? 1.0f : 0.0f, RRSettings.Normals == 1 ? 1.0f : 0.0f, materialOn ? 1.0f : 0.0f, ptMode);	// x 2: the albedo buffer (2026-10-31)
 	guides.size = D3DXVECTOR4((float)rw, (float)rh, 0.0f, 0.0f);	// (perf-rr) the render size: one thread per render pixel, the rect of every image
-	ID3D9NvrExtBuffer* guidesBuffer = ExtUniforms(rrGuidesUniforms, &guides, sizeof(guides));
-	if (!guidesBuffer) return fail("its constant buffers could not be written");
-	{
+	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs, docs/next/RT-DENOISE-INPUTS.md) RRMirrorMotion (test only, off): the -mirror variant writes the
+	// virtual point's motion into FSRPrep's motion image at flat mirrors the path tracer marked (PSR's motion). Off, no specular image (no
+	// PTDenoiseSplit / PTDenoiseMirrorSurface), a reset frame, or the .spv missing: the plain pass, exactly as before.
+	IDirect3DTexture9* ptSpec = RRSettings.MirrorMotion && ptMode > 1.5f ? RtPathTrace::RrSpecular() : nullptr;
+	if (ptSpec && !rrMirrorTried) {
+		rrMirrorTried = true;
+		if (DxvkCompute::HasSpirv("DlssRRGuides-mirror"))
+			rrGuidesMirror = DxvkCompute::CreatePipeline("DlssRRGuides-mirror", RRGuidesMirrorBindings, _countof(RRGuidesMirrorBindings), 4, true);
+		Logger::Log("UNOFFICIAL DLSS RR: RRMirrorMotion: %s", rrGuidesMirror ? "flat path-traced mirrors get the virtual point's motion (DlssRRGuides-mirror)" :
+			"Compute\\DlssRRGuides-mirror.spv missing or refused: the plain guide pass");
+	}
+	const bool mirrorMotion = ptSpec && rrGuidesMirror && !reset;
+	if (mirrorMotion && rrMirrorLogs < 1) { rrMirrorLogs++; Logger::Log("UNOFFICIAL DLSS RR: RRMirrorMotion runs (first frame)"); }
+	if (mirrorMotion) {
+		RRGuidesMirrorConstants m = {};
+		m.base = guides;
+		const D3DXMATRIX& pv = rrPrevView;
+		m.prevRight = D3DXVECTOR4(pv._11, pv._21, pv._31, 0.0f);
+		m.prevUp = D3DXVECTOR4(pv._12, pv._22, pv._32, 0.0f);
+		m.prevForward = D3DXVECTOR4(pv._13, pv._23, pv._33, 0.0f);
+		m.prevProjection = D3DXVECTOR4(rrPrevProjection.x, rrPrevProjection.y, cameraData->y, 0.0f);
+		m.cameraDelta = D3DXVECTOR4(delta.x, delta.y, delta.z, 1.0f);
+		ID3D9NvrExtBuffer* mirrorBuffer = ExtUniforms(rrGuidesMirrorUniforms, &m, sizeof(m));
+		if (!mirrorBuffer) return fail("its constant buffers could not be written");
+		NVR_EXT_RESOURCE_BINDING b[] = { Image(0, color), Image(1, normals), Image(2, depth), Image(3, materialOn ? (IUnknown*)material : (IUnknown*)depth),
+			Image(4, rrColor.Texture, true), Image(5, rrDiffuse.Texture, true), Image(6, rrSpecular.Texture, true), Image(7, rrNormals.Texture, true),
+			Image(8, rrRoughness.Texture, true), Buffer(0, NVR_EXT_BIND_UNIFORM_BUFFER, mirrorBuffer), Sampler(0, point),
+			Image(9, albedoOn ? (IUnknown*)albedo : (IUnknown*)depth),
+			Image(10, ptAlbedo ? (IUnknown*)ptAlbedo : (IUnknown*)depth), Image(11, ptSpecRG ? (IUnknown*)ptSpecRG : (IUnknown*)depth),
+			Image(12, ptSpecB ? (IUnknown*)ptSpecB : (IUnknown*)depth), Image(13, fsrMotion.Texture, true), Image(14, ptSpec) };
+		static GpuTimer mirrorTimer("  RR guides (mirror motion)");
+		GpuProfileScope gpuMirror(mirrorTimer, Device);
+		if (!RRDispatch(rrGuidesMirror, b, _countof(b), plan.groupsX, plan.groupsY)) return fail("DlssRRGuides-mirror failed to dispatch");
+	}
+	ID3D9NvrExtBuffer* guidesBuffer = mirrorMotion ? nullptr : ExtUniforms(rrGuidesUniforms, &guides, sizeof(guides));
+	if (!mirrorMotion && !guidesBuffer) return fail("its constant buffers could not be written");
+	if (!mirrorMotion) {
 		NVR_EXT_RESOURCE_BINDING b[] = { Image(0, color), Image(1, normals), Image(2, depth), Image(3, materialOn ? (IUnknown*)material : (IUnknown*)depth),
 			Image(4, rrColor.Texture, true), Image(5, rrDiffuse.Texture, true), Image(6, rrSpecular.Texture, true), Image(7, rrNormals.Texture, true),
 			Image(8, rrRoughness.Texture, true), Buffer(0, NVR_EXT_BIND_UNIFORM_BUFFER, guidesBuffer), Sampler(0, point),

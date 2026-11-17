@@ -58,6 +58,14 @@ float FDModel(float r) {
     return m;
 #endif
 }
+// UNOFFICIAL 2026-11-16 batch D (DEFERRED-GAPS-AUDIT item 11; docs/next/FD-BATCH-D.md): the far land's mark. GBufferV2's lighting-free far
+// land record (TerrainLODTemplate.hlsl) writes COLOR2.r = 4 + the specular bit + FD_FAR_LAND_MARK: still model 4 (land) for every reader
+// (FDModel, floor(r + 0.01)), told apart from the near land (whose r has no fraction) by DeferredSun, which gives it no ShadowBounce (its
+// forward shader had none). 1 / 64 is the smallest step fp16 holds at r = 20 (the half-float target rounds anything finer away); the
+// readers of the fraction as metal (/ 0.49) see 0.032 there: the sun pass lights land with the land's own metal scale, and the lamp pass,
+// the flashlight, the path tracer and the DLSS guides get 3 % metal on far land, too little to show.
+#define FD_FAR_LAND_MARK (1.0f / 64.0f)
+float FDFarLand(float r) { const float f = r - floor(r); return f > 0.5f * FD_FAR_LAND_MARK && f < 1.5f * FD_FAR_LAND_MARK ? 1.0f : 0.0f; }
 // The pixel's sun was compiled out of its record and is DeferredSun's to add. THE function to switch for another flag.
 float FDSunDeferredPixel(float a, float r) {
 #if FD_GBUFFER_V2
@@ -123,6 +131,35 @@ float FDAddedLightKeep(float a) {
 #else
     return a > 2.5f ? FDLightFreeKeep(a) : a;
 #endif
+}
+
+// UNOFFICIAL 2026-11-16 fd-sunvis (docs/next/FD-SUN-RESULTS.md section 4): what the forward sun had that the G-buffer did not carry, in the
+// spare fraction of COLOR3.a (the smooth normal's code: 1 a world record, 2 an actor's gear; Includes/CapturedNormals.hlsl). A GBufferV2
+// lighting-free record writes there
+//   1 + q / 1024 (world) or 2 - q / 1024 (gear),  q = 48 s + v  (0 .. 479),
+//   v = round(47 (1 - vis)): vis = the share of the sun that reaches the pixel besides what the cascades see (the game's canopy PROJ_SHADOW
+//       or STBB's 0.85, the parallax / land height self-shadow, the _rmaos micro-shadow), computed by the writers as the forward sun did; 48 levels
+//   s = 0: no highlight reflectance recorded (the pass takes 0.04); s = 1 + round(100 F0) (1 .. 9): the non-metal highlight's F0 the record
+//       would have lit with (VanillaBridge's authored strength, the _rmaos specular level), 0 .. 0.08 in steps of 0.01
+// q = 0 is the code itself: every writer that does not write this (skin, foliage, forward records, blended draws) reads as "the sun reaches,
+// F0 0.04", the picture before. Every code is on fp16's grid ([1, 2): steps of 1 / 1024), so the target holds it exactly. The readers of the
+// code keep their tests: written > 0.99 (snow, AL, reflections, the PT prep), actor > 1.5 (1 + q / 1024 stays at or below 1.468, 2 - q / 1024
+// at or above 1.532), forward skin 2.05 .. 2.45 and deferred skin 3.5+ are not touched. A blended draw (the hook's mark in NVR_SpecFade.z:
+// 3 or -1) writes the plain code: under SRCALPHA a target's alpha is its own blend weight and must stay 1 (or CapturedCoverage's 0).
+#define FD_SV_STEP (1.0f / 1024.0f)
+// Writer: a = the record's COLOR3.a (written as 1 or 2, else returned as it is), vis 0..1, f0 < 0 = none recorded, markZ = NVR_SpecFade.z.
+float FDSunVisCode(float a, float vis, float f0, float markZ) {
+    const float v = floor((1.0f - saturate(vis)) * 47.0f + 0.5f);
+    const float s = f0 < 0.0f ? 0.0f : 1.0f + floor(saturate(f0 * 12.5f) * 8.0f + 0.5f);	// (F0 0 .. 0.08 -> 1 .. 9)
+    const float q = (markZ > 1.5f || markZ < -0.5f) ? 0.0f : 48.0f * s + v;
+    return abs(a - 1.0f) < 0.01f ? a + q * FD_SV_STEP : abs(a - 2.0f) < 0.01f ? a - q * FD_SV_STEP : a;
+}
+// Reader: a = COLOR3.a. vis 1 and f0 0.04 where nothing was recorded (or any other code: skin, unwritten).
+void FDSunVisDecode(float a, out float vis, out float f0) {
+    const float q = a > 0.99f && a < 2.005f ? floor(abs(a - (a > 1.5f ? 2.0f : 1.0f)) * 1024.0f + 0.5f) : 0.0f;
+    const float s = floor((q + 0.5f) / 48.0f);
+    vis = 1.0f - (q - 48.0f * s) / 47.0f;
+    f0 = s > 0.5f ? (s - 1.0f) * 0.01f : 0.04f;
 }
 
 // UNOFFICIAL 2026-11-14 foliage (claude/fd-foliage; Includes/FoliageDeferred.hlsl, core/DeferredFoliage.h): the leaf / grass DEFERRED records'

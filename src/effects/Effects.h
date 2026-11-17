@@ -19,6 +19,7 @@
 #include "GodRays/GodRays.h"
 #include "ImageAdjust/ImageAdjust.h"
 #include "Lens/Lens.h"
+#include "SunGlare/SunGlare.h"
 #include "LowHF/LowHF.h"
 #include "MotionBlur/MotionBlur.h"
 #include "Normals/Normals.h"
@@ -62,6 +63,7 @@
 #include "PBR/PBR.h"
 #include "Terrain/Terrain.h"
 #include "WetnessEffects/WetnessEffects.h"	// UNOFFICIAL 2026-11-04 Wetness Effects (from Physically-Based-Reloaded), in place of WetWorld's screen pass
+#include "Puddles/Puddles.h"	// 2026-11-08 Puddles (on top of Wetness Effects)
 #include "WetnessEffects/WetnessReflections.h"	// UNOFFICIAL 2026-11-04 Wetness Effects' reflections and HUD raindrops (from Physically-Based-Reloaded)
 #include "WetnessEffects/HudRaindrops.h"
 #include "Grass/Grass.h"

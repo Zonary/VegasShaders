@@ -1,7 +1,8 @@
 // UNOFFICIAL 2026-10-28 CapturedNormals (core/CapturedNormals.h, docs/next/CAPTURED-NORMALS.md; macintroll's proposal): while the
 // world's main opaque list draws, NVR's lit templates (ObjectTemplate, ParallaxTemplate, SkinTemplate, TerrainTemplate) write the surface's
 // smooth interpolated vertex normal (world space, after skinning, BEFORE the normal map) to a fourth render target, COLOR3:
-//   rg  the normal, octahedral (Includes/Shadow.hlsl ShadowEncodeNormal), facing the camera
+//   rg  the normal, octahedral (Includes/Shadow.hlsl ShadowEncodeNormal), on the camera's side: of the view ray (CapturedNormalOut: the
+//       land, skin, foliage), or (2026-11-16 fd-roofedge) of the triangle (CapturedNormalOutTri: objects and parallax)
 //   b   the camera distance (length of the camera-relative world position), which readers compare against the depth buffer
 //   a   1 = written by a template, 2 = by an actor's (bone-skinned draws: SKIN, or the skin template; 2026-10-28: snow keeps off actors)
 //       (0 = cleared, or a variant with no smooth normal)
@@ -23,6 +24,33 @@
         [flatten] if (len2 < 1.0e-6f) return CAPTURED_NORMAL_INVALID;
         n *= rsqrt(len2);
         n *= dot(n, worldPos) > 0.0f ? -1.0f : 1.0f;	// the side the camera sees (two-sided cards, cloth)
+        #if defined(SKIN) || defined(CAPTURED_ACTOR)
+            return float4(ShadowEncodeNormal(n), length(worldPos), 2.0f);
+        #else
+            return float4(ShadowEncodeNormal(n), length(worldPos), 1.0f);
+        #endif
+    }
+
+    // UNOFFICIAL 2026-11-16 fd-roofedge (docs/next/FD-ROOFEDGE.md): which side of the TRIANGLE the camera is on decides the flip, not the
+    // smooth normal's angle to the view ray. A mesh shaded smooth across a sharp edge (a roof ridge: its vertices' normals averaged
+    // straight up) seen from below that edge shows its front face while the interpolated normal points away from the camera; the view
+    // test above turned it to point DOWN, and the deferred passes lit the band under the ridge with a normal facing away from the sun (a
+    // dark wedge along the roofs' top edges under the deferred renderer; forward lights in the vertex tangent frame and never sees it).
+    // p: the camera-relative world position (the camera is the origin); face: the triangle's normal as wound, any length. -1 only where
+    // n lies behind the triangle as the camera sees it (two-sided cards and cloth seen from behind); where the triangle is edge-on (no
+    // usable face) the view test, as before.
+    float CapturedTriangleFlip(float3 n, float3 p, float3 face) {
+        const float side = dot(face, p);	// < 0: the face as wound points at the camera
+        const bool usable = side * side > 1.0e-8f * dot(face, face) * dot(p, p);
+        return (usable ? dot(n, face) * side : dot(n, p)) > 0.0f ? -1.0f : 1.0f;
+    }
+    // CapturedNormalOut with the triangle's side (above). ddx / ddy: call at the pixel shader's top level only. The object and parallax
+    // records; the land keeps CapturedNormalOut (a heightfield's normal does not point away from a camera that sees its top).
+    float4 CapturedNormalOutTri(float3 n, float3 worldPos) {
+        const float len2 = dot(n, n);
+        const float flip = CapturedTriangleFlip(n, worldPos, cross(ddx(worldPos), ddy(worldPos)));
+        [flatten] if (len2 < 1.0e-6f) return CAPTURED_NORMAL_INVALID;
+        n *= rsqrt(len2) * flip;
         #if defined(SKIN) || defined(CAPTURED_ACTOR)
             return float4(ShadowEncodeNormal(n), length(worldPos), 2.0f);
         #else
@@ -102,15 +130,38 @@
             // Mirrored uv flips the frame with it (the sign rides in the cross products). n0 must face the camera: Direct3D's ddy runs DOWN
             // the screen (GLSL's dFdy up), which makes det(n0, dp1, dp2) negative for a facing n0, so the frame is negated (s < 0). Worked
             // check: a wall facing +z seen from +z, u = x, v = -y: t = (-1, 0, 0) and b = (0, 1, 0) before the sign, +x and -y after.
-            float3 CapturedDerivNormal(float3 p, float2 uv, float3 n0, float3 tn) {
-                n0 *= rsqrt(max(dot(n0, n0), 1.0e-20f));
-                const float3 dp1 = ddx(p), dp2 = ddy(p);
+            // (2026-11-16 fd-roofedge) n0 is re-faced by the triangle's side (CapturedTriangleFlip): the callers pass the smooth normal
+            // faced by the view test, which points it away from the light under a smooth-shaded ridge seen from below.
+            // The frame about a unit n0 on the camera's side of the triangle (dp1 / dp2: ddx / ddy of p); nz: the normal the map's z goes along.
+            float3 CapturedDerivFrame(float3 dp1, float3 dp2, float2 uv, float3 n0, float3 nz, float3 tn) {
                 const float2 duv1 = ddx(uv), duv2 = ddy(uv);
                 const float3 dp2perp = cross(dp2, n0), dp1perp = cross(n0, dp1);
                 const float3 t = dp2perp * duv1.x + dp1perp * duv2.x;
                 const float3 b = dp2perp * duv1.y + dp1perp * duv2.y;
                 const float s = -rsqrt(max(max(dot(t, t), dot(b, b)), 1.0e-30f));
-                return (t * tn.x + b * tn.y) * s + n0 * tn.z;
+                return (t * tn.x + b * tn.y) * s + nz * tn.z;
+            }
+            float3 CapturedDerivNormal(float3 p, float2 uv, float3 n0, float3 tn) {
+                const float3 dp1 = ddx(p), dp2 = ddy(p);
+                n0 *= rsqrt(max(dot(n0, n0), 1.0e-20f)) * CapturedTriangleFlip(n0, p, cross(dp1, dp2));
+                return CapturedDerivFrame(dp1, dp2, uv, n0, n0, tn);
+            }
+            // UNOFFICIAL 2026-11-16 fd-directlight (docs/next/FD-DIRECTLIGHT.md item 1): CapturedDerivNormal for a caller that has the vertex
+            // normal as the vertex shader sent it (nVertex: not faced to the camera). Where the triangle is seen from BEHIND (a two-sided card or
+            // cloth: the vertex normal lies behind it as the camera sees it), the forward shaders light it with its FRONT's normal-mapped normal
+            // (they light in the vertex's tangent frame, which nothing turns round; the game's shaders do the same, and so does the table
+            // family's exact frame above), so the record stores that one: the same tangent directions (the uv runs the same way on both sides)
+            // with the map's z along the vertex normal instead of the camera-side one. Near Jacobstown pines: needle cards seen from their back
+            // were lit as their front forward and lit as a surface facing the camera (away from the sun) by the deferred passes. Everywhere
+            // else (a front, a smooth-shaded ridge seen from below, an edge-on triangle) exactly CapturedDerivNormal's normal.
+            float3 CapturedDerivNormalFront(float3 p, float2 uv, float3 nVertex, float3 tn) {
+                const float3 dp1 = ddx(p), dp2 = ddy(p);
+                const float3 face = cross(dp1, dp2);
+                const float side = dot(face, p);	// (CapturedTriangleFlip's test written out: its "usable" is needed here too)
+                const bool usable = side * side > 1.0e-8f * dot(face, face) * dot(p, p);
+                const float behind = dot(nVertex, face) * side;	// > 0: the vertex normal lies behind the triangle as the camera sees it
+                const float3 n0 = nVertex * (rsqrt(max(dot(nVertex, nVertex), 1.0e-20f)) * ((usable ? behind : dot(nVertex, p)) > 0.0f ? -1.0f : 1.0f));
+                return CapturedDerivFrame(dp1, dp2, uv, n0, usable && behind > 0.0f ? -n0 : n0, tn);
             }
         #else
         #define CapturedMaterialOut(roughness) float4(NVR_MATERIAL_CLASS, NVR_MATERIAL_RADIUS, (roughness), 1.0f)

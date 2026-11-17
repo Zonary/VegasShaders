@@ -20,6 +20,9 @@
 #include "DeferredDistant.h"	// UNOFFICIAL 2026-11-14 DeferredDistant (DS_DEPTH_AGREE)
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the sun steps' fade in this pass)
 #include "ShaderRecord.h"
+#include "FailOnce.h"	// UNOFFICIAL 2026-11-16 fd-batchB: the pass's real failures retried after the next cell change
+#include "FdTestFault.h"	// UNOFFICIAL 2026-11-16 fd-batchB (test only: DebugVar4 901 / 902)
+#include "ForwardCloudShadows.h"	// UNOFFICIAL 2026-11-16 fd-batchB: c169 for this pass (item 22)
 #include <unordered_set>
 
 namespace DeferredSun {
@@ -31,6 +34,11 @@ namespace DeferredSun {
 	inline bool Live = false;			// this frame
 	inline int DebugView = 0;
 	inline bool Shadows = true;
+	// UNOFFICIAL 2026-11-16 fd-sunvis ([Shaders.ShadowsExteriors.Deferred], live; DeferredSun.hlsl DS_Vis, Includes/DeferredPixel.hlsl FDSunVisCode):
+	// the forward sun's terms the G-buffer now carries. The pass's own: the land's height self-shadow, the recorded highlight F0, SpecularFade's
+	// highlight fade rebuilt from the pixel's distance. (CanopyShadow, ParallaxShadow and MicroShadow are applied by the records: PBR.cpp.)
+	inline bool LandCrackShadow = true, AuthoredHighlight = true, HighlightFade = true;
+	inline int SpecFadeCompiled = -1;	// [Shaders.PBR.Main] SpecularFade at startup (the records' SPEC_FADE_ON; core/PbrPop.h SpecFade::Compiled), -1 not read yet
 	inline std::unordered_set<IDirect3DPixelShader9*> Handles;	// the lighting-free records' handles (from LightFreeRecords::Records)
 	inline size_t HandlesFrom = 0;
 	// UNOFFICIAL 2026-11-15 (bench batch 4: the land's own light was never used: "no recent land draw read back" in every view) the land's
@@ -65,20 +73,49 @@ namespace DeferredSun {
 	inline unsigned long long StatFrames = 0, StatPasses = 0, StatSkipped = 0, StatRefusedMixed = 0, StatLinearDepth = 0, StatConverted = 0, StatFogExact = 0;
 	// UNOFFICIAL 2026-11-14 (bench batch 2: outdoors the pass never drew and the lighting-free records' pixels had no sun) the safety rule:
 	// the lighting-free records may be bound only in frames the pass will light. A refusal found in Apply after they drew (nothing else can be
-	// known before the span) turns the pass off for the session: Wanted() is false from then on, so DeferredRenderer 2 draws forward from
-	// the next frame (it reads Wanted through SunRuns before it binds anything). One frame at most is drawn without its sun; logged once.
-	inline const char* Refused = nullptr;
+	// known before the span) turned the pass off for the session.
+	// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 8: one odd frame turned DeferredRenderer 2 forward until the game restarted)
+	// now two kinds:
+	//   - a per-frame cause (no directional light, no G-buffer, no or another scene target at the span's end, LinearScene's span not open):
+	//     that frame is skipped (its lighting-free pixels miss the sun once, as before) and the pass runs again the next frame. Only when
+	//     kSkipsToLatch spans IN A ROW are refused (the cause lasts: a mod's target, the game's MSAA) does it latch as below, so a lasting
+	//     cause cannot draw frame after frame without the sun;
+	//   - a real failure (the conversion to linear light failed) or such a streak: a FailOnce latch. Wanted() is false for the rest of the
+	//     cell, so DeferredRenderer 2 draws forward from the next frame (it reads Wanted through SunRuns before it binds anything); after
+	//     the next cell change it is tried again, 3 tries in all ([Main.Main.Misc] RetryFailedEffects false: off for the session, as before).
+	inline FailOnce::Latch Fail{ "DeferredSun" };
+	inline const char* Refused = nullptr;		// the latch's last reason (shown while it holds)
+	constexpr unsigned kSkipsToLatch = 3;
+	inline unsigned SkipStreak = 0;				// refused spans in a row (a drawn pass resets it)
+	inline unsigned long long SkipLogs = 0, StatSkippedFrames = 0;
 	// UNOFFICIAL 2026-11-15 DeferredFirstPerson (core/DeferredFirstPerson.h): Apply run a second time for the first-person view model, into its
 	// light target (linear, no fog), at the stencil's view-model mark: frame is the first-person camera in the DD layout (c0-c5), depth its
 	// projection's _33 / _43 (c9), charM / charCenter / charData the view model's sun map (c206-c209, c213, c214: the light's view x
 	// projection, for the true camera-relative point; charData.w 0 = no map this frame). Off (always without the switch): Apply as before.
 	struct ViewModelPass { bool on = false; float frame[6][4] = {}; float depth[2] = {}; float charM[4][4] = {}; float charCenter[4] = {}; float charData[4] = {}; };
 	inline ViewModelPass Vm;
-	inline void Refuse(const char* why) {
-		if (Refused) return;
+	// A real failure: off for the rest of the cell (the latch logs it and lists it in the status bar). why: a literal.
+	inline void Latch(const char* why) {
+		if (Fail.failed) return;
 		Refused = why;
-		Logger::Log("[WARNING] UNOFFICIAL DeferredSun: refused for the session (%s): the lighting-free records are not bound from the next frame, the deferred renderer draws forward (logged once)", why);
+		SkipStreak = 0;
+		Logger::Log("[WARNING] UNOFFICIAL DeferredSun: off (%s): the lighting-free records are not bound from the next frame, the deferred renderer draws forward until the pass is tried again", why);
+		Fail.Set(why);
 	}
+	// A per-frame cause: this frame only, unless it is the kSkipsToLatch-th refused span in a row. why: a literal.
+	inline void SkipFrame(const char* why) {
+		StatSkippedFrames++;
+		if (++SkipStreak >= kSkipsToLatch) {
+			Logger::Log("[WARNING] UNOFFICIAL DeferredSun: %u frames in a row without the sun pass (%s): the cause lasts", SkipStreak, why);
+			Latch(why);
+			return;
+		}
+		if (SkipLogs++ < 20 || SkipLogs % 200 == 0)
+			Logger::Log("UNOFFICIAL DeferredSun: one frame skipped (%s): its lighting-free pixels had no sun this frame; the pass runs again next frame "
+				"(%u in a row so far; %u in a row turn it off until the next cell change; %llu frames skipped this session)", why, SkipStreak, kSkipsToLatch, StatSkippedFrames);
+	}
+	// true while the latch holds for good (out of tries, or RetryFailedEffects off)
+	inline bool LatchFinal() { return Fail.failed && (Fail.tries >= FailOnce::kTries || !FailOnce::RetryOn()); }
 
 	inline bool WantedAtStartup() { return LightFreeRecords::WantedAtStartup(); }
 	// The G-buffer's layout: true = GBufferV2 (CAPTURED_NORMALS_ON 4; its rules and the lighting-free code: Includes/DeferredPixel.hlsl).
@@ -87,9 +124,9 @@ namespace DeferredSun {
 	inline void SetForced(bool on) { Forced = on; }
 	// Whether the pass is wanted this frame (the setting or the renderer), and can run (compiled).
 	// (2026-11-14 batch 2) and nothing known before the frame stops it: LinearScene live (the pass adds in linear light), the G-buffer's
-	// levels, a directional light, no session refusal (Refuse). DeferredRenderer 2 binds the lighting-free records only while this is true.
+	// levels, a directional light, the latch not holding (Fail). DeferredRenderer 2 binds the lighting-free records only while this is true.
 	inline bool Wanted() {
-		return WantedAtStartup() && Pass && !PassFailed && !Refused && (Forced || TheSettingManager->GetSettingI(kSection, "Enabled") != 0) &&
+		return WantedAtStartup() && Pass && !PassFailed && !Fail.Blocked() && (Forced || TheSettingManager->GetSettingI(kSection, "Enabled") != 0) &&
 			LinearScene::Live && CapturedNormals::AlbedoCompiledIn() && CapturedNormals::MaterialCompiledIn() && !CapturedNormals::Failed &&
 			Tes && Tes->directionalLight;
 	}
@@ -99,10 +136,13 @@ namespace DeferredSun {
 	inline const char* Failure() {
 		if (!WantedAtStartup()) return "the lighting-free records are not made (LightFreeRecords off at startup)";
 		if (PassFailed) return "its pass did not load (see its lines)";
-		if (Refused) return Refused;
+		if (LatchFinal()) return Refused;	// (2026-11-16 fd-batchB: a latch that will be tried again is "not ready", not a reason to warn once)
 		if (!CapturedNormals::AlbedoCompiledIn() || !CapturedNormals::MaterialCompiledIn()) return "needs CapturedNormals + MaterialBuffer + AlbedoBuffer (restart)";
-		if (CapturedNormals::Failed) return "the G-buffer failed";
+		// (2026-11-16 fd-batchB) the G-buffer's and LinearScene's latches only once they hold for good (out of tries, or RetryFailedEffects off)
+		auto final = [](const FailOnce::Latch& l) { return l.failed && (l.tries >= FailOnce::kTries || !FailOnce::RetryOn()); };
+		if (CapturedNormals::Failed && (final(CapturedNormals::MakeFail) || final(CapturedNormals::CheckFail))) return "the G-buffer failed (see its lines)";
 		if (LinearScene::Checked && !LinearScene::Compiled) return "LinearScene is not compiled in";
+		if (final(LinearScene::Fail)) return "LinearScene failed (see its lines)";
 		return nullptr;
 	}
 
@@ -176,6 +216,7 @@ namespace DeferredSun {
 
 	// Once a frame (Render.cpp, with DeferredLamps::BeginFrame).
 	inline void BeginFrame() {
+		FdTestFault::BeginFrame();	// (2026-11-16 fd-batchB, test only: DebugVar4)
 		Live = Wanted() && CapturedNormals::AlbedoCompiledIn() && CapturedNormals::MaterialCompiledIn() && !CapturedNormals::Failed;
 		SunFadeDeferred::PassLive = Live && PassFade;	// (2026-11-15 fd-smoothsun: the sun steps by half a degree while this pass draws it)
 		if (!WantedAtStartup()) return;
@@ -200,18 +241,24 @@ namespace DeferredSun {
 		if (LinearScene::DrawWatch == &LandDrawWatch || LinearScene::DrawWatch == &ObjectDrawWatch) LinearScene::DrawWatch = nullptr;	// (no watch across frames)
 		DebugView = TheSettingManager->GetSettingI(kSection, "DebugView");
 		Shadows = TheSettingManager->GetSettingI(kSection, "Shadows") != 0;
+		LandCrackShadow = TheSettingManager->GetSettingI(kSection, "LandCrackShadow") != 0;
+		AuthoredHighlight = TheSettingManager->GetSettingI(kSection, "AuthoredHighlight") != 0;
+		if (SpecFadeCompiled < 0) SpecFadeCompiled = TheSettingManager->GetSettingI("Shaders.PBR.Main", "SpecularFade") != 0 ? 1 : 0;
+		HighlightFade = TheSettingManager->GetSettingI(kSection, "HighlightFade") != 0 && SpecFadeCompiled == 1 &&
+			TheSettingManager->GetSettingI("Shaders.PBR.Main", "SpecularFade") != 0;	// (as the records fade: compiled at startup, live while compiled)
 		{
 			static int statusSlot = -1;
 			const bool asked = Forced || TheSettingManager->GetSettingI(kSection, "Enabled") != 0;
 			const char* why = Live ? (Forced ? "live (the deferred renderer)" : "live (Enabled)") : !asked ? "off" : PassFailed ? "the pass failed to load" :
-				Refused ? Refused : !LinearScene::Live ? "needs LinearScene live" : "needs CapturedNormals + MaterialBuffer + AlbedoBuffer";
+				Fail.failed ? Refused : !LinearScene::Live ? "needs LinearScene live" : "needs CapturedNormals + MaterialBuffer + AlbedoBuffer";
 			EffectStatus::Note(statusSlot, "DeferredSun", Live ? EffectStatus::Drawn : EffectStatus::Skipped, why);
 		}
 		if (!GpuTimer::Enabled) { StatFrames = 0; return; }
 		if (++StatFrames < 240) return;
 		const double f = (double)StatFrames;
 		Logger::Log("DEFERRED SUN %u frames: the pass %.2f a frame (the exact linear depth %.2f; the frame converted to linear light first %.2f; the exact stored-curve fog %.2f), skipped %.2f, mixed spans lit (sun-keeping records in the same span, told apart by their code) %.2f%s%s",
-			(unsigned)StatFrames, StatPasses / f, StatLinearDepth / f, StatConverted / f, StatFogExact / f, StatSkipped / f, StatRefusedMixed / f, Refused ? "; refused for the session: " : "", Refused ? Refused : "");
+			(unsigned)StatFrames, StatPasses / f, StatLinearDepth / f, StatConverted / f, StatFogExact / f, StatSkipped / f, StatRefusedMixed / f,
+			Fail.failed ? (LatchFinal() ? "; off for the session: " : "; off until the next cell change: ") : "", Fail.failed && Refused ? Refused : "");
 		StatFrames = 0; StatPasses = StatSkipped = StatRefusedMixed = StatLinearDepth = StatConverted = StatFogExact = 0;
 	}
 
@@ -280,11 +327,15 @@ namespace DeferredSun {
 		// light. Such spans are counted (StatRefusedMixed: now "mixed spans lit").
 		if (older) StatRefusedMixed++;
 		NiDirectionalLight* sun = Tes ? Tes->directionalLight : nullptr;
-		if (!sun) { StatSkipped++; if (!Vm.on) Refuse("no directional light at the span's end"); return; }
-		if (!CapturedNormals::Drawn || !CapturedNormals::AlbedoTexture || !CapturedNormals::MaterialTexture || !CapturedNormals::Texture) { StatSkipped++; if (!Vm.on) Refuse("the G-buffer was not made this frame"); return; }
+		if (!sun) { StatSkipped++; if (!Vm.on) SkipFrame("no directional light at the span's end"); return; }
+		if (!CapturedNormals::Drawn || !CapturedNormals::AlbedoTexture || !CapturedNormals::MaterialTexture || !CapturedNormals::Texture) { StatSkipped++; if (!Vm.on) SkipFrame("the G-buffer was not made this frame"); return; }
+		// (2026-11-16 fd-batchB, test only) DebugVar4 901: one refused frame, as a per-frame cause above
+		if (!Vm.on && FdTestFault::Take(901)) { StatSkipped++; SkipFrame("test fault 901 (DebugVar4)"); return; }
+		// (test only) DebugVar4 902: a real failure, as a failed conversion below (here, so it does not wait for a frame in the stored curve)
+		if (!Vm.on && FdTestFault::Take(902)) { StatSkipped++; Latch("test fault 902 (DebugVar4): as a failed conversion to linear light"); return; }
 		IDirect3DSurface9* target = nullptr;
 		d->GetRenderTarget(0, &target);
-		if (!target) { StatSkipped++; if (!Vm.on) Refuse("no scene target at the span's end"); return; }
+		if (!target) { StatSkipped++; if (!Vm.on) SkipFrame("no scene target at the span's end"); return; }
 		static GpuTimer timer("Deferred sun"), vmTimer("Deferred sun (first person)");	// (with the conversion to linear light below, when it runs)
 		GpuProfileScope gpu(Vm.on ? vmTimer : timer, d);
 		// The space (bench batch 2): LinearScene switches the frame between linear light and the stored curve draw by draw (BeforeDraw: a
@@ -293,14 +344,20 @@ namespace DeferredSun {
 		// puts it into linear light itself with LinearScene's own conversion (the same one BeforeDraw makes; exact without MSAA, and the span
 		// does not run under the game's MSAA), then adds its light; DeferredLamps and the flashlight after it find the frame linear, and
 		// LinearScene::EndSpan converts back once, as for any span that ends linear. No span (LinearScene off, the game's MSAA) or a failed
-		// conversion: refused (Refuse).
+		// conversion: refused (2026-11-16 fd-batchB: SkipFrame for the span, Latch for a failed conversion).
 		if (!LinearScene::Linear && !Vm.on) {	// (DeferredFirstPerson: its own light target, linear)
 			if (!LinearScene::InSpan || !LinearScene::SpanTarget || target != LinearScene::SpanTarget) {
 				target->Release(); StatSkipped++;
-				Refuse(!LinearScene::InSpan ? "LinearScene's span is not running (LinearScene off, or the game's MSAA)" : "the scene target at the span's end is not LinearScene's");
+				SkipFrame(!LinearScene::InSpan ? "LinearScene's span is not running (LinearScene off, or the game's MSAA)" : "the scene target at the span's end is not LinearScene's");
 				return;
 			}
-			if (!LinearScene::Convert(d, target, true)) { target->Release(); StatSkipped++; Refuse("LinearScene's conversion to linear light failed"); return; }
+			if (!LinearScene::Convert(d, target, true)) {
+				target->Release(); StatSkipped++;
+				// LinearScene's own latch (its line says why; it turns the renderer forward by itself): this frame only here
+				if (LinearScene::Fail.failed) SkipFrame("LinearScene failed (see its line)");
+				else Latch("LinearScene's conversion to linear light failed");
+				return;
+			}
 			StatConverted++;
 		}
 		D3DSURFACE_DESC t = {};
@@ -355,6 +412,11 @@ namespace DeferredSun {
 			if (rec && rec->TextureRef) rec->Texture = *rec->TextureRef;
 		}
 		pass->SetCT();
+		// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 22): ForwardCloudShadows' c169 for THIS pass. SetCT sends it through
+		// ForwardCloudShadows::ForShader, whose strength is 0 when the last object pass drawn was a plant's with PlantShadows off (PassPlant):
+		// the whole frame's cloud shadow then came and went with the last object drawn. Here the frame's own strength, whatever was drawn last
+		// (put back with the other pixel constants below). Plants with PlantShadows off: their pixels are told apart in the shader (batch D).
+		if (ForwardCloudShadows::Compiled) ForwardCloudShadows::SendFrame(d);
 		// the pass's own (c6-c9)
 		const NiPoint3& dir = sun->direction;
 		D3DXVECTOR3 toSun(-dir.x, -dir.y, -dir.z);
@@ -368,7 +430,9 @@ namespace DeferredSun {
 			// (2026-11-15 batch 6) the objects' sun colour as the game handed them this frame (c3 read back at a sun-lit object record's draw:
 			// 1.21 x Diff x Dimmer in every recording so far), else the directional light's Diff x Dimmer as before
 			{ objectFresh ? LandLight::ObjectColor[0] : sun->Diff.r * sun->Dimmer, objectFresh ? LandLight::ObjectColor[1] : sun->Diff.g * sun->Dimmer,
-			  objectFresh ? LandLight::ObjectColor[2] : sun->Diff.b * sun->Dimmer, 1.0f },
+			  // w (2026-11-16 fd-merged-1116, FD-BATCH-D item 22): 1 = the forward clouds shade plants ([Shaders.VolumetricClouds.Main]
+			  // PlantShadows), 0 = they do not: DeferredSun.hlsl leaves model 5's pixels out of the cloud term then, as forward's PassPlant does
+			  objectFresh ? LandLight::ObjectColor[2] : sun->Diff.b * sun->Dimmer, ForwardCloudShadows::PlantShadows ? 1.0f : 0.0f },
 			// w (2026-11-14, read only by the foliage branch, FD_FOLIAGE): 2 = [Shaders.Grass.Main] ShadowFix (the grass's lookup takes the world's up)
 			{ (float)DebugView, linearDepth ? 1.0f : 0.0f, Shadows ? 1.0f : 0.0f, FoliageCompiled && TheSettingManager->GetSettingI("Shaders.Grass.Main", "ShadowFix") ? 2.0f : 1.0f },
 			{ proj._33, proj._43, 0.01f, 2.0f } };
@@ -391,6 +455,14 @@ namespace DeferredSun {
 			{ LandLight::DeferredDir[0], LandLight::DeferredDir[1], LandLight::DeferredDir[2], landFresh ? 1.0f : 0.0f },
 			{ LandLight::Color[0], LandLight::Color[1], LandLight::Color[2], landFresh && LandLight::ColorGood ? 1.0f : 0.0f } };
 		d->SetPixelShaderConstantF(14, land[0], 2);
+		// (2026-11-16 fd-sunvis) c16 DS_Vis: x 1 = the land's height self-shadow, y 1 = the recorded highlight F0, z / w SpecularFade's band
+		// (the game's fSpecularLODStartFade and 1 / (fSpecularLODEnd - it); w 0 = no fade: SpecularFade off or not compiled, or the key off)
+		{
+			const float start = *BSShaderManager::fSpecularLODStartFade, end = *BSShaderManager::fSpecularLODEnd;
+			const bool fade = HighlightFade && end > start + 1.0f;
+			const float vis[4] = { LandCrackShadow ? 1.0f : 0.0f, AuthoredHighlight ? 1.0f : 0.0f, fade ? start : 0.0f, fade ? 1.0f / (end - start) : 0.0f };
+			d->SetPixelShaderConstantF(16, vis, 1);
+		}
 		LogLight(toSun, sun, landFresh);
 		const float one[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
 		d->SetPixelShaderConstantF(211, one, 1);	// NVR_SpecFade: full (no per-draw fade in a screen pass)
@@ -426,6 +498,12 @@ namespace DeferredSun {
 		d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
 		if (DeferredLamps::SkinSpecSurface) { d->SetRenderTarget(1, nullptr); d->SetViewport(&vp); d->SetRenderState(D3DRS_COLORWRITEENABLE1, mask1); }
 		StatPasses++;
+		if (!Vm.on) {	// (2026-11-16 fd-batchB) a drawn pass ends a streak of refused frames; one line when it follows one, or a latch's retry
+			if (SkipStreak && SkipLogs <= 21) Logger::Log("UNOFFICIAL DeferredSun: the sun pass drew again after %u skipped frame%s", SkipStreak, SkipStreak == 1 ? "" : "s");
+			SkipStreak = 0;
+			static int latchTold = 0;
+			if (Fail.tries != latchTold) { latchTold = Fail.tries; Logger::Log("UNOFFICIAL DeferredSun: the sun pass draws again after its latch (attempt %d of %d)", Fail.tries + 1, FailOnce::kTries); }
+		}
 
 		for (DWORD s = 0; s < 16; s++) {
 			rs->SetTexture(s, tex[s]);

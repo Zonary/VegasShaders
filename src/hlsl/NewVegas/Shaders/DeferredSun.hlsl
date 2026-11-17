@@ -9,10 +9,13 @@
 // deferred lerp(A, F, f) + D (1 - f)). Loaded like a template (ShaderRecord::LoadShader, the same global define list, so every compiled
 // shadow option is the forward shaders' own); every TESR_ constant and sampler is bound by the record's SetCT, by name.
 //
-// What the G-buffer does not carry, and so is not given back (the bench's parity measures it; FD-SUN-RESULTS.md "Open"): the game's canopy
-// PROJ_SHADOW and the STBB 0.85, the _rmaos micro-shadow, the vanilla bridge's authored F0, SpecularFade's per-draw highlight fade (PBR
-// pop), the parallax / land height self-shadow, the wet film's sun highlight, the land's vanilla (UsePBR off) highlight, parallax's
-// vanilla sun (POM shadows off).
+// (2026-11-16 fd-sunvis, FD-SUN-RESULTS.md section 4) Given back since: the records write in COLOR3.a's spare fraction (Includes/
+// DeferredPixel.hlsl FDSunVisCode) the share of the sun their forward term would have let through besides the cascades (the game's canopy
+// PROJ_SHADOW and STBB's 0.85, the parallax / land height self-shadow, the _rmaos micro-shadow) and the highlight's non-metal F0
+// (VanillaBridge's authored strength, the _rmaos specular level); this pass multiplies the sun by the one and lights the highlight with the
+// other, and rebuilds SpecularFade's highlight fade (PBR pop) from the pixel's distance (the game fades per object). Each by its key in
+// [Shaders.ShadowsExteriors.Deferred]. Still not carried: metal's bridged tint (metal takes its colour), the wet film's sun highlight, the
+// land's vanilla (UsePBR off) highlight, parallax's vanilla sun (POM shadows off), blended (fading) draws' recorded terms (they write none).
 
 #ifndef LINEAR_LIGHTING_ON
     #define LINEAR_LIGHTING_ON 0
@@ -23,9 +26,9 @@
         #define LIN_PREDECODED
     #endif
 #endif
-// The object shaders' opt-ins for the sun lookup (ObjectTemplate.hlsl): the character map and the clouds' shadow map looked up here.
+// The object shaders' opt-ins for the sun lookup (ObjectTemplate.hlsl): the character map looked up here. (2026-11-16 batch D: not the
+// clouds' shadow map, SHADOW_CLOUD_IN: the pass looks it up itself, below at DS_CLOUD, so it can leave plants and foliage out per pixel.)
 #define SHADOW_CHARACTER_MAP_IN 1
-#define SHADOW_CLOUD_IN
 #ifndef FD_SKIN
     #define FD_SKIN 0
 #endif
@@ -34,6 +37,16 @@
     // shadow options (the least penumbra, the reach cap), switched per pixel (Includes/Shadow.hlsl ShadowSkinPixel)
     #define SHADOW_SKIN_SOFTNESS 2
 #endif
+
+// UNOFFICIAL 2026-11-16 fd-sunvis (Includes/DeferredPixel.hlsl FDSunVisCode): the pixel's recorded highlight F0 and SpecularFade's fade, set
+// per pixel in main before the sun is lit. PBR_SPEC_F0 gives the highlight that F0 (as VanillaBridge's PBR_SPEC_F0 does in the records:
+// metal keeps its colour); the diffuse's (1 - F) share keeps the dielectric's 0.04, or less where the record's own was less (an _rmaos map's
+// specular level). FD_SUN_SPEC_FADE: Includes/Object.hlsl getSunLightingModel's fade.
+static float DSSpecF0 = 0.04f;
+static float DSSpecFade = 1.0f;
+#define PBR_SPEC_F0(baseColor, metal) lerp(DSSpecF0.xxx, (baseColor), (metal))
+#define PBR_DIELECTRIC_F0 min(DSSpecF0, 0.04f)
+#define FD_SUN_SPEC_FADE DSSpecFade
 
 #include "includes/Helpers.hlsl"
 #include "includes/Object.hlsl"
@@ -70,6 +83,7 @@ float4 TESR_TerrainExtraData : register(c11);	// x use PBR, y saturation
 float4 TESR_TerrainParallaxIso : register(c12);	// z ShadowBounce
 float4 DS_LandSun   : register(c14);	// (2026-11-15) the land's own light as its pixel shaders got it: xyz SunDir (c18, to the light), w 1 = read back this frame
 float4 DS_LandColor : register(c15);	// rgb SunColor (c3, the stored curve), w 1 = read back (core/LandLight.h); else the directional light (DS_Sun / DS_SunColor)
+float4 DS_Vis      : register(c16);	// (2026-11-16 fd-sunvis) x 1 = the land's recorded height self-shadow, y 1 = the recorded highlight F0, z SpecularFade's start (game units), w 1 / its range (0: no fade)
 float4 DS_Fog      : register(c13);	// (2026-11-14) rgb the fog colour the records lerped with (stored curve), w 1 = the game's fog is drawn: the exact stored-curve add (FDAddFogged) from the frame's copy on s0
 #define DD TESR_DeferredDepthFrame
 
@@ -79,6 +93,30 @@ sampler2D TESR_AlbedoBuffer : register(s1) = sampler_state { ADDRESSU = CLAMP; A
 sampler2D TESR_MaterialBuffer : register(s4) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
 sampler2D TESR_CapturedNormalsBuffer : register(s5) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
 sampler2D TESR_DeferredDepthLinear : register(s6) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
+
+// UNOFFICIAL 2026-11-16 batch D (DEFERRED-GAPS-AUDIT item 22, docs/next/FD-BATCH-D.md): ForwardCloudShadows ([Shaders.VolumetricClouds.Main]
+// ForwardShadows, restart; off by default) in this pass. Includes/Shadow.hlsl's cloud term (SHADOW_CLOUD_IN) is the last factor of
+// GetSunShadow and multiplies every pixel alike; the forward shaders differ per draw: the object passes of plants get strength 0 with
+// PlantShadows off (core/ForwardCloudShadows.h), and grass and the speedtree leaves never take the clouds at all. So the pass declares the
+// same map and constant (c169, s8: what Shadow.hlsl declares for SHADOW_CLOUD_IN) and applies CloudSunAt's factor itself, after the lookup,
+// to every pixel but those: the foliage records' pixels, and model 5 (plants) while DS_SunColor.w < 0.5.
+//   DS_SunColor.w (c7) = 1 the clouds shade plants (PlantShadows on), 0 they do not: core/DeferredSun.h Apply sends PlantShadows there
+//   (fd-merged-1116) and c169 as the frame's strength (ForwardCloudShadows::SendFrame, batch B).
+#if FORWARD_CLOUD_SHADOWS && FORWARD_SHADOWS
+    #define DS_CLOUD 1
+float4 NVR_CloudSun : register(c169); // xy: the map's uv under the camera along the light, z: map uv per world unit, w: strength (0 off)
+sampler2D TESR_CloudShadow : register(s8) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = LINEAR; MINFILTER = LINEAR; MIPFILTER = NONE; };
+// Includes/Shadow.hlsl CloudSunAt, the same expression (keep in step).
+float DSCloudSunAt(float3 P) {
+    float3 light = normalize(TESR_SmoothedSunDir.xyz);
+    float2 suv = NVR_CloudSun.xy + (P.xy - light.xy * (P.z / max(light.z, 0.25f))) * NVR_CloudSun.z;
+    float2 edge = min(suv, 1.0f - suv);
+    float inside = saturate(min(edge.x, edge.y) * 10.0f);
+    return lerp(1.0f, tex2Dlod(TESR_CloudShadow, float4(suv, 0.0f, 0.0f)).r, inside * NVR_CloudSun.w);
+}
+#else
+    #define DS_CLOUD 0
+#endif
 
 struct PS_IN { float2 uv : TEXCOORD0; float2 vpos : VPOS; };
 
@@ -100,15 +138,8 @@ float DSSunShadowRtFirst(float3 P, float3 Nw) {
         bool seen = w > 1.0f && uv.x >= 0.0f && uv.y >= 0.0f && uv.x <= TESR_RtSunData.z && uv.y <= TESR_RtSunData.w &&
                     abs(texel.g - w) <= abs(TESR_RtSunData.y) * w + 1.0f;
         float weight = seen ? saturate((TESR_RtSunData.x - w) / (0.15f * TESR_RtSunData.x)) : 0.0f;
-        [branch] if (weight >= 1.0f) {
-            float traced = lerp(saturate(texel.r), 1.0f, saturate(TESR_ShadowFade.x));
-#if SHADOW_CLOUD_SAMPLE
-            [branch] if (NVR_CloudSun.w > 0.0f) traced *= CloudSunAt(P);
-#elif SHADOW_CLOUD_FROM_VALUE
-            traced *= NvrCloudSun;
-#endif
-            return traced;
-        }
+        [branch] if (weight >= 1.0f)
+            return lerp(saturate(texel.r), 1.0f, saturate(TESR_ShadowFade.x));	// (the clouds' share: main's DS_CLOUD, as after GetSunShadow)
     }
     return GetSunShadow(P, Nw);
 }
@@ -128,9 +159,6 @@ float3 DSShadingNormal(float4 m, float4 normals, out float bumped) {
     return bumped > 0.5f ? ShadowDecodeNormal(float2(m.g, (m.a - 1.01f) / 0.49f - 1.0f)) : ShadowDecodeNormal(normals.rg);
 #endif
 }
-
-// The roughness the record lit with: b, the path tracer's no-highlight code (-3 .. -2) decoded, none (-1) taken as fully rough.
-float DSRoughness(float b) { return b < -1.5f ? -2.0f - b : b < 0.0f ? 1.0f : b; }
 
 // The land's sun (Includes/Terrain.hlsl getSunLighting's direct part, keep in step: the land cannot share Object.hlsl's register layout):
 // UsePBR: PBRSun with the land's metal scale, its roughness (written by the lighting-free land record: (1 - gloss) x RoughnessScale), its
@@ -213,7 +241,7 @@ float4 main(PS_IN IN, out float depth : DEPTH DS_SKIN_SPEC_OUT) : COLOR0 {
 #endif
     const float model = FDModel(m.r);
     const bool land = abs(model - 4.0f) < 0.5f;
-    const float r = DSRoughness(m.b);
+    const float r = GBufferRoughness(m.b);	// (2026-11-16 fd-sunvis: the deferred passes' one decode, Includes/Object.hlsl)
     const float metal = saturate((m.r - floor(m.r)) / 0.49f);
     const float3 L = DS_Sun.xyz;
 #ifdef FD_TEST_SUN_COLOR
@@ -231,6 +259,17 @@ float4 main(PS_IN IN, out float depth : DEPTH DS_SKIN_SPEC_OUT) : COLOR0 {
     const float3 Lland = DS_LandSun.w > 0.5f ? DS_LandSun.xyz : L;
     const float3 sunLand = DS_LandColor.w > 0.5f ? LinColor(DS_LandColor.rgb) : sunLin;
 #endif
+
+    // UNOFFICIAL 2026-11-16 fd-sunvis (Includes/DeferredPixel.hlsl FDSunVisDecode): what the record recorded of its forward sun besides the
+    // cascades: the share of the sun that reaches (objects / parallax: the canopy shadow, the parallax self-shadow, the micro-shadow, each by
+    // its key in the record; the land: its height self-shadow, by LandCrackShadow here) and the highlight's F0 (AuthoredHighlight). The
+    // highlight's fade: SpecularFade's band (the game's fSpecularLODStartFade .. fSpecularLODEnd) from this pixel's distance (the game fades
+    // per object, from the object's; DS_Vis.w 0 = no fade).
+    float sunVis, specF0;
+    FDSunVisDecode(normals.a, sunVis, specF0);
+    sunVis = land && DS_Vis.x < 0.5f ? 1.0f : sunVis;
+    DSSpecF0 = DS_Vis.y > 0.5f && !land ? specF0 : 0.04f;
+    DSSpecFade = DS_Vis.w > 0.0f ? saturate(1.0f - (length(P) - DS_Vis.z) * DS_Vis.w) : 1.0f;
 
     float3 light;
 #if FD_SKIN
@@ -262,7 +301,27 @@ float4 main(PS_IN IN, out float depth : DEPTH DS_SKIN_SPEC_OUT) : COLOR0 {
     // (2026-11-15 fd-sun-fsr, docs/next/FD-SUN-FSR-RESULTS.md: the cause was the position's half-pixel offset (Includes/DeferredDepth.hlsl
     // DDRay), not its precision; the pull hid it at 1080p and not under FSR's RenderScale 0.67 (black triangles on the land). With the
     // offset gone the replayed og-ground, Goodsprings and desert-near frames match forward as well without any pull as with it: removed.)
-    [branch] if (DS_Ctrl.z > 0.5f && dot(light, 1.0f) > 0.0f) shadow = DS_SUN_SHADOW(P, Nw);	// (2026-11-15 DS_SUN_SHADOW: GetSunShadow, or DeferredRtSunFirst's above)
+    [branch] if (DS_Ctrl.z > 0.5f && dot(light, 1.0f) > 0.0f) {
+        // (2026-11-16 fd-roofedge, docs/next/FD-ROOFEDGE.md) the lookup with the normal the forward shaders give it: the smooth normal faced to
+        // the camera by the view test (Includes/Shadow.hlsl ShadowFacingNormal, as their faceNormal). The object and parallax records now store
+        // it faced by the triangle's side (Includes/CapturedNormals.hlsl CapturedNormalOutTri), which lights a ridge seen from below correctly;
+        // the shadow lookup keeps forward's normal offset, or at a low sun a slope facing away from it took light under its ridge that forward
+        // shadows. Every other record's stored normal is already view-faced (no change); the grass's world up stays as it was.
+#if FD_FOLIAGE
+        shadow = DS_SUN_SHADOW(P, foliage ? Nw : ShadowFacingNormal(Nw, P));	// (2026-11-15 DS_SUN_SHADOW: GetSunShadow, or DeferredRtSunFirst's above)
+#else
+        shadow = DS_SUN_SHADOW(P, ShadowFacingNormal(Nw, P));	// (2026-11-15 DS_SUN_SHADOW: GetSunShadow, or DeferredRtSunFirst's above)
+#endif
+#if DS_CLOUD
+        // (2026-11-16 batch D) the clouds' share, where GetSunShadow put it (its last factor), but not on what forward kept out of it
+    #if FD_FOLIAGE
+        const bool cloudless = foliage || (abs(model - 5.0f) < 0.5f && DS_SunColor.w < 0.5f);
+    #else
+        const bool cloudless = abs(model - 5.0f) < 0.5f && DS_SunColor.w < 0.5f;
+    #endif
+        [branch] if (NVR_CloudSun.w > 0.0f && !cloudless) shadow *= DSCloudSunAt(P);
+#endif
+    }
 #if FD_SKIN
     [branch] if (skinPx) {	// SkinTemplate.hlsl's sun: SkinLight(PBRLight(the sun), the shadow) + its highlight, in world space
         FDSkinSetup(normals.a, m.b);
@@ -274,17 +333,24 @@ float4 main(PS_IN IN, out float depth : DEPTH DS_SKIN_SPEC_OUT) : COLOR0 {
     }
     else
 #endif
-    light *= shadow;
-    // the land's ShadowBounce (TerrainTemplate.hlsl): the sun its relief took, back x its colour, outside cast shadows. The parallax
-    // self-shadow is not in the G-buffer: taken as none (crackShadow 1).
-    [branch] if (land && TESR_TerrainParallaxIso.z > 0.0f) {
-        const float reliefLoss = max(0.0f, saturate(dot(Nw, Lland)) - saturate(dot(N, Lland)));
+#if FD_FOLIAGE
+    light *= shadow * (foliage ? 1.0f : sunVis);	// (2026-11-16 fd-sunvis: the recorded share, 1 where nothing was recorded)
+#else
+    light *= shadow * sunVis;	// (2026-11-16 fd-sunvis: the recorded share, 1 where nothing was recorded)
+#endif
+    // the land's ShadowBounce (TerrainTemplate.hlsl): the sun its relief took, back x its colour, outside cast shadows. (2026-11-16 fd-sunvis)
+    // the height self-shadow (crackShadow) is the recorded share (1 with LandCrackShadow off), as the land record's reliefLoss takes it.
+    // (2026-11-16 batch D, DEFERRED-GAPS-AUDIT item 11) not on the far land (Includes/DeferredPixel.hlsl FDFarLand): its forward shader
+    // (TerrainLODTemplate.hlsl) had no ShadowBounce, and slopes facing away from a low sun came out brighter and flatter than forward.
+    [branch] if (land && TESR_TerrainParallaxIso.z > 0.0f && FDFarLand(m.r) < 0.5f) {
+        const float reliefLoss = max(0.0f, saturate(dot(Nw, Lland)) - sunVis * saturate(dot(N, Lland)));
         light += sunLand * LinScale(TESR_TerrainData.z) * albedo.rgb * (reliefLoss * shadow * TESR_TerrainParallaxIso.z);
     }
 
     // DebugView (written over the frame, blend off: DeferredSun::Apply): 1 the sun alone x (1 - fog), 2 the shadow term, 3 the cascade (red
     // Near, green Middle, blue Far, white Lod, black past), 4 the fog factor (1 - fog), 5 the normal used, 6 the model (red PBRSun, green
-    // PBRDiffuse, blue the land; brighter where the normal is the bumped one), 7 the position (64-unit checker x distance / 8192)
+    // PBRDiffuse, blue the land; brighter where the normal is the bumped one), 7 the position (64-unit checker x distance / 8192), 8 (2026-11-16
+    // fd-sunvis) the recorded sun share (white = reaches) in red / green, the recorded F0 / 0.08 in blue
     [branch] if (DS_Ctrl.x > 0.5f) {
         const float v = DS_Ctrl.x;
         float3 dbg;
@@ -294,7 +360,8 @@ float4 main(PS_IN IN, out float depth : DEPTH DS_SKIN_SPEC_OUT) : COLOR0 {
         else if (v < 4.5f) dbg = keep.xxx;
         else if (v < 5.5f) dbg = N * 0.5f + 0.5f;
         else if (v < 6.5f) dbg = (land ? float3(0, 0, 1) : FDSunSpecular(albedo.a, m.r) > 0.5f ? float3(1, 0, 0) : float3(0, 1, 0)) * (0.5f + 0.5f * bumped);
-        else { const float3 cell = floor((P + DD[4].xyz) / 64.0f); dbg = float3(frac((cell.x + cell.y + cell.z) * 0.5f) * 0.6f + 0.2f, saturate(viewZ / 8192.0f), 0.0f); }
+        else if (v < 7.5f) { const float3 cell = floor((P + DD[4].xyz) / 64.0f); dbg = float3(frac((cell.x + cell.y + cell.z) * 0.5f) * 0.6f + 0.2f, saturate(viewZ / 8192.0f), 0.0f); }
+        else dbg = float3(sunVis, sunVis, saturate(DSSpecF0 / 0.08f));
         return float4(dbg, 1.0f);
     }
     // linear frame: ONE / ONE add. With the game's fog drawn, what makes the pixel exactly the forward stored-curve fog lerp

@@ -100,7 +100,12 @@ namespace GearWeather {
 	inline bool LastPlayerKnown = false;
 	inline float Moving = 0.0f;
 
-	struct Part { NiGeometry* geometry; UInt32 seed; bool weapon; };
+	// (2026-11-16 fd-fwdgroups) the part's transforms as DRAWN: batch 8 tagged parts (passes 0.63-1.00 a frame, nothing skipped) but drew none
+	// ("parts 0.0, box pixels 0" in every window): every part's bound read at DeferredFirstPerson::End, after the first-person render, missed
+	// the 150-unit test round the first-person eye. Believed: the view model's transforms no longer hold the pose the render drew (not proven
+	// in game; the F10 line's "nearest part" now says how far they were). Taken at the part's first draw instead, used for its box and noise rows.
+	struct Snap { NiTransform T; NiBound bound; float radius; };
+	struct Part { NiGeometry* geometry; UInt32 seed; bool weapon; int bones; Snap still; Snap bone[kMaxBones]; };
 	inline Part Parts[kMaxIds];
 	inline int PartCount = 0;
 	inline unsigned long long StatFrames = 0, StatPasses = 0, StatParts = 0, StatPixelsBox = 0, StatUntagged = 0, StatSkipped = 0;
@@ -186,7 +191,24 @@ namespace GearWeather {
 		if (PartCount >= kMaxIds) return kMaxIds;
 		bool weapon = false;
 		for (NiAVObject* n = geometry; WeaponNode && n && !weapon; n = n->m_parent) weapon = n == WeaponNode;
-		Parts[PartCount] = { geometry, NameSeed(geometry->m_pcName), weapon };
+		Part& p = Parts[PartCount];
+		p.geometry = geometry; p.seed = NameSeed(geometry->m_pcName); p.weapon = weapon; p.bones = 0;
+		p.still.T = geometry->m_worldTransform;
+		if (geometry->geomData) { p.still.bound = geometry->geomData->m_kBound; p.still.radius = 1.0f; } else p.still.radius = 0.0f;
+		NiSkinInstance* skin = geometry->skinInstance;
+		if (skin && skin->SkinData && skin->SkinData->BoneData && skin->BoneObjects) {
+			// the bones that move vertices, the largest bounds first when there are more than 16 (the hands and forearms carry most of the skin)
+			struct B { UInt32 i; float r; } list[128]; int n = 0;
+			for (UInt32 i = 0; i < skin->SkinData->Bones && n < 128; i++)
+				if (skin->BoneObjects[i] && skin->SkinData->BoneData[i].Verts) list[n++] = { i, skin->SkinData->BoneData[i].Bound.Radius * skin->BoneObjects[i]->m_worldTransform.scale };
+			if (n > kMaxBones) std::partial_sort(list, list + kMaxBones, list + n, [](const B& a, const B& b) { return a.r > b.r; });
+			for (int k = 0; k < n && p.bones < kMaxBones; k++) {
+				Snap& b = p.bone[p.bones++];
+				b.T = skin->BoneObjects[list[k].i]->m_worldTransform;
+				b.bound = skin->SkinData->BoneData[list[k].i].Bound;
+				b.radius = 1.0f;
+			}
+		}
 		return ++PartCount;
 	}
 	// wmTagged: WeaponMask tagged this draw (its own bit 0x80 in the same stencil states); the ids are OR'd into its reference and mask.
@@ -249,6 +271,10 @@ namespace GearWeather {
 	}
 	// ViewModelSpheres' filter: a bound centred more than 150 units from the eye is a stray (a bone parked far away), not a part on screen
 	inline bool Near(const D3DXVECTOR4& s) { return s.x * s.x + s.y * s.y + s.z * s.z < 150.0f * 150.0f; }
+	// (2026-11-16) the nearest part bound's centre from the eye this frame (DeferredFirstPerson's diagnostic line): a box that is never made
+	// shows here as hundreds or thousands of units
+	inline float NearestPart = -1.0f;
+	inline void Note(const D3DXVECTOR4& s) { const float d = sqrtf(s.x * s.x + s.y * s.y + s.z * s.z); if (NearestPart < 0.0f || d < NearestPart) NearestPart = d; }
 
 	// The camera's frame in Includes/DeferredDepth.hlsl's DD layout (DeferredFirstPerson::Frame): a sphere's box on screen, in pixels.
 	inline bool SphereBox(const D3DXVECTOR4& s, const D3DXVECTOR4* frame, RECT& box) {
@@ -279,33 +305,25 @@ namespace GearWeather {
 	struct PartData { float header[4]; float rigid[3][4]; float boneS[kMaxBones][4], boneX[kMaxBones][4], boneY[kMaxBones][4], boneZ[kMaxBones][4]; RECT box; bool any; };
 	inline void Describe(const Part& p, const D3DXVECTOR3& eye, const D3DXVECTOR4* frame, PartData& out) {
 		memset(&out, 0, sizeof(out));
-		NiGeometry* g = p.geometry;
 		out.header[1] = p.weapon ? 1.0f : 0.0f;
-		NiSkinInstance* skin = g->skinInstance;
 		int bones = 0;
-		if (skin && skin->SkinData && skin->SkinData->BoneData && skin->BoneObjects) {
-			// the bones that move vertices, the largest bounds first when there are more than 16 (the hands and forearms carry most of the skin)
-			struct B { UInt32 i; float r; } list[128]; int n = 0;
-			for (UInt32 i = 0; i < skin->SkinData->Bones && n < 128; i++)
-				if (skin->BoneObjects[i] && skin->SkinData->BoneData[i].Verts) list[n++] = { i, skin->SkinData->BoneData[i].Bound.Radius * skin->BoneObjects[i]->m_worldTransform.scale };
-			if (n > kMaxBones) std::partial_sort(list, list + kMaxBones, list + n, [](const B& a, const B& b) { return a.r > b.r; });
-			for (int k = 0; k < n && bones < kMaxBones; k++) {
-				const NiTransform& T = skin->BoneObjects[list[k].i]->m_worldTransform;
-				const D3DXVECTOR4 s = Sphere(T, skin->SkinData->BoneData[list[k].i].Bound, eye);
-				float rows[3][4]; Rows(T, eye, rows);
-				memcpy(out.boneS[bones], &s.x, 16); memcpy(out.boneX[bones], rows[0], 16); memcpy(out.boneY[bones], rows[1], 16); memcpy(out.boneZ[bones], rows[2], 16);
-				RECT r; if (Near(s) && SphereBox(s, frame, r)) Grow(out.box, r, out.any);
-				bones++;
-			}
+		// (2026-11-16) from the snapshot taken at the part's first draw (IdOf), not the transforms as they stand after the render
+		for (int k = 0; k < p.bones; k++) {
+			const D3DXVECTOR4 s = Sphere(p.bone[k].T, p.bone[k].bound, eye);
+			float rows[3][4]; Rows(p.bone[k].T, eye, rows);
+			memcpy(out.boneS[bones], &s.x, 16); memcpy(out.boneX[bones], rows[0], 16); memcpy(out.boneY[bones], rows[1], 16); memcpy(out.boneZ[bones], rows[2], 16);
+			Note(s);
+			RECT r; if (Near(s) && SphereBox(s, frame, r)) Grow(out.box, r, out.any);
+			bones++;
 		}
 		if (bones) { out.header[0] = (float)bones; return; }
-		Rows(g->m_worldTransform, eye, out.rigid);
-		if (g->geomData) { const D3DXVECTOR4 s = Sphere(g->m_worldTransform, g->geomData->m_kBound, eye); RECT r; if (Near(s) && SphereBox(s, frame, r)) Grow(out.box, r, out.any); }
+		Rows(p.still.T, eye, out.rigid);
+		if (p.still.radius > 0.0f) { const D3DXVECTOR4 s = Sphere(p.still.T, p.still.bound, eye); Note(s); RECT r; if (Near(s) && SphereBox(s, frame, r)) Grow(out.box, r, out.any); }
 		else { out.box = { (LONG)frame[3].z, (LONG)frame[3].w, (LONG)(frame[3].z + 1.0f / frame[3].x), (LONG)(frame[3].w + 1.0f / frame[3].y) }; out.any = true; }
 	}
 
 	// The first-person render begins (DeferredFirstPerson::Begin, the first-person depth surface bound): ids from now on.
-	inline void BeginTagging(NiNode* weaponNode) { Tagging = Live && Pass; PartCount = 0; WeaponNode = weaponNode; }
+	inline void BeginTagging(NiNode* weaponNode) { Tagging = Live && Pass; PartCount = 0; WeaponNode = weaponNode; NearestPart = -1.0f; }
 	inline void EndTagging() { Tagging = false; }
 
 	inline bool EnsureCopies(IDirect3DDevice9* d, const D3DSURFACE_DESC& t) {

@@ -86,7 +86,12 @@ namespace DeferredRenderer {
 	inline IDirect3DPixelShader9* SwappedFrom = nullptr;	// this draw: the deferred handle BeforeDraw swapped for its forward one
 
 	// Objects whose base pass drew with a deferred record this frame (open addressing, tagged with the frame: no clearing; FoldHighlights' pattern)
-	constexpr unsigned kSlots = 8192;
+	// UNOFFICIAL 2026-11-16 fd-batchB (deferred gaps audit item 15): 32,768 slots (8,192 before) and the insert failures counted (StatMarkFailed,
+	// on the F10 line): an object that could not be marked keeps its own lamp passes AND is lit by the lamp pass (lit twice). With 64 probes
+	// a failure needs a run of 64 taken slots, which at 8,192 slots began to be likely at a few thousand objects a frame; now ~4x that.
+	constexpr unsigned kSlots = 32768;	// (a power of two: the hash masks with kSlots - 1)
+	static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be a power of two");
+	inline unsigned long long StatMarkFailed = 0;
 	inline const void* Key[kSlots] = {};
 	inline UInt32 Frame[kSlots] = {};
 	inline bool Plain[kSlots] = {};		// the object's base record has no SPECULAR (see Skip)
@@ -102,8 +107,9 @@ namespace DeferredRenderer {
 				return true;
 			}
 		}
+		if (insert) StatMarkFailed++;	// (2026-11-16) a mark that failed (not a lookup that found nothing)
 		return false;	// table full: the object keeps its passes (drawn twice is wrong, so: not marked = its lamp passes drawn AND lit by the pass;
-						// counted in StatMarked's shortfall; 8192 objects a frame is far past any interior)
+						// counted in StatMarkFailed)
 	}
 
 	// Which pixel shaders get a deferred record (the lit records of the G-buffer templates; mode 2 adds the land).
@@ -384,13 +390,15 @@ namespace DeferredRenderer {
 		if (++StatFrames < 240) return;
 		const double f = (double)StatFrames;
 		Logger::Log("DEFERRED RENDERER %u frames (%u live), mode %d, %s, per frame: deferred binds %.1f, forward fallbacks %.2f, deferred handles swapped back at the span's end %.2f | "
-			"objects marked deferred %.1f, lamp passes skipped %.1f, highlight passes skipped %.1f (kept for a base without SPECULAR %.1f) | forward world draws in the span %.1f, of them blended (fading / alpha-blended: forward record, own lamp passes) %.2f (swapped inside a run %.2f), with lamps capped by the game %.2f (%.2f lamps unlit%s) | one-pass patch %s: forward OPT draws with lamps lost (the game's cap or the shader's slots) in the span %.2f (%.2f lamps), after it %.2f (%.2f lamps); per-object limit %s: objects learned %u, held at the forward limit %.1f, rebuilds %u; DeferredRendererOnePass %d (emittance per object %s), emissive objects held at the game's own one-pass limit %.1f, one-pass draws without the game's emittance %.1f (objects noted %u)",
-			StatFrames, (unsigned)StatLiveFrames, mode, Native ? "native" : "DXVK", StatBinds / f, StatFallbacks / f, StatSwaps / f, StatMarked / f, StatSkippedLamps / f, StatSkippedHighlights / f, StatKeptHighlights / f,
+			"objects marked deferred %.1f (marks failed, table full: %llu in these frames), lamp passes skipped %.1f, highlight passes skipped %.1f (kept for a base without SPECULAR %.1f) | forward world draws in the span %.1f, of them blended (fading / alpha-blended: forward record, own lamp passes) %.2f (swapped inside a run %.2f), with lamps capped by the game %.2f (%.2f lamps unlit%s) | one-pass patch %s: forward OPT draws with lamps lost (the game's cap or the shader's slots) in the span %.2f (%.2f lamps), after it %.2f (%.2f lamps); per-object limit %s: objects learned %u, held at the forward limit %.1f, rebuilds %u; DeferredRendererOnePass %d (emittance per object %s), emissive objects held at the game's own one-pass limit %.1f, one-pass draws without the game's emittance %.1f (objects noted %u)",
+			StatFrames, (unsigned)StatLiveFrames, mode, Native ? "native" : "DXVK", StatBinds / f, StatFallbacks / f, StatSwaps / f, StatMarked / f, StatMarkFailed, StatSkippedLamps / f, StatSkippedHighlights / f, StatKeptHighlights / f,
 			StatForwardDraws / f, StatBlended / f, StatBlendedSwaps / f, StatMissedLampDraws / f, StatMissedLamps / f, Native ? "" : ": counted on native only", OnePass ? "on" : "off",
 			StatSlotDrawsIn / f, StatSlotLampsIn / f, StatSlotDrawsOut / f, StatSlotLampsOut / f,
 			OnePassLimit::On ? (OnePassLimit::CaveIn ? "on" : "NOT installed") : "off (DXVK: ManyLamps feeds the forward shaders)",
 			OnePassLimit::Learned, OnePassLimit::Held / f, OnePassLimit::Rebuilds, OnePassMode, OnePassLimit::EmitExact ? "on" : "off", OnePassLimit::HeldEmissive / f, OnePassLimit::EmitDraws / f, OnePassLimit::MultiNoted);
 		OnePassLimit::Held = 0; OnePassLimit::HeldEmissive = 0; OnePassLimit::EmitDraws = 0;
+		if (StatMarkFailed) Logger::Log("[WARNING] UNOFFICIAL DeferredRenderer: %llu objects could not be marked deferred in the last %u frames (the table of %u slots was full there): they were lit twice (their own lamp passes and the lamp pass)", StatMarkFailed, StatFrames, kSlots);
+		StatMarkFailed = 0;
 		StatFrames = 0;
 		StatBinds = StatFallbacks = StatSwaps = StatSkippedLamps = StatSkippedHighlights = StatKeptHighlights = StatMarked = StatForwardDraws = StatMissedLampDraws = StatMissedLamps = StatLiveFrames = StatBlended = StatBlendedSwaps = 0;
 		StatSlotDrawsIn = StatSlotLampsIn = StatSlotDrawsOut = StatSlotLampsOut = 0;

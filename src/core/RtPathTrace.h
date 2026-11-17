@@ -32,6 +32,9 @@ namespace RtPathTrace {
 	// colour the diffuse light was divided by, a 0 = no surface (sky / the game's frame), 1 + metal (PTDenoiseSplit) or 1; SpecularRG /
 	// SpecularBRough (G32R32F; nullptr without PTDenoiseSplit): the specular albedo the specular light was divided by, + the roughness.
 	bool	RrGuides(IDirect3DTexture9** Albedo, IDirect3DTexture9** SpecularRG, IDirect3DTexture9** SpecularBRough);
+	// UNOFFICIAL 2026-11-15 (rt-denoise-inputs) [Main.Main.RayTracing] RRMirrorMotion: this frame's specular image (rgb the specular light, a the
+	// hit distance; < 0 at a mirror PTDenoiseMirrorSurface marked) when RrGuides gives the specular guides (PTDenoiseSplit), else nullptr
+	IDirect3DTexture9*	RrSpecular();
 	// UNOFFICIAL 2026-11-10 early kick (bench only: env NVR_RT_EARLY_PT; docs/next/PT-EARLY-KICK-PLAN-2026-11-10.md): live path tracing
 	// (PTReplace + PTDenoise) hands its frame to the helper when the world STARTS drawing, with a traced first surface (no G-buffer of
 	// this frame), and collects it right before Replace. Without the env both do nothing.

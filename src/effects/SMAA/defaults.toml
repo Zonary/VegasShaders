@@ -13,5 +13,5 @@ PredicationStrength = 0.4             # [0.0-1.0] How much a depth edge lowers t
 DeDither = false                      # Judge the luma edges on the picture without the tonemap's dither noise (recomputed from the pixel position and frame; decisions only, the blend still reads the dithered picture). Luma edge flips between dither patterns 1.8x fewer (model); +0.01 ms. Together with GateSoftness 0.5 and DitherBuster DeDither (+ Predication) the grass scene's twinkle falls 9.7x. Needs Sky Dither with AtToneMap; EdgeDetection 3 only.
 
 [_Shaders.SMAA.Status]
-Enabled = true						  # Apply SMAA.
+Enabled = false						  # Apply SMAA.  (2026-11-16, owner: off by default; settings migration 86 moves a saved true to false once)
 

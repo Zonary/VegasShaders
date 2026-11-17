@@ -29,7 +29,7 @@ layout(push_constant) uniform Push {
     vec4 size;     // x 1 / width, y 1 / height, z >= 2: the mean's variance over up to z frames (Settings.MeanVariance), w 1: the 3 x 3 kernel
     uint samplerIndex;
     float guideSigma;   // (2026-11-07) Settings.GuideSigma: the relative shading difference that weighs a tap down by 1 / e (0 = no guide)
-    uint specular;      // (2026-11-07 ptaaa-denoiser) bit 0: specular mode (above); bit 1: the symmetric brightness test (AntiFirefly, below)
+    uint specular;      // (2026-11-07 ptaaa-denoiser) bit 0: specular mode (above); bit 1: the symmetric brightness test (AntiFirefly, below); bit 4 (2026-11-16): Settings.Soft
     float historyFix;   // (2026-11-07 ptaaa-denoiser) Settings.HistoryFix: pixels with a history this short or shorter (frames; 0 off) are
                         // smoothed by geometry only, more the newer (NRD ReLAX's history fix): a newly seen pixel's one noisy path is not
                         // kept as a speckle by the brightness test (the trails behind a moving lamp or object)
@@ -69,7 +69,16 @@ void main() {
     // reference, the analytic case 1.001 -> 0.912; with this 1.040 / 1.008. The mean of the two variances overshot: 1.056 / 1.019)
     const bool symmetric = (pc.specular & 2u) != 0u;
     const float boost = ca.a < 4.0 ? 0.05 : 0.0, ownVar = variance / meanOf;
-    const float g0 = pc.guideSigma > 0.0 && !spec ? GuideShade(uv) : -1.0;
+    // UNOFFICIAL 2026-11-13 (rtgi-review B2) specular bit 3 (Settings.GuideOnce, in the passes after the first): the guide's value is in B's blue, written
+    // there by the pass before (below): this texel's and each tap's come with the B reads already made, in place of 2 more texture reads and a pow
+    // per tap. The first pass reads the guide's textures as before (B's blue is the temporal pass's fast history then).
+    const bool guideInB = (pc.specular & 8u) != 0u;
+    const float g0 = pc.guideSigma > 0.0 && !spec ? (guideInB ? cb.b : GuideShade(uv)) : -1.0;
+    // UNOFFICIAL 2026-11-16 (rtgi-review) specular bit 4 (Settings.Soft bit 2, with the guide): a texel the albedo buffer has no texel for (the guide
+    // is -1 there: grass, drawn by the game's own shader) is a SOFT surface: its blades sit each at their own depth and normal, so no tap passed the
+    // tests below and every grass texel kept its own value. Round a soft texel every tap within 25 % of its depth counts, whatever its normal and
+    // brightness. Solid texels: as before (they still shut soft taps out by depth and normal).
+    const bool soft0 = (pc.specular & 16u) != 0u && pc.guideSigma > 0.0 && !spec && g0 < 0.0;
     const float r0 = spec ? textureLod(sampler2D(t_guideFrame, NVR_SAMPLER(pc.samplerIndex)), uv, 0.0).g : 1.0;
     const float spread = spec ? smoothstep(0.05, 0.4, r0) : 1.0;
     const float normalPower = spec ? pc.params.z * mix(8.0, 1.0, spread) : pc.params.z;
@@ -91,6 +100,11 @@ void main() {
             if (tb.g <= 0.0) continue;
             const vec3 tn = normalize(textureLod(sampler2D(t_normals, NVR_SAMPLER(pc.samplerIndex)), tapUv, 0.0).xyz * 2.0 - 1.0);
             float w = reach == 1 ? kernel3[abs(x)] * kernel3[abs(y)] : kernel[abs(x)] * kernel[abs(y)];
+            if (soft0) {   // (2026-11-16 Settings.Soft) the loose depth test alone
+                w *= clamp(1.0 - abs(tb.g - z) / (0.25 * z + 1.0e-3), 0.0, 1.0);
+                sum += ta.rgb * w; moment += tb.r * w; weights += w;
+                continue;
+            }
             w *= exp(-abs(tb.g - z) / (pc.params.y * zSlope * length(vec2(x, y)) + 1.0e-3));
             w *= pow(max(dot(n, tn), 0.0), normalPower);
             if (spec && (x != 0 || y != 0)) {
@@ -111,7 +125,7 @@ void main() {
             }
             w *= mix(exp(-abs(luma(ta.rgb) - l) / sigmaT), 1.0, fresh);   // (ptaaa-denoiser: the history fix)
             if (g0 >= 0.0 && (x != 0 || y != 0)) {
-                const float gt = GuideShade(tapUv);
+                const float gt = guideInB ? tb.b : GuideShade(tapUv);
                 if (gt >= 0.0) w *= exp(-abs(gt - g0) / (pc.guideSigma * 0.5 * (gt + g0) + 1.0e-4));
             }
             sum += ta.rgb * w;
@@ -120,5 +134,5 @@ void main() {
         }
     }
     o_a = vec4(weights > 0.0 ? sum / weights : ca.rgb, ca.a);
-    o_b = vec4(weights > 0.0 ? moment / weights : cb.r, z, 0.0, 0.0);
+    o_b = vec4(weights > 0.0 ? moment / weights : cb.r, z, pc.guideSigma > 0.0 && !spec ? g0 : 0.0, 0.0);   // (b: 2026-11-13 B2, the guide for the next pass)
 }

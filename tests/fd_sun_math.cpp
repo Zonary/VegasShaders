@@ -24,10 +24,11 @@ static bool MakeDevice() {
 	return SUCCEEDED(d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window, D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_FPU_PRESERVE, &pp, &gDevice));
 }
 
-static IDirect3DPixelShader9* Compile(const std::string& file, bool pass, bool specular) {
+static IDirect3DPixelShader9* Compile(const std::string& file, bool pass, bool specular, bool fade = false) {
 	std::vector<D3DXMACRO> m;
 	m.push_back({ "FD_PASS", pass ? "1" : "0" });
 	if (specular) m.push_back({ "SPECULAR", "" });
+	if (fade) m.push_back({ "FD_FADE", "1" });	// (2026-11-16 fd-sunvis) SpecularFade's form, template vs pass
 	m.push_back({ "CAPTURED_NORMALS_ON", "3" });
 	m.push_back({ NULL, NULL });
 	ID3DXBuffer* code = nullptr; ID3DXBuffer* errors = nullptr;
@@ -42,7 +43,7 @@ static IDirect3DPixelShader9* Compile(const std::string& file, bool pass, bool s
 
 static const UINT W = 512, H = 512;
 
-static bool Draw(IDirect3DPixelShader9* ps, float spec, std::vector<float>& out) {
+static bool Draw(IDirect3DPixelShader9* ps, float spec, std::vector<float>& out, float fade = 1.0f) {
 	IDirect3DTexture9* tex = nullptr; IDirect3DSurface9* rt = nullptr; IDirect3DSurface9* sys = nullptr;
 	if (FAILED(gDevice->CreateTexture(W, H, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A32B32G32R32F, D3DPOOL_DEFAULT, &tex, NULL))) return false;
 	tex->GetSurfaceLevel(0, &rt);
@@ -58,7 +59,9 @@ static bool Draw(IDirect3DPixelShader9* ps, float spec, std::vector<float>& out)
 	const float pbrExtra[4] = { 0.85f, 1.0f, 0.5f, 4000.0f };	// c33 TESR_PBRExtraData: x saturation
 	const float pbrMath[4] = { 1.0f, 0.0f, 0.0f, 0.0f };		// c223 TESR_PBRMath: EnergySplit on, Reflectivity 1
 	const float linear[4] = { 2.2f, 1.0f / 2.2f, 0.0f, 0.0f };	// c191 TESR_LinearLighting
-	const float sp[4] = { spec, 0.0f, 0.0f, 0.0f };
+	const float sp[4] = { spec, fade, 0.0f, 0.0f };
+	const float specFade[4] = { fade, 0.0f, 0.0f, 0.0f };	// c211 NVR_SpecFade: x the template's highlight fade (PBR_SPEC_FADE)
+	gDevice->SetPixelShaderConstantF(211, specFade, 1);
 	gDevice->SetPixelShaderConstantF(32, pbrData, 1);
 	gDevice->SetPixelShaderConstantF(33, pbrExtra, 1);
 	gDevice->SetPixelShaderConstantF(223, pbrMath, 1);
@@ -105,13 +108,21 @@ int main(int argc, char** argv) {
 	if (!CopyFileA(file.c_str(), placed.c_str(), FALSE)) { printf("could not place %s\n", placed.c_str()); return 2; }
 	if (!MakeDevice()) { printf("no D3D9 device\n"); DeleteFileA(placed.c_str()); return 2; }
 	IDirect3DPixelShader9* tSpec = Compile(placed, false, true), *tDiff = Compile(placed, false, false), *pass = Compile(placed, true, false);
+	IDirect3DPixelShader9* tFade = Compile(placed, false, true, true), *passFade = Compile(placed, true, false, true);	// (2026-11-16 fd-sunvis)
 	DeleteFileA(placed.c_str());
-	if (!tSpec || !tDiff || !pass) { printf("compile failed\n"); return 2; }
+	if (!tSpec || !tDiff || !pass || !tFade || !passFade) { printf("compile failed\n"); return 2; }
 	std::vector<float> a, b, c, d;
 	if (!Draw(tSpec, 0.0f, a) || !Draw(pass, 1.0f, b) || !Draw(tDiff, 0.0f, c) || !Draw(pass, 0.0f, d)) { printf("draw failed\n"); return 2; }
 	const bool ok1 = Compare("SPECULAR template vs pass (PBRSun)", a, b);
 	const bool ok2 = Compare("plain template vs pass (PBRDiffuse)", c, d);
 	Compare("(control) SPECULAR vs plain template", a, c);
-	printf(ok1 && ok2 ? "FD SUN MATH: PASS\n" : "FD SUN MATH: FAIL\n");
-	return ok1 && ok2 ? 0 : 1;
+	// (2026-11-16 fd-sunvis) SpecularFade at 0.37 and at 0: the template's PBR_SPEC_FADE against the pass's lerp form
+	std::vector<float> e, f, g, h;
+	if (!Draw(tFade, 0.0f, e, 0.37f) || !Draw(passFade, 1.0f, f, 0.37f) || !Draw(tFade, 0.0f, g, 0.0f) || !Draw(passFade, 1.0f, h, 0.0f)) { printf("draw failed\n"); return 2; }
+	const bool ok3 = Compare("fade 0.37: template vs pass", e, f);
+	const bool ok4 = Compare("fade 0: template vs pass", g, h);
+	Compare("(control) fade 0.37 vs no fade", a, e);
+	const bool ok = ok1 && ok2 && ok3 && ok4;
+	printf(ok ? "FD SUN MATH: PASS\n" : "FD SUN MATH: FAIL\n");
+	return ok ? 0 : 1;
 }

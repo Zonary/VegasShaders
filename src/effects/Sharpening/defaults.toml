@@ -2,6 +2,7 @@
 Clamp = 0.1
 Offset = 2.0
 Strength = 0.75
+CAS = false                         # UNOFFICIAL (2026-11-13), applies immediately, outdoors and indoors: AMD FidelityFX Contrast Adaptive Sharpening (CAS) in place of the old filter, with the same fade over distance (Offset). Low-contrast detail is sharpened more and strong edges are left nearly alone (no halos). Strength is then CAS's sharpness, 0-1 (0 = the lightest CAS, not off). false = the old filter, as before.
 
 [_Shaders.Sharpening.Interiors]
 Clamp = 0.1                         # UNOFFICIAL: the same settings for interiors (Main is outdoors).

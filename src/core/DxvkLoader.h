@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <shlobj.h>	// SHGetFolderPathA (AdapterNameFromPrefs)
 #include <string>
 #include <vector>
 
@@ -225,5 +226,86 @@ namespace DxvkLoader {
 		value += std::string(kKey) + " = False";
 		SetEnvironmentVariableA("DXVK_CONFIG", value.c_str());
 		Logger::Log("DxvkLoader: DXVK told not to use its descriptor-heap binding model (DXVK_CONFIG \"%s\"; [Main.Main.Misc] DxvkDescriptorHeapOff)", value.c_str());
+	}
+
+	// UNOFFICIAL 2026-11-17 DxvkAdapterNameFromPrefs ([Main.Main.Misc], default on; docs/next/DXVK-LAUNCHER.md): the launcher loop.
+	// At start the game compares the name of the first graphics adapter its Direct3D reports with [Display] sD3DDevice from its
+	// INIs, which the launcher wrote; when they differ it starts FalloutNVLauncher.exe (from the registry's install path) and quits
+	// (FalloutNV 0x004DA570, called from WinMain after the INIs are read). The launcher then resets many graphics settings
+	// (iTexMipMapSkip=1 among them, which crashes with NVTF). DXVK reports another name than Windows: on NVIDIA its built-in profile
+	// for this game (d3d9.hideNvidiaGpu) and on Intel its default (d3d9.hideIntelGpu) say "AMD Radeon RX 6700 XT". With DXVK in the
+	// game folder the launcher runs on it too and writes that name; from Data\NVSE\Plugins\VSDxvk (a mod manager install) only the
+	// game runs on DXVK, the launcher writes Windows' name, the game sees DXVK's, starts the launcher, and so on for ever
+	// (a co-developer, 2026-11-17). So whenever the game's Direct3D is DXVK (the mod's, or a DXVK d3d9.dll in the game folder), DXVK is
+	// told to report the name the INIs already hold: d3d9.customDeviceDesc = "<that name>" added to DXVK_CONFIG for this process.
+	// Only the name: DXVK keeps its vendor and device ids (on NVIDIA still AMD's 1002 / 73DF, as the game and Vegas Shaders have
+	// always seen them under DXVK), so DXVK and the game treat the card exactly as before. Nothing on disk is changed. Left alone:
+	// INIs that name no card yet (a first start: the launcher runs once, as it does without DXVK), a name DXVK_CONFIG cannot carry
+	// (" or ;), a dxvk.conf or DXVK_CONFIG that sets d3d9.customDeviceDesc itself (the player's setting wins), any other d3d9.dll.
+	// Cost: a real graphics card change no longer starts the launcher under DXVK (the old settings stay). Called at plugin load
+	// after the settings are read, before the game reads its INIs or makes its Direct3D (DXVK reads DXVK_CONFIG when the first
+	// Direct3D object is made).
+
+	// The game's INI folder, chosen as FalloutNV 0x00876AD0 does: the game folder when .\Custom.ini or .\FALLOUT.INI (relative to the
+	// current folder, which is the game's) has [General] bUseMyGamesDirectory=0, else Documents\My Games\FalloutNV\.
+	inline std::string GameIniFolder() {
+		if (!GetPrivateProfileIntA("General", "bUseMyGamesDirectory", 1, ".\\Custom.ini") || !GetPrivateProfileIntA("General", "bUseMyGamesDirectory", 1, ".\\FALLOUT.INI"))
+			return ".\\";
+		char documents[MAX_PATH] = {};
+		if (FAILED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents))) return "";
+		return std::string(documents) + "\\My Games\\FalloutNV\\";
+	}
+	// sD3DDevice as the game reads it: FALLOUT.INI, then FalloutPrefs.ini over it, through GetPrivateProfileString as the game reads
+	// its INIs (surrounding quotes stripped; a mod manager's profile INIs are seen the same way). False when neither file has it.
+	inline bool GameD3DDevice(const std::string& folder, std::string& name, std::string& from) {
+		static const char* kMissing = "\x01";
+		bool found = false;
+		for (const char* file : { "FALLOUT.INI", "FalloutPrefs.ini" }) {
+			char value[512] = {};
+			const std::string path = folder + file;
+			GetPrivateProfileStringA("Display", "sD3DDevice", kMissing, value, sizeof(value), path.c_str());
+			if (strcmp(value, kMissing)) { name = value; from = path; found = true; }
+		}
+		return found;
+	}
+
+	inline void AdapterNameFromPrefs(bool wanted) {
+		static const char* kKey = "d3d9.customDeviceDesc";
+		char runtime[MAX_PATH] = {};
+		HMODULE d3d9 = GetModuleHandleA("d3d9.dll");
+		if (!Loaded && !(d3d9 && GetModuleFileNameA(d3d9, runtime, MAX_PATH) && IsDxvk(runtime))) return;	// not DXVK: nothing to do
+		if (!wanted) { Logger::Log("DxvkLoader: DxvkAdapterNameFromPrefs is off: DXVK names the graphics card itself"); return; }
+		char file[MAX_PATH] = {};
+		if (!GetEnvironmentVariableA("DXVK_CONFIG_FILE", file, MAX_PATH)) strcpy_s(file, "dxvk.conf");
+		std::string conf;
+		if (FILE* f = nullptr; !fopen_s(&f, file, "rb") && f) {
+			char buffer[4096]; size_t n;
+			while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0) conf.append(buffer, n);
+			fclose(f);
+		}
+		char line[2048] = {};
+		const DWORD have = GetEnvironmentVariableA("DXVK_CONFIG", line, sizeof(line));
+		if (ConfigSetsKey(conf, kKey) || (have < sizeof(line) && ConfigSetsKey(line, kKey))) {
+			Logger::Log("DxvkLoader: %s is set in %s: the graphics card's name is left as the player set it", kKey, ConfigSetsKey(conf, kKey) ? file : "DXVK_CONFIG");
+			return;
+		}
+		const std::string folder = GameIniFolder();
+		std::string name, from;
+		if (folder.empty() || !GameD3DDevice(folder, name, from) || name.empty()) {
+			Logger::Log("DxvkLoader: the game's INIs (%s) name no graphics card yet (sD3DDevice): DXVK's own name is used, and the game starts its "
+				"launcher once, as it does without DXVK", folder.empty() ? "Documents folder not found" : folder.c_str());
+			return;
+		}
+		if (name.find_first_of("\";") != std::string::npos) {
+			Logger::Log("[WARNING] DxvkLoader: sD3DDevice \"%s\" (%s) cannot be passed to DXVK: DXVK's own name is used", name.c_str(), from.c_str());
+			return;
+		}
+		if (have >= sizeof(line)) { Logger::Log("[WARNING] DxvkLoader: DXVK_CONFIG is too long to add to: DXVK's own graphics card name is used"); return; }
+		std::string value = line;
+		if (!value.empty()) value += ";";
+		value += std::string(kKey) + " = \"" + name + "\"";
+		SetEnvironmentVariableA("DXVK_CONFIG", value.c_str());
+		Logger::Log("DxvkLoader: DXVK told to name the graphics card \"%s\", as %s does, so the game's graphics-card check does not start the "
+			"launcher (vendor and device ids unchanged; DXVK_CONFIG \"%s\"; [Main.Main.Misc] DxvkAdapterNameFromPrefs)", name.c_str(), from.c_str(), value.c_str());
 	}
 }

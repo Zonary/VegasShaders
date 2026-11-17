@@ -26,3 +26,4 @@ PersistentDebugView = 0             # (Persistent wetness and snow) Test view. 1
 
 [_Shaders.WetWorld.Status]
 Enabled = true                      # Water ripples on surfaces, and puddles based on physical terrain pockets during rainy weathers. 
+
