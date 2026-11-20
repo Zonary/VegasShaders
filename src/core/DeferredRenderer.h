@@ -10,7 +10,9 @@
 //  - Records (ShaderManager::LoadShader, at load): mode 1 = LAMPS_DEFERRED 3 (ObjectTemplate.hlsl NVR_LAMPS_OUT: every lamp out, the sun /
 //    cell light kept) for every lit Object and Parallax pixel shader, from the Interior overrides where the name has an Interior record;
 //    mode 2 = the lighting-free records (LAMPS_DEFERRED 2, core/LightFreeRecords.h) of the Object, Parallax and Terrain shaders. Both write
-//    the deferred mark (COLOR2.a 1.01..1.99) the lamp pass lights. Not: hair (HAIR), the game's added-light passes (DIFFUSE, ONLY_SPECULAR),
+//    the deferred mark (COLOR2.a 1.01..1.99) the lamp pass lights. (2026-11-18 DeferredStandalone) mode 2 also for a shader whose forward
+//    records did not load (too long for ps_3_0): the game's own shader is then its forward partner (ForwardOf, the blended-draw swap).
+//    Not: hair (HAIR), the game's added-light passes (DIFFUSE, ONLY_SPECULAR),
 //    the unlit pass (NO_LIGHT); skin, eyes, first person, reflections and everything after the main list stay forward (other templates or
 //    other contexts: the records are chosen only inside the main list's G-buffer span, CapturedNormals::InSpan).
 //  - Selection (NiD3DPixelShaderEx::SetupShader, Choose): indoors (mode 2: outdoors too while DeferredSun runs) while the G-buffer is bound;
@@ -34,6 +36,7 @@
 // whether it runs (DeferredSun::Wanted); its Apply is called in Render.cpp's DeferredSpan, after this file's AtSpanEnd.
 #include "DeferredSun.h"
 #include "DeferredFoliage.h"	// UNOFFICIAL 2026-11-14 phase 3 foliage: its live state follows mode 2's (BeginFrame)
+#include "LateInteriors.h"	// UNOFFICIAL 2026-11-16 fast-restart (InteriorRecordCensus, log only)
 
 namespace DeferredRenderer {
 	inline const char* kSection = "Main.Main.Quality";
@@ -56,7 +59,17 @@ namespace DeferredRenderer {
 	inline unsigned Loaded = 0, Refused = 0;
 	// 2026-11-14 fd-fixes (blended draws): every deferred handle -> its record and its forward record (the per-draw swap below), and the
 	// land's (TerrainTemplate, mode 2) handles: the land's fade over objects is a SRCALPHA blend with alpha 1, a plain replace, so it stays deferred
-	struct Pair { ShaderRecordPixel* deferred; ShaderRecordPixel* forward; };
+	// UNOFFICIAL 2026-11-19: outdoor partner (Exterior, else Default — FORWARD_SHADOWS = 1). Swapping an alpha-blended outdoor object
+	// (cracked asphalt road slabs, rubble skirts, decals) to the Interior record (FORWARD_SHADOWS = 0) stripped all sun shadows from it.
+	struct Pair { ShaderRecordPixel* deferred; ShaderRecordPixel* forward; ShaderRecordPixel* outdoor = nullptr; };
+	inline ShaderRecordPixel* OutdoorRecord(const NiD3DPixelShaderEx* shader) {
+		ShaderRecordPixel* r = shader ? (ShaderRecordPixel*)shader->ShaderProg[ShaderRecordType::Exterior] : nullptr;
+		if (!r && shader) r = (ShaderRecordPixel*)shader->ShaderProg[ShaderRecordType::Default];
+		return r && r->ShaderHandle ? r : nullptr;
+	}
+	inline ShaderRecordPixel* PartnerOf(const Pair& pair) {
+		return pair.outdoor && TheShaderManager && TheShaderManager->GameState.isExterior ? pair.outdoor : pair.forward;
+	}
 	inline std::unordered_map<IDirect3DPixelShader9*, Pair> Pairs;
 	inline std::unordered_set<IDirect3DPixelShader9*> LandHandles;
 
@@ -133,12 +146,20 @@ namespace DeferredRenderer {
 		for (int d = 0; d < 63 && tmpl.Defines[d].Name; d++) if (!strcmp(tmpl.Defines[d].Name, define)) return true;
 		return false;
 	}
-	inline void Add(const void* shader, ShaderRecordPixel* record, ShaderRecordPixel* forward, const char* name, const ShaderTemplate& tmpl) {
+	// gameHandle (2026-11-18 DeferredStandalone): with no forward record, the game's own shader takes the forward record's place in the span-end
+	// swap and for blended draws (BeforeDraw), so the lighting-free record never draws outside the G-buffer span
+	inline void Add(const void* shader, ShaderRecordPixel* record, ShaderRecordPixel* forward, const char* name, const ShaderTemplate& tmpl, IDirect3DPixelShader9* gameHandle = nullptr) {
 		Records[shader] = record;
 		Handles.insert(record->ShaderHandle);
 		if (!HasDefine(tmpl, "SPECULAR")) PlainHandles.insert(record->ShaderHandle);
 		if (forward && forward->ShaderHandle) DeferredLamps::ForwardOf[record->ShaderHandle] = forward->ShaderHandle;	// the span-end swap (critic item 4)
-		Pairs[record->ShaderHandle] = { record, forward && forward->ShaderHandle ? forward : nullptr };
+		else if (gameHandle) {
+			gameHandle->AddRef();	// held for the session: the swaps bind it after load, and the game may let go of its own reference
+			DeferredLamps::ForwardOf[record->ShaderHandle] = gameHandle;
+		}
+		ShaderRecordPixel* outdoor = OutdoorRecord((const NiD3DPixelShaderEx*)shader);
+		if (outdoor && outdoor->ShaderHandle) DeferredLamps::ForwardOfOutdoor[record->ShaderHandle] = outdoor->ShaderHandle;
+		Pairs[record->ShaderHandle] = { record, forward && forward->ShaderHandle ? forward : nullptr, outdoor };
 		if (tmpl.Name && !strcmp(tmpl.Name, "TerrainTemplate")) LandHandles.insert(record->ShaderHandle);
 		Missing.erase(shader);
 		Loaded++;
@@ -171,11 +192,16 @@ namespace DeferredRenderer {
 	// render thread).
 	inline void Load(NiD3DPixelShaderEx* shader, const char* name, ShaderTemplate tmpl) {
 		const int mode = Mode();
-		if (!mode || !shader->ShaderProg[ShaderRecordType::Default] || !Eligible(name, tmpl, mode)) return;
-		ShaderRecordPixel* forward = (ShaderRecordPixel*)(shader->ShaderProg[ShaderRecordType::Interior] ? shader->ShaderProg[ShaderRecordType::Interior] : shader->ShaderProg[ShaderRecordType::Default]);
+		if (!mode || !Eligible(name, tmpl, mode)) return;
+		// (2026-11-18 DeferredStandalone, LightFreeRecords.h) mode 2 with no forward record: the lighting-free record alone, if one was made
+		ShaderRecordPixel* forward = (ShaderRecordPixel*)(shader->ShaderProg[ShaderRecordType::Interior] ? shader->ShaderProg[ShaderRecordType::Interior] :
+			shader->ShaderProg[ShaderRecordType::Default] ? shader->ShaderProg[ShaderRecordType::Default] : shader->ShaderProg[ShaderRecordType::Exterior]);
+		const bool forwardLoaded = forward != nullptr;
+		if (!forwardLoaded && !(mode >= 2 && LightFreeRecords::Records.count(shader) && shader->ShaderHandleBackup)) return;
 		if (mode >= 2) {
 			auto found = LightFreeRecords::Records.find(shader);
-			if (found != LightFreeRecords::Records.end()) Add(shader, found->second, forward, name, tmpl); else NoteRefused(shader, name);
+			if (found != LightFreeRecords::Records.end()) Add(shader, found->second, forward, name, tmpl, forwardLoaded ? nullptr : (IDirect3DPixelShader9*)shader->ShaderHandleBackup);
+			else NoteRefused(shader, name);
 		}
 		else if (!Records.count(shader)) {
 			static const D3DXMACRO overrides[2] = { { "LAMPS_DEFERRED", "3" }, { NULL, NULL } };
@@ -268,9 +294,18 @@ namespace DeferredRenderer {
 		BlendedNow = true;
 		if (!bound) return;
 		auto p = Pairs.find(bound);
-		if (p == Pairs.end() || !p->second.forward) return;	// (no forward record known: drawn deferred, as before)
-		p->second.forward->SetCT();
-		d->SetPixelShader(p->second.forward->ShaderHandle);
+		if (p == Pairs.end()) return;
+		ShaderRecordPixel* partner = PartnerOf(p->second);
+		if (partner) {
+			partner->SetCT();
+			d->SetPixelShader(partner->ShaderHandle);
+			if (GpuTimer::Enabled && partner->PointShadowForward) InteriorRecordCensus::Swap();	// (2026-11-16 fast-restart, log only)
+		}
+		else {	// (2026-11-18 DeferredStandalone) no forward record: the game's own shader, which takes the game's constants as they are
+			auto g = DeferredLamps::ForwardOf.find(bound);
+			if (g == DeferredLamps::ForwardOf.end()) return;	// (none known: drawn deferred, as before)
+			d->SetPixelShader(g->second);
+		}
 		SwappedFrom = bound;
 		BoundDeferred = BoundPlain = false;
 		StatBlendedSwaps++;
@@ -331,8 +366,17 @@ namespace DeferredRenderer {
 		d->GetPixelShader(&bound);
 		if (bound) {
 			if (Handles.count(bound)) {
-				auto f = DeferredLamps::ForwardOf.find(bound);
-				if (f != DeferredLamps::ForwardOf.end()) { d->SetPixelShader(f->second); StatSwaps++; }
+				auto p = Pairs.find(bound);
+				ShaderRecordPixel* partner = p != Pairs.end() ? PartnerOf(p->second) : nullptr;
+				if (partner && partner->ShaderHandle) {
+					partner->SetCT();
+					d->SetPixelShader(partner->ShaderHandle);
+					StatSwaps++;
+				}
+				else {
+					auto f = DeferredLamps::ForwardOf.find(bound);
+					if (f != DeferredLamps::ForwardOf.end()) { d->SetPixelShader(f->second); StatSwaps++; }
+				}
 			}
 			bound->Release();
 		}

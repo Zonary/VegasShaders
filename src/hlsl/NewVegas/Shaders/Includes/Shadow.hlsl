@@ -190,8 +190,8 @@ static const float SHADOW_FORMAT = TESR_ShadowFormatData.y;
 #endif
 
 // ---------------------------------------------------------------------------
-// UNOFFICIAL 2026-11-04 ForwardCloudShadows ([Shaders.VolumetricClouds.Main] ForwardShadows, restart: FORWARD_CLOUD_SHADOWS from
-// ShaderRecord::BuildDefines; core/ForwardCloudShadows.h). The volumetric clouds' shadow taken off the SUN term inside the surface
+// UNOFFICIAL 2026-11-04 ForwardCloudShadows ([Shaders.VolumetricClouds.Main] ForwardShadows, live since 2026-11-16: FORWARD_CLOUD_SHADOWS
+// below; core/ForwardCloudShadows.h). The volumetric clouds' shadow taken off the SUN term inside the surface
 // shaders, per MSAA sample, instead of SunFar's factor over the finished picture (that factor is one per pixel: with the game's MSAA it
 // darkened a whole edge pixel by its nearest sample's sun share, and it darkened grass and plants, which nothing could tell apart).
 // Grass and the speedtree leaves do not include it: they keep their sunlight under a cloud. The object passes of plants get strength 0
@@ -200,8 +200,11 @@ static const float SHADOW_FORMAT = TESR_ShadowFormatData.y;
 //     record; the Interior records' s8 is a lamp's) looked up here, on NVR_CloudSun (c169, set per draw).
 //   SHADOW_CLOUD_VALUE (the land: every sampler is taken): its vertex shader looks the map up (CloudSunVertex, the vertex sampler s1)
 //     and the pixel shader puts the interpolated value in NvrCloudSun before GetSunShadow.
+// UNOFFICIAL 2026-11-16 fast-restart (docs/next/FAST-RESTART.md): compiled into every outdoor record always and switched live by the
+// strength the DLL sends (NVR_CloudSun.w / NVR_CloudSunVS.w: 0 = off: the lookup is skipped and the land's value is 1). Before, it was
+// compiled in only with the setting and the clouds on at startup, so flipping either recompiled nearly every shader at the next start.
 #ifndef FORWARD_CLOUD_SHADOWS
-    #define FORWARD_CLOUD_SHADOWS 0
+    #define FORWARD_CLOUD_SHADOWS 1
 #endif
 #if FORWARD_CLOUD_SHADOWS && FORWARD_SHADOWS && defined(SHADOW_CLOUD_IN) && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS)
     #define SHADOW_CLOUD_SAMPLE 1

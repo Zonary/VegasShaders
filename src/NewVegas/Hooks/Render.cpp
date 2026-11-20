@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <mutex>
+#include "../../core/DdsTranscode.h"	// UNOFFICIAL 2026-11-18 BC7 / DX10-header _rmaos maps (RmaosDraw)
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -83,6 +84,7 @@ void HdrOutputNoteDesktop() { HdrOutput::NoteDesktop(); }	// UNOFFICIAL 2026-10-
 #include "../../core/ScopeCamera.h"	// UNOFFICIAL 2026-11-12 [Main.Main.Scope] Detect / OwnCamera / ...: the picture-in-picture scope's scene (ScopeScene below)
 #include "../../core/ScopeFog.h"	// UNOFFICIAL 2026-11-12 [Main.Main.Scope] PostEffects 1: distance fog on that picture
 #include "../../core/ForwardCloudShadows.h"	// UNOFFICIAL 2026-11-04 ForwardCloudShadows: the clouds' shadow in the surface shaders
+#include "../../core/LateInteriors.h"	// UNOFFICIAL 2026-11-16 fast-restart: the Interior lamp-shadow records made after the start
 #include "../../core/BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (LOD only, per draw; fork port 2026-11-13)
 #include "../../gunfx/GunFX.h"	// 2026-11-16 (gunfx-builtin): GunFX built in: its heat, haze and smoke by direct calls
 #include "../../gunfx/GunFXHost.h"
@@ -689,6 +691,9 @@ RenderMethod Render = reinterpret_cast<RenderMethod>(Hooks::Render);
 static bool MaterialWFor(const void* Pass, float& w, bool inSpan);	// UNOFFICIAL 2026-11-15 (below, MaterialForPass): c211.w for MergeCopies' key
 void __fastcall RenderHook(Main* This, UInt32 edx, BSRenderedTexture* RenderedTexture, int Arg2, int Arg3) {
 	SessionLog::StageScope stage("game frame");	// 2026-11-04: the CRASH lines' stage (SessionLog.h)
+	// UNOFFICIAL 2026-11-16 fast-restart (core/LateInteriors.h): the lamp-shadow records left out of the start, before anything of this frame
+	// draws: as soon as their compiles are done, and at the latest when a game is loaded (waiting for them then)
+	if (LateInteriors::Any()) { SessionLog::StageScope late("lamp-shadow records"); LateInteriors::Tick(Player && Player->parentCell); }
 	SessionLog::StallWatch::FrameScope stallFrame;	// UNOFFICIAL 2026-11-07 (perf-ptcost): the STALL watchdog's frame begin / end (SessionLog.h)
 	static CpuTimer gameRenderCpuTimer("Game render (CPU)"), presentCpuTimer("Present (CPU)"), gameUpdateCpuTimer("Game update (CPU)");
 	const double renderStart = CpuTimer::NowMs();
@@ -751,9 +756,11 @@ void __fastcall RenderHook(Main* This, UInt32 edx, BSRenderedTexture* RenderedTe
 	LampPassTest::BeginFrame();	// UNOFFICIAL, diagnostic: LampPassTestSkip
 #endif
 	DeferredRenderer::BeginFrame();	// UNOFFICIAL 2026-11-14 full deferred renderer (before LampsInOnePass: its one-pass wish; before DeferredLamps: its live switch)
+	InteriorRecordCensus::Frame(!TheShaderManager->GameState.isExterior && Player && Player->parentCell, DeferredRenderer::Live);	// UNOFFICIAL 2026-11-16 fast-restart (log only, F10)
 	DeferredTransparents::BeginFrame();	// UNOFFICIAL 2026-11-15 forward+ for the blended list (off: nothing)
 	LampsInOnePass::BeginFrame();	// UNOFFICIAL 2026-10-18 LampsInOnePass (before the scene walk builds the objects' passes)
 	ManyLamps::BeginFrame(ConstantFilter::Hooked);	// UNOFFICIAL 2026-10-27 ManyLampsOnePass (F10 statistics)
+	PointShadowForward::UpdateKeepLamps();	// UNOFFICIAL 2026-11-19: keep lamps whose radius reaches the view active indoors and outdoors even when RenderShadowMaps is skipped
 	DeferredLamps::BeginFrame();	// UNOFFICIAL 2026-10-31 DeferredLamps
 	DeferredSun::BeginFrame();	// UNOFFICIAL 2026-11-14 DeferredSun
 	DeferredFirstPerson::BeginFrame();	// UNOFFICIAL 2026-11-15 DeferredFirstPerson / GearWeather (off: nothing)
@@ -1869,7 +1876,7 @@ namespace RmaosDraw {
 	static std::unordered_map<const NiSourceTexture*, Entry> ByTexture;
 	static size_t ByTextureCap = 4096;	// UNOFFICIAL 2026-11-12: ByTexture is bounded (CapTextureLookup above; Forget)
 	static unsigned ByTextureCleared = ~0u;
-	struct Job { Map* Target; std::string File; std::vector<char> Bytes; };
+	struct Job { Map* Target; std::string File; std::vector<char> Bytes; std::string Note; };	// Note: DdsTranscode's line (UNOFFICIAL 2026-11-18)
 	static std::mutex Lock;
 	static std::condition_variable Wake;
 	static std::deque<Job> ToRead, Read;
@@ -1885,10 +1892,12 @@ namespace RmaosDraw {
 	static int BudgetMB = 512;					// [Shaders.PBR.Rmaos] BudgetMB (0 = no limit), read once a second
 	static float KeepSeconds = 30.0f;			// [Shaders.PBR.Rmaos] KeepSeconds
 	static bool Trimming = false, ToldBudget = false, ToldAllInUse = false;
+	static int Converted = 0;	// UNOFFICIAL 2026-11-18 DdsTranscode: maps converted so far (a line each for the first 40)
 	static double SettingsAtMs = -1.0e30, ScanAtMs = 0.0, CountAtMs = 0.0;
 	static unsigned long long Released = 0, ReleasedTold = 0, ReleasedBytes = 0;
 	static bool WorkerStarted = false, Checked = false, Compiled = false;
 	static float Current[4] = { -1.0f, 0.0f, 0.0f, 0.0f };	// c220 as last sent this frame
+	static IDirect3DTexture9* LastTexture = nullptr;	// UNOFFICIAL 2026-11-19: stage 2 texture for the draw in progress (re-bound after shader binds)
 	static bool ThisDraw = false;	// UNOFFICIAL 2026-10-20: the object being drawn has its map on (MaterialAware reflections, core/ReflMaterial.h)
 	// UNOFFICIAL 2026-10-18 FadeIn (pbrpop, [Shaders.PBR.Rmaos] FadeIn, seconds, live): a map that has just arrived comes in over this time
 	// (c220.x = its share, Object.hlsl blends its values in from the object's look without it) instead of at once. 0 = at once, as before.
@@ -1918,6 +1927,10 @@ namespace RmaosDraw {
 			}
 			std::ifstream file(job.File, std::ios::binary);
 			if (file) job.Bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+			// UNOFFICIAL 2026-11-18 (core/DdsTranscode.h): a DX10-header DDS (BC7 above all, which D3D9 does not have) made readable by D3DX9
+			// here, off the render thread; the line goes to the log when Upload makes the texture
+			char why[256];
+			if (const char* note = DdsTranscode::ToLegacy(job.Bytes, why, sizeof(why))) job.Note = note;
 			std::lock_guard<std::mutex> hold(Lock);
 			Read.push_back(std::move(job));
 		}
@@ -2151,7 +2164,9 @@ namespace RmaosDraw {
 				HeldBytes += target.Bytes;
 				Held.push_back(&target);
 			}
-			else { target.Missing = true; Logger::Log("[Rmaos] could not load %s", job.File.c_str()); }
+			else { target.Missing = true; Logger::Log("[Rmaos] could not load %s%s%s", job.File.c_str(), job.Note.empty() ? "" : ": ", job.Note.c_str()); }
+			if (texture && !job.Note.empty() && Converted++ < 40) Logger::Log("[Rmaos] %s: %s%s", job.File.c_str(), job.Note.c_str(),
+				Converted == 40 ? " (the last such line this session)" : "");
 			uploaded++;
 		}
 #if NVR_TEST_TOOLS
@@ -2194,17 +2209,26 @@ namespace RmaosDraw {
 
 	// Every draw with a map binds it (stage 2 is the effects' too between the passes); without one, stage 2 is left as it is:
 	// the shader does not read it then.
+	static void BindStage2(IDirect3DTexture9* texture) {
+		TheRenderManager->device->SetTexture(2, texture);
+		TheRenderManager->renderState->NoteDeviceTexture(2, texture);
+		const DWORD states[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP},
+			{D3DSAMP_MAGFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MINFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MIPFILTER, D3DTEXF_LINEAR} };
+		for (const auto& s : states) TheRenderManager->SetSamplerState(2, (D3DSAMPLERSTATETYPE)s[0], s[1]);
+	}
+
 	static void Send(const float values[4], IDirect3DTexture9* texture) {
-		if (texture) {
-			TheRenderManager->device->SetTexture(2, texture);
-			TheRenderManager->renderState->NoteDeviceTexture(2, texture);
-			const DWORD states[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP},
-				{D3DSAMP_MAGFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MINFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MIPFILTER, D3DTEXF_LINEAR} };
-			for (const auto& s : states) TheRenderManager->SetSamplerState(2, (D3DSAMPLERSTATETYPE)s[0], s[1]);
-		}
+		LastTexture = texture;
+		if (texture) BindStage2(texture);
 		if (!memcmp(values, Current, sizeof(Current))) return;
 		memcpy(Current, values, sizeof(Current));
 		TheRenderManager->device->SetPixelShaderConstantF(220, Current, 1);
+	}
+
+	// UNOFFICIAL 2026-11-19: a shader bind or deferred->forward swap during the draw can overwrite stage 2 (the game's own texture bind
+	// or SetCT); re-bind this object's _rmaos / _m texture so NVR_RmaosMap never reads a stale stage-2 binding.
+	static void AfterBind() {
+		if (Compiled && LastTexture) BindStage2(LastTexture);
 	}
 
 	// One object about to be drawn (RenderPassStandard/Skinned hooks).
@@ -2219,8 +2243,14 @@ namespace RmaosDraw {
 		}
 		if (!Compiled) return;
 		PBRShaders* pbr = TheShaderManager->Shaders.PBR;
+		// UNOFFICIAL 2026-11-18 MetalFromMap on by default (owner: "maps decide"; settings step 91). A modder's report: a gun with a hand-made
+		// _rmaos map kept its matte rust and shiny steel in the world but came out with one uniform gloss in first person. With MetalFromMap
+		// off the metal was the colour guess, and the first-person guess ([Shaders.PBR.Metal] FirstPerson 1.0, GreyMetal 0.5) made every grey
+		// part at least half metal whatever the map said, so its sky reflection covered the map's roughness; the world's guess (GreyMetal 0)
+		// made almost nothing metal, so the world looked right by chance, its authored metal ignored as well.
+		const bool metalFromMap = pbr && pbr->RmaosSettings.MetalFromMap;
 		float values[4] = { 0.0f, pbr ? pbr->RmaosSettings.OcclusionNow : 1.0f, pbr ? (float)pbr->RmaosSettings.DebugView : 0.0f,
-			pbr && pbr->RmaosSettings.MetalFromMap ? 1.0f : 0.0f };	// UNOFFICIAL 2026-10-28 w: MetalFromMap (Object.hlsl getDerivedMetallic)	// UNOFFICIAL 2026-10-18: Occlusion x the weather's AOScale
+			metalFromMap ? 1.0f : 0.0f };	// UNOFFICIAL 2026-10-28 w: MetalFromMap (Object.hlsl getDerivedMetallic)	// UNOFFICIAL 2026-10-18: Occlusion x the weather's AOScale
 		Map* map = nullptr;
 		NiGeometry* geometry = pass ? pass->geometry : nullptr;
 		BSShaderProperty* property = geometry ? (BSShaderProperty*)geometry->GetProperty(NiProperty::PropertyType::kType_Shade) : nullptr;
@@ -2305,6 +2335,7 @@ namespace RmaosDraw {
 	// UNOFFICIAL 2026-11-09 FromGameData: after the object's draw. A draw that does not come through ForObject (the game's sorted blended
 	// list, another plugin's draws) read whatever the last object left in c94: one object's metal on the next. Put "on, no flag" back.
 	static void AfterObject() {
+		LastTexture = nullptr;
 		if (!EnvData::Compiled || !EnvData::Dirty) return;
 		const float env[4] = { EnvData::Live ? 1.0f : 0.0f, 0.0f, 0.0f, EnvData::NoMask };
 		TheRenderManager->device->SetPixelShaderConstantF(94, env, 1);
@@ -2447,6 +2478,12 @@ namespace GrassFirst {
 	static bool Recording = false;
 	static void* ActiveAccumulator = nullptr;	// set by the early part, consumed by the late part of the same accumulator call
 	static std::vector<Record> Records;
+	// UNOFFICIAL 2026-11-16 grass-cull (docs/next/GRASS-CULL.md): the passes whose cards GPU grass caught and skipped this call (KeepCards off),
+	// with the part they were drawn for (0 every tuft, 1 the near ones). If no strands could be drawn for them (GpuGrass::StrandsFailed) their
+	// cards are drawn after all (DrawCaughtCards): a piece never ends up with neither.
+	struct Caught { void* pass; UInt32 passId, a3, a4, a5, cull, alphaTest; int part; };
+	static std::vector<Caught> GpuCaught;
+	static unsigned StatCardsBack = 0;
 	static bool GameVertexShader[kGrassLastId - kGrassFirstId + 1] = {};	// learned: this grass pass binds the game's VS (no split)
 	// UNOFFICIAL 2026-10-28 (tester: "i think grass shadows go away after fast traveling"): frames in a row a learned pass bound NVR's VS
 	// again in the late part; at UnlearnFrames it is split (and so drawn early, with its sun shadows) again. See GrassListHook.
@@ -2676,6 +2713,27 @@ namespace GrassFirst {
 		return d > 0.0f ? d : 0.0f;
 	}
 
+	// UNOFFICIAL 2026-11-16 grass-cull: the cards GPU grass skipped this call, drawn after all because no strands were drawn for them (the
+	// device state the replay needs: each pass's cull and alpha test, and c19.w by the part; GpuGrass is unhooked by now, so they draw).
+	static void DrawCaughtCards() {
+		if (GpuCaught.empty()) return;
+		NiDX9RenderState* state = TheRenderManager->renderState;
+		const int before = GrassShaders::DrawPart;
+		int part = -1;
+		for (const Caught& c : GpuCaught) {
+			if (c.part != part) { ((void(__cdecl*)())kEndPass)(); part = c.part; GrassShaders::DrawPart = part; }	// re-bind: c19.w
+			state->SetRenderState(D3DRS_CULLMODE, c.cull, RenderStateArgs);
+			state->SetRenderState(D3DRS_ALPHATESTENABLE, c.alphaTest, RenderStateArgs);
+			RenderPassImmediately(c.pass, c.passId, c.a3, c.a4, c.a5);
+			StatCardsBack++;
+		}
+		((void(__cdecl*)(char, int))0x00B98540)(0, 0);	// BSRenderState::SetAlphaToCoverageEnable(0, 0), as after a bucket
+		((void(__cdecl*)())kEndPass)();
+		GrassShaders::DrawPart = before;
+		static unsigned told = 0;
+		if (told < 10) { told++; Logger::Log("UNOFFICIAL GPU grass: no strands could be drawn this frame: the %u grass passes whose cards they replace were drawn as cards (%u so far)", (unsigned)GpuCaught.size(), StatCardsBack); }
+	}
+
 	static bool Allowed(void* accumulator) {
 		GrassShaders* grass = TheShaderManager->Shaders.Grass;
 		if (!Installed || !grass || !grass->Enabled || !grass->DrawFirst) return false;
@@ -2719,6 +2777,36 @@ namespace GrassFirst {
 		for (PassIdNode* p = head; p; p = p->next) p->id = values[i++];
 		return true;
 	}
+
+	// UNOFFICIAL 2026-11-17 grass-cull diagnostic ([Shaders.Grass.GPUGrass] Log 2, test only): the grass pass groups of an accumulator's
+	// renderers (layout as OptQueued below): how many grass IDs are in the pass-ID lists, how many grass groups hold passes, and how many hold
+	// passes while their ID is NOT in the list (the game re-inserts an ID only while its group is empty: such passes would never be drawn).
+	struct GrassGroups { unsigned listed = 0, groups = 0, passes = 0, stuckGroups = 0, stuckPasses = 0; };
+	static GrassGroups CountGrassGroups(void* accumulator) {
+		GrassGroups g;
+		const UInt8* a = (const UInt8*)accumulator;
+		const UInt32 count = *(const UInt32*)(a + 0x18C);
+		for (UInt32 r = 0; r < count && r < 2; r++) {
+			UInt8* renderer = *(UInt8* const*)(a + 0x174 + 4 * r);
+			if (!renderer) continue;
+			bool listed[kGrassLastId - kGrassFirstId + 1] = {};
+			const PassIdNode* list = (const PassIdNode*)(renderer + 0x2C);
+			if (list->next || list->id) for (const PassIdNode* p = list; p; p = p->next) if (IsGrass(p->id)) { listed[p->id - kGrassFirstId] = true; g.listed++; }
+			for (UInt32 id = kGrassFirstId; id <= kGrassLastId; id++) {
+				UInt32 index = 0;
+				if (!(UInt8)ThisCall(0x00853130, renderer + 0x0C, id, &index)) continue;	// NiTMapBase<UInt32, UInt32>::GetAt
+				const UInt8* passGroup = *(UInt8**)(renderer + 8) + index * 0x68;
+				unsigned n = 0;
+				for (unsigned b = 0; b < 5; b++)
+					for (const UInt32* node = *(const UInt32* const*)(passGroup + b * 0x14 + 4); node && n < 100000; node = (const UInt32*)node[0]) if (node[2]) n++;
+				if (!n) continue;
+				g.groups++; g.passes += n;
+				if (!listed[id - kGrassFirstId]) { g.stuckGroups++; g.stuckPasses += n; }
+			}
+		}
+		return g;
+	}
+	static GrassGroups DiagBefore;
 
 	// Is an OPT ID queued, and is every queued OPT pass an object's first pass? (BSBatchRenderer: pass groups at +8, 0x68 each, found
 	// through the NiTMap at +0x0C; 5 buckets of 0x14 with the head at +4; a node holds the RenderPass at [2]; RenderPass +7 = first pass.)
@@ -2924,6 +3012,7 @@ namespace GrassFirst {
 			~CaptureSpan() { if (on) { FlashlightDeferred::BeamSpanEnd(); CapturedNormals::EndSpan(TheRenderManager->device); } } };
 		if (first == 1 && last == 0x25B && group < 0) { GBufferCensus::SpanScope census(GBufferCensus::SpanDepthFirst); DepthFirst(accumulator, arg3, group); }	// UNOFFICIAL 2026-10-26 LampsDepthFirst
 		if (first == 1 && last == 0x25B && group < 0 && Allowed(accumulator)) {
+			if (GpuGrass::DiagEveryFrame()) DiagBefore = CountGrassGroups(accumulator);	// UNOFFICIAL 2026-11-17 grass-cull diagnostic
 			PassIdNode* lists[2] = {};
 			unsigned count = 0;
 			bool ok = Lists(accumulator, lists, count);
@@ -2946,12 +3035,15 @@ namespace GrassFirst {
 				GrassShaders::DrawPart = 1;
 				Recording = true;
 				// UNOFFICIAL 2026-10-27 GPU grass (effects/GpuGrass.h): when it takes this call, NewGrass stays out of it (both hook the same draw call)
+				GpuCaught.clear();	// UNOFFICIAL 2026-11-16 grass-cull
 				const bool gpuGrass = GpuGrass::BeginEarly(TheRenderManager->device, TheShaderManager->Shaders.Grass->Enabled);
 				if (!gpuGrass) NewGrass::BeginEarly(TheRenderManager->device, TheShaderManager->Shaders.Grass->Enabled);	// UNOFFICIAL 2026-10-18 NewGrass (core/NewGrass.h)
 				EarlySerial = GrassShaders::BindSerial;	// UNOFFICIAL 2026-10-28: only this run's grass binds teach RenderPassImmediatelyHook
 				{ GBufferCensus::SpanScope census(GBufferCensus::SpanGrassEarly); ThisCall(kRenderBatches, accumulator, (UInt32)kGrassFirstId, (UInt32)kGrassLastId, arg3, group); }
 				if (!gpuGrass) NewGrass::EndEarly(TheRenderManager->device, StatEarly);
 				GpuGrass::EndEarly(TheRenderManager->device);	// the strands: one cull pass + two indirect draws, before the land
+				if (GpuGrass::StrandsFailed()) DrawCaughtCards();	// UNOFFICIAL 2026-11-16 grass-cull: the skipped cards after all
+				GpuCaught.clear();
 				Recording = false;
 				// UNOFFICIAL 2026-10-27 grass sun shadows (core/GrassShadows.h): the early grass passes drawn with NVR's grass VS, drawn again
 				// into the near sun cascade (every tuft, c19.w = 0), before the land and everything after it read the shadow atlas.
@@ -2997,6 +3089,7 @@ namespace GrassFirst {
 			const bool gpuGrass = ShadowOnlyRecords && !Records.empty() &&
 				GpuGrass::BeginEarly(TheRenderManager->device, TheShaderManager->Shaders.Grass->Enabled);
 			ShadowOnlyRecords = false;
+			GpuCaught.clear();	// UNOFFICIAL 2026-11-16 grass-cull
 			int part = -1;
 			for (const Record& r : Records) {
 				const int want = r.drawnEarly ? 2 : 0;
@@ -3015,6 +3108,7 @@ namespace GrassFirst {
 				NoteRtGrass(r.pass, r.passId);	// UNOFFICIAL 2026-10-30 RT grass (a pass drawn early is noted once: RtCore skips the repeat)
 				if (gpuGrass) {
 					const bool took = arm && GpuGrass::Took();
+					if (took && !GpuGrass::KeepsCards()) GpuCaught.push_back({ r.pass, r.passId, r.a3, r.a4, r.a5, r.cull, r.alphaTest, kind == kAllNear ? 0 : 1 });	// UNOFFICIAL 2026-11-16 grass-cull
 					GpuGrass::Disarm();
 					float alpha[4] = {};	// AlphaParam (c5) of NVR's grass VS: z = the fade start, for Classify (learned early otherwise)
 					if (GrassShaders::LastBindNVR && SUCCEEDED(TheRenderManager->device->GetVertexShaderConstantF(5, alpha, 1)) && alpha[2] > 0.0f)
@@ -3055,6 +3149,8 @@ namespace GrassFirst {
 				RestoreMask = (unsigned)TheShaderManager->Shaders.Grass->DrawFirstRestore;
 				Save();
 				GpuGrass::EndEarly(TheRenderManager->device);
+				if (GpuGrass::StrandsFailed()) DrawCaughtCards();	// UNOFFICIAL 2026-11-16 grass-cull: the skipped cards after all
+				GpuCaught.clear();
 				Restore();
 			}
 			// What the game's grass call leaves in c19 without GrassFirst: the last grass bind's value, w = 0.
@@ -3063,9 +3159,10 @@ namespace GrassFirst {
 				TheRenderManager->device->SetVertexShaderConstantF(19, leave, 1);
 			}
 			Records.clear();
-			if (++Frames <= 3 || (Frames % 3600 == 0 && Frames <= 3600 * 17))	// UNOFFICIAL fixes-b #53: at most 20 lines per session
-				Logger::Log("UNOFFICIAL GrassFirst: frame %u: %u grass draws before the land (%u of them all near: not again), %u after it (fading tufts), %u whole after it (%u all fading, the rest no split), %u drawn whole early (game VS, learned), %u met before any grass bind of the run; fade start %.1f (seen %.1f-%.1f); %u states put back (mask %u)",
-					Frames, StatEarly, StatAllNear, StatLate, StatWhole, StatAllFading, StatUnsplit, StatUnknown, FadeStart, FadeSeenMin, FadeSeenMax, StatRestored, RestoreMask);
+			if (++Frames <= 3 || (Frames % 3600 == 0 && Frames <= 3600 * 17) || GpuGrass::DiagEveryFrame())	// UNOFFICIAL fixes-b #53: at most 20 lines per session (2026-11-16 grass-cull: every frame with [Shaders.Grass.GPUGrass] Log 2, test only)
+				Logger::Log("UNOFFICIAL GrassFirst: frame %u: %u grass draws before the land (%u of them all near: not again), %u after it (fading tufts), %u whole after it (%u all fading, the rest no split), %u drawn whole early (game VS, learned), %u met before any grass bind of the run; fade start %.1f (seen %.1f-%.1f); %u states put back (mask %u); grass groups at the main list (Log 2): %u IDs listed, %u groups / %u passes, %u groups / %u passes NOT listed",
+					Frames, StatEarly, StatAllNear, StatLate, StatWhole, StatAllFading, StatUnsplit, StatUnknown, FadeStart, FadeSeenMin, FadeSeenMax, StatRestored, RestoreMask,
+					DiagBefore.listed, DiagBefore.groups, DiagBefore.passes, DiagBefore.stuckGroups, DiagBefore.stuckPasses);
 			StatEarly = StatLate = StatWhole = StatUnsplit = StatAllNear = StatAllFading = StatRestored = StatUnknown = 0;
 			FadeSeenMin = FadeSeenMax = 0.0f;
 		}
@@ -3097,6 +3194,12 @@ namespace GrassFirst {
 			const int kind = Classify(pass);
 			if (kind == kAllFading) { StatAllFading++; Records.push_back(r); return; }	// drawn whole after the land (as the game)
 			if (kind == kAllNear) {	// every tuft, now (c19.w = 0): if the bound test were ever wrong, a tuft is drawn early, never lost
+				// UNOFFICIAL 2026-11-16 grass-cull (tester: the card grass "somewhat better lit" with DrawFirstCull on than off): the capture's
+				// span (the G-buffer the near grass writes; with the deferred renderer its DEFERRED record, lit by DeferredSun) opens at the early
+				// run's first grass bind of part 1 only (CapturedNormals::GrassBind). An all-near pass binds as part 0, so all-near passes met
+				// before the first mixed one were drawn forward, the rest deferred: the same grass lit two ways, depending on DrawFirstCull and
+				// on the order of the passes. Opened here as a part-1 bind would (nothing when it is open, or the records are not wanted).
+				CapturedNormals::GrassBind(TheRenderManager->device, 1);
 				GrassShaders::DrawPart = 0;
 				const float all[4] = { GrassShaders::LastPairing[0], GrassShaders::LastPairing[1], GrassShaders::LastPairing[2], 0.0f };
 				TheRenderManager->device->SetVertexShaderConstantF(19, all, 1);
@@ -3106,6 +3209,7 @@ namespace GrassFirst {
 			GpuGrass::Arm(pass, kind == kAllNear ? 0 : 1, NearestDistance(pass));	// UNOFFICIAL 2026-10-27 GPU grass (does nothing unless it took this call)
 			RenderPassImmediately(pass, passId, a3, a4, a5);
 			NoteRtGrass(pass, passId);	// UNOFFICIAL 2026-10-30 RT grass
+			if (GpuGrass::Took() && !GpuGrass::KeepsCards()) GpuCaught.push_back({ pass, passId, a3, a4, a5, r.cull, r.alphaTest, kind == kAllNear ? 0 : 1 });	// UNOFFICIAL 2026-11-16 grass-cull
 			NewGrass::Disarm();
 			GpuGrass::Disarm();
 			if (kind == kAllNear) {
@@ -3480,7 +3584,7 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 	// reflection's above (the next bind picks this mod's again). The water shader binds are counted for the Scope WATER log line.
 	if (ShaderSplit::CurrentContext == ShaderSplit::ExtraCamera) {
 		const bool water = PixelShader && PixelShader->Name && !strncmp(PixelShader->Name, "WATER", 5);
-		if (water) {
+		if (water && !ScopeCamera::NonScope) {
 			ScopeCamera::WaterBinds++;
 			if (PixelShader->ShaderHandleBackup && PixelShader->ShaderHandle != PixelShader->ShaderHandleBackup && !ScopeCamera::GameShaders && !ScopeCamera::GameWater) ScopeCamera::WaterBindsOurs++;
 		}
@@ -3591,12 +3695,12 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 
 	// trace pipeline active shaders
 	const auto& develop = TheSettingManager->SettingsMain.Develop;
-	if (develop.DebugMode && !InterfaceManager->IsActive(Menu::MenuType::kMenuType_Console) && Global->OnKeyDown(develop.TraceShaders)) {
-		char label[256];
-		sprintf(label, "Pass %i %s, %s (%s %s)", PassIndex, Pointers::Functions::GetPassDescription(PassIndex), Geometry->m_pcName, VertexShader->Name, PixelShader->Name);
-		if (VertexShader->ShaderHandle == VertexShader->ShaderHandleBackup) strcat(label, " - Vertex: vanilla");
-		if (PixelShader->ShaderHandle == PixelShader->ShaderHandleBackup) strcat(label, " - Pixel: vanilla");
-		Logger::Log("%s", label);
+	if (develop.DebugMode && !InterfaceManager->IsActive(Menu::MenuType::kMenuType_Console) && Global->OnKeyDown(develop.TraceShaders)
+		&& Geometry && VertexShader && PixelShader) {
+		// (2026-11-17: no fixed buffer: the object's name comes from a mesh file and has no length limit)
+		Logger::Log("Pass %i %s, %s (%s %s)%s%s", PassIndex, Pointers::Functions::GetPassDescription(PassIndex), Geometry->m_pcName ? Geometry->m_pcName : "",
+			VertexShader->Name, PixelShader->Name, VertexShader->ShaderHandle == VertexShader->ShaderHandleBackup ? " - Vertex: vanilla" : "",
+			PixelShader->ShaderHandle == PixelShader->ShaderHandleBackup ? " - Pixel: vanilla" : "");
 		InterfaceManager->ShowMessage("Shaders Traced");
 		//DWNode::AddNode(Name, Geometry->m_parent, Geometry);
 	}
@@ -3608,11 +3712,14 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 	DeferredTransparents::BeforeBind(ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL 2026-11-15 DeferredTransparents: the bind's context, for SetupShader
 	SetShaders(This, PassIndex);
 	GameShaderPairs::AfterBind(VertexShader, PixelShader);
-	FlashlightLamp::NoteBind(PixelShader ? PixelShader->Name : "", PixelShader && PixelShader->ShaderHandle == (IDirect3DPixelShader9*)PixelShader->ShaderHandleBackup,
-		VertexShader ? VertexShader->Name : "", VertexShader && VertexShader->ShaderHandle == (IDirect3DVertexShader9*)VertexShader->ShaderHandleBackup, GameShaderPairs::BoundNote);	// UNOFFICIAL 2026-11-13 (the FLASHLAMP look: the pair this pass draws with)
+	IDirect3DVertexShader9* const boundVS = GameShaderPairs::BoundVertex ? GameShaderPairs::BoundVertex : (VertexShader ? VertexShader->ShaderHandle : nullptr);
+	IDirect3DPixelShader9* const boundPS = GameShaderPairs::BoundPixel ? GameShaderPairs::BoundPixel : (PixelShader ? PixelShader->ShaderHandle : nullptr);
+	FlashlightLamp::NoteBind(PixelShader ? PixelShader->Name : "", PixelShader && boundPS == (IDirect3DPixelShader9*)PixelShader->ShaderHandleBackup,
+		VertexShader ? VertexShader->Name : "", VertexShader && boundVS == (IDirect3DVertexShader9*)VertexShader->ShaderHandleBackup, GameShaderPairs::BoundNote);	// UNOFFICIAL 2026-11-13 (the FLASHLAMP look: the pair this pass draws with)
 	HairBeamBind(PixelShader);	// UNOFFICIAL 2026-11-12 HairAndEyes: the log's counts
 	GameEyes::OnBind(PixelShader, VertexShader);	// UNOFFICIAL GameShaderEyes: inside an eye's draw, the game's shaders on the device (see above)
 	MaterialRulesDraw::AfterBind();	// UNOFFICIAL material rules: this object's class again over the bind's "no rule"
+	RmaosDraw::AfterBind();	// UNOFFICIAL 2026-11-19: re-bind stage 2 _rmaos / _m texture if the shader bind touched it
 	ReflectionProbe::AfterBind();  // UNOFFICIAL ReflectionClipFix: the clip plane re-issued once the pass's shaders are bound
 	BarrelHeat::SetForDraw(Geometry, VertexShader, PixelShader);
 	HandBlood::SetForDraw();	// UNOFFICIAL: blood on the first-person weapon and gloves
@@ -3622,15 +3729,15 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 	HiddenObjectCulling::OnBind(PixelShader);	// UNOFFICIAL HiddenObjectCulling: only lamp-only passes may be skipped
 	// UNOFFICIAL interior forward point-light shadows: the draw's lamps and their cube maps (PointShadowForward.h).
 	PointShadowForward::LastVertexShaderName = VertexShader ? VertexShader->Name : nullptr;	// AimProbe (LogLamps)
-	PointShadowForward::LastVertexShaderNvr = VertexShader && VertexShader->ShaderHandleBackup && VertexShader->ShaderHandle != VertexShader->ShaderHandleBackup;
-	PointShadowForward::LastPixelShaderNvr = PixelShader && PixelShader->ShaderHandleBackup && PixelShader->ShaderHandle != PixelShader->ShaderHandleBackup;
+	PointShadowForward::LastVertexShaderNvr = VertexShader && VertexShader->ShaderHandleBackup && boundVS != VertexShader->ShaderHandleBackup;
+	PointShadowForward::LastPixelShaderNvr = PixelShader && PixelShader->ShaderHandleBackup && boundPS != PixelShader->ShaderHandleBackup;
 	FoldHighlights::OnBind(PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr, PassIndex);	// UNOFFICIAL FoldHighlights
-	if (GBufferCensus::Mode) GBufferCensus::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr, PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr);	// UNOFFICIAL 2026-11-14 GBufferCensus (test only)
+	if (GBufferCensus::Mode) GBufferCensus::OnBind(boundPS, PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr);	// UNOFFICIAL 2026-11-14 GBufferCensus (test only)
 #if NVR_TEST_TOOLS
 	PassFamilyView::OnBind(TheRenderManager->device, PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr,
 		ShaderSplit::CurrentContext == ShaderSplit::World, PassIndex);	// UNOFFICIAL, diagnostic: PassFamilyView
 	CasterView::OnBind(TheRenderManager->device);	// UNOFFICIAL 2026-10-28, diagnostic
-	LinearSceneCensus::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr, PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr, PassIndex);	// UNOFFICIAL 2026-10-28, diagnostic
+	LinearSceneCensus::OnBind(boundPS, PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr, PassIndex);	// UNOFFICIAL 2026-10-28, diagnostic
 #endif
 	PointShadowForward::SetForDraw(PixelShader, ShaderSplit::WorldOrScope(),	// (UNOFFICIAL 2026-11-12 [Main.Main.Scope] OwnCamera: lamp shadows in a scope's picture too)
 		ShaderSplit::CurrentContext == ShaderSplit::FirstPerson,
@@ -3638,11 +3745,11 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 			ManyLamps::Steady(*(const PointShadowForward::RenderPassView**)0x011F91E0) : nullptr);	// UNOFFICIAL 2026-10-31 SteadyLampShadows
 	LandLamps::OnBind(PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr);	// UNOFFICIAL 2026-10-30 LandAllLamps
 	ManyLamps::OnBind(PixelShader ? PixelShader->Name : nullptr, PointShadowForward::LastPixelShaderNvr, ShaderSplit::CurrentContext == ShaderSplit::FirstPerson, ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL 2026-10-27 ManyLampsOnePass: the run's first object
-	DeferredSun::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr);	// UNOFFICIAL 2026-11-14 DeferredSun: counts the lighting-free binds of the span
-	DeferredLamps::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr);	// UNOFFICIAL 2026-10-31 DeferredLamps: counts the deferred binds, reads the frame globals once
-	DeferredRenderer::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr, PixelShader ? PixelShader->Name : nullptr);	// UNOFFICIAL 2026-11-14 full deferred renderer: is a deferred record bound
+	DeferredSun::OnBind(boundPS);	// UNOFFICIAL 2026-11-14 DeferredSun: counts the lighting-free binds of the span
+	DeferredLamps::OnBind(boundPS);	// UNOFFICIAL 2026-10-31 DeferredLamps: counts the deferred binds, reads the frame globals once
+	DeferredRenderer::OnBind(boundPS, PixelShader ? PixelShader->Name : nullptr);	// UNOFFICIAL 2026-11-14 full deferred renderer: is a deferred record bound
 	if (GameEyes::Eye) DeferredRenderer::BoundDeferred = DeferredRenderer::BoundPlain = false;	// UNOFFICIAL 2026-11-15: an eye's bind inside its draw: the eye record is forward (GameEyes::ApplyEye)
-	DeferredTransparents::OnBind(PixelShader ? PixelShader->ShaderHandle : nullptr);	// UNOFFICIAL 2026-11-15 a forward+ record: the table, the atlas, c180 / c181 (after the others' binds)
+	DeferredTransparents::OnBind(boundPS);	// UNOFFICIAL 2026-11-15 a forward+ record: the table, the atlas, c180 / c181 (after the others' binds)
 	ScopeSunShadows::ForDraw(*(const PointShadowForward::RenderPassView**)0x011F91E0);	// UNOFFICIAL ScopeFix outdoors
 	OnePassDepth::Reapply(TheRenderManager->device);	// UNOFFICIAL LampsDepthFirst: a bind inside a depth-only draw keeps the depth-only shader
 #if NVR_TEST_TOOLS
@@ -3858,8 +3965,42 @@ namespace ScopeScene {
 		ScopeCamera::WaterScenes = ScopeCamera::WaterBinds = ScopeCamera::WaterBindsOurs = ScopeCamera::ReflectionCalls = ScopeCamera::ReflectionCallsExtra = 0;
 	}
 
+	// UNOFFICIAL 2026-11-19: recognise non-scope extra cameras (DynamicReflections cubemaps, reflection / env-map cameras) so they
+	// take the cheap game-shader path (Shaders 2) instead of running full scope constants/shadows/fog or flipping ScopeCamera::Exact().
+	static bool ContainsNoCase(const char* hay, const char* needle) {
+		if (!hay || !needle || !*needle) return false;
+		const size_t nlen = strlen(needle);
+		for (; *hay; hay++) {
+			size_t i = 0;
+			while (i < nlen && hay[i] && tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
+			if (i == nlen) return true;
+		}
+		return false;
+	}
+	static bool IsReflectionModule(UInt32 caller) {
+		static UInt32 cachedCaller = 0;
+		static bool cachedResult = false;
+		if (caller == cachedCaller && caller != 0) return cachedResult;
+		char module[MAX_PATH];
+		CpuSplit::ModuleName(caller, module, sizeof(module));
+		cachedCaller = caller;
+		cachedResult = ContainsNoCase(module, "dynamicreflection");
+		return cachedResult;
+	}
+	static bool IsNonScopeCamera(NiCamera* camera, UINT width, UINT height, UInt32 caller) {
+		if (IsReflectionModule(caller)) return true;
+		const char* cname = camera ? camera->m_pcName : nullptr;
+		if (ContainsNoCase(cname, "reflect") || ContainsNoCase(cname, "cubemap") || ContainsNoCase(cname, "envmap")) return true;
+		if (camera && width > 0 && width == height) {
+			const NiFrustum& fr = camera->Frustum;
+			const float fovX = D3DXToDegree(2.0f * atanf(0.5f * (fr.Right - fr.Left)));
+			const float fovY = D3DXToDegree(2.0f * atanf(0.5f * (fr.Top - fr.Bottom)));
+			if (fovX >= 85.0f && fovY >= 85.0f) return true;	// 90x90 cubemap face, not a zoomed rifle scope
+		}
+		return false;
+	}
+
 	static void Draw(NiCamera* camera, void* accumulator, UInt32 flag) {
-		SessionLog::StageScope stage("the scope picture");
 		IDirect3DDevice9* device = TheRenderManager->device;
 		// The picture's target: the plugin made it current before the walk.
 		UINT width = 0, height = 0;
@@ -3870,6 +4011,40 @@ namespace ScopeScene {
 			if (SUCCEEDED(target->GetDesc(&desc))) { width = desc.Width; height = desc.Height; format = desc.Format; }
 			target->Release();
 		}
+
+		// Non-scope extra camera (e.g. DynamicReflections cubemap face): cheap game-shader path, no scope constants/fog/tracking.
+		if (IsNonScopeCamera(camera, width, height, ScopeCamera::PendingCaller)) {
+			static UInt32 nonScopeSig = 0;
+			static unsigned nonScopeLogs = 0;
+			const UInt32 sig = (width << 16) ^ height ^ ((UInt32)format << 8) ^ ScopeCamera::PendingCaller;
+			if (sig != nonScopeSig && nonScopeLogs < 4) {
+				nonScopeSig = sig;
+				nonScopeLogs++;
+				char module[MAX_PATH];
+				CpuSplit::ModuleName(ScopeCamera::PendingCaller, module, sizeof(module));
+				const NiFrustum& fr = camera->Frustum;
+				Logger::Log("UNOFFICIAL Scope Detect: non-scope extra camera '%s' drawn by %s (%ux%u, fov %.1f x %.1f deg): using the game's own shaders (cheap path, not treated as a scope).",
+					camera->m_pcName ? camera->m_pcName : "?", module, width, height,
+					D3DXToDegree(2.0f * atanf(0.5f * (fr.Right - fr.Left))), D3DXToDegree(2.0f * atanf(0.5f * (fr.Top - fr.Bottom))));
+			}
+			ScopeCamera::InScene = true;
+			ScopeCamera::NonScope = true;
+			ScopeCamera::Camera = camera;
+			ScopeCamera::GameShaders = true;
+			ScopeCamera::GameWater = true;
+			ScopeCamera::Own = false;
+			ScopeCamera::Shadows = false;
+			ScopeCamera::OurSkin = false;
+			ShaderSplit::BeginContext(ShaderSplit::ExtraCamera);
+			RenderSceneNext(camera, accumulator, flag);
+			ShaderSplit::EndContext();
+			ScopeSunShadows::Reset();
+			ScopeCamera::InScene = ScopeCamera::NonScope = ScopeCamera::GameShaders = ScopeCamera::GameWater = false;
+			ScopeCamera::Camera = nullptr;
+			return;
+		}
+
+		SessionLog::StageScope stage("the scope picture");
 		static GpuTimer gpuTimer("Scope scene");
 		static CpuTimer cpuTimer("Scope scene (CPU)");
 		CpuProfileScope cpu(cpuTimer);
@@ -3877,6 +4052,7 @@ namespace ScopeScene {
 
 		const D3DXVECTOR4 mainPosition = TheRenderManager->CameraPosition;
 		ScopeCamera::InScene = true;
+		ScopeCamera::NonScope = false;
 		ScopeCamera::Camera = camera;
 		ScopeCamera::GameShaders = ScopeCamera::Shaders == 2;
 		ScopeCamera::GameWater = ScopeCamera::Water == 1;
@@ -3902,7 +4078,7 @@ namespace ScopeScene {
 		// ... and the frame's first bind uploads the main camera's again (ConstantFilter compares with what the device holds: none is skipped).
 		ForcePixelConstants = ForceVertexConstants = true;
 		LogScene(camera, width, height, format, own, mainPosition);
-		ScopeCamera::InScene = ScopeCamera::Own = ScopeCamera::Shadows = ScopeCamera::GameShaders = ScopeCamera::OurSkin = ScopeCamera::GameWater = false;
+		ScopeCamera::InScene = ScopeCamera::NonScope = ScopeCamera::Own = ScopeCamera::Shadows = ScopeCamera::GameShaders = ScopeCamera::OurSkin = ScopeCamera::GameWater = false;
 		ScopeCamera::Camera = nullptr;
 		ScopeCamera::LastCamera = camera;
 		ScopeCamera::LastSceneFrame = ScopeCamera::FrameNumber();
@@ -4145,8 +4321,10 @@ static void ForwardShadowsForPass(void* Pass) {
 	// (2026-11-15 DeferredFirstPerson) and always while the view model draws deferred records: their shading model in the G-buffer comes from this
 	// class (GBufferV2), and a world draw's left over (land, a plant) would send the gun through the wrong light model
 	else if (ShaderSplit::CurrentContext == ShaderSplit::FirstPerson && CapturedNormals::VmSpan && ((CapturedNormals::NoHighlightFlag && CapturedNormals::PtCodesCompiled) || CapturedNormals::VmDeferred)) MaterialForPass(Pass);
-	if (ForwardCloudShadows::Compiled)	// UNOFFICIAL 2026-11-04 ForwardCloudShadows: this draw's strength (0 for plants with PlantShadows off)
-		ForwardCloudShadows::ForPass(TheRenderManager->device, !ForwardCloudShadows::PlantShadows && PlantPass(((const PointShadowForward::RenderPassView*)Pass)->geometry));
+	// UNOFFICIAL 2026-11-04 ForwardCloudShadows: this draw's strength (0 for plants with PlantShadows off; 2026-11-16 fast-restart: always sent,
+	// 0 while off, since every outdoor record has the lookup; the plant test only while on)
+	ForwardCloudShadows::ForPass(TheRenderManager->device, ForwardCloudShadows::Active && !ForwardCloudShadows::PlantShadows && PlantPass(((const PointShadowForward::RenderPassView*)Pass)->geometry),
+		ShaderRecordPixel::Current && ShaderRecordPixel::Current->CloudSunFoliage);	// (2026-11-16: a grass / leaf record's strength follows PlantShadows)
 	LampCountStats::Count((const PointShadowForward::RenderPassView*)Pass);
 	LandLamps::ForPass((const PointShadowForward::RenderPassView*)Pass);	// UNOFFICIAL 2026-10-30 LandAllLamps: the piece's own lamps, for after VPT's write
 	// UNOFFICIAL 2026-10-31 SteadyLampShadows: while a many-lamp shader is bound, its lamps (and the six with cube-map shadows) in a steady order
@@ -4351,6 +4529,7 @@ void __cdecl RenderPassStandardHook(void* Pass, UInt32 Arg2, UInt32 Arg3, UInt32
 		// its group drawn with its copies as one instanced draw, a merged copy's engine setup skipped (every NVR step above and below still
 		// runs for it), or the self-check
 		DeferredRenderer::BeforeDraw(Pass, (ShaderSplit::CurrentContext == ShaderSplit::World || DeferredRenderer::ViewModelRoot), TheRenderManager->device);	// UNOFFICIAL 2026-11-14 fd-fixes: a blended draw takes the forward record
+		if (DeferredRenderer::SwappedFrom) RmaosDraw::AfterBind();
 		if (MergeCopies::InList) MergeCopies::Entry(Pass, Arg2, Arg3, Arg4, RenderPassStandard);
 		else RenderPassStandard(Pass, Arg2, Arg3, Arg4);
 	}
@@ -4438,6 +4617,7 @@ void __cdecl RenderPassSkinnedHook(void* Pass, UInt32 Arg2, UInt32 Arg3, UInt32 
 	GameEyes::Before((const PointShadowForward::RenderPassView*)Pass);	// UNOFFICIAL GameShaderEyes, per draw
 	AlphaHash::ForPass(((const PointShadowForward::RenderPassView*)Pass)->geometry, ShaderSplit::CurrentContext == ShaderSplit::World, TheRenderManager->device);	// UNOFFICIAL 2026-11-03 SmoothCutouts
 	DeferredRenderer::BeforeDraw(Pass, (ShaderSplit::CurrentContext == ShaderSplit::World || DeferredRenderer::ViewModelRoot), TheRenderManager->device);	// UNOFFICIAL 2026-11-14 fd-fixes: a blended draw takes the forward record
+	if (DeferredRenderer::SwappedFrom) RmaosDraw::AfterBind();
 	RenderPassSkinned(Pass, Arg2, Arg3, Arg4);
 	DeferredRenderer::AfterDraw(Pass, (ShaderSplit::CurrentContext == ShaderSplit::World || DeferredRenderer::ViewModelRoot));	// UNOFFICIAL 2026-11-14 full deferred renderer: mark / count
 	DeferredTransparents::AfterDraw(Pass, ShaderSplit::CurrentContext == ShaderSplit::World);	// UNOFFICIAL 2026-11-15 forward+: mark / count
@@ -5543,8 +5723,13 @@ static void RenderMainMenuMovie() {
 CallDetour kRenderInterfaceDetour;
 void __fastcall RenderInterfaceHook(void* apThis, void*, void* apCuller, bool abPipboyVisible) {
 	SessionLog::StageScope stage("the interface");
-	{ SessionLog::StageScope warm("shader warm-up"); ShaderWarmUp::OnInterfaceFrame(); }	// UNOFFICIAL: at the main menu, draw the shaders used in play once (ShaderWarmUp.h)
-	{ SessionLog::StageScope warm("shader warm-up 2"); ShaderWarmUp2::OnInterfaceFrame(); }	// UNOFFICIAL: at the main menu, draw the recorded drawing setups once (ShaderWarmUp2.h)
+	// UNOFFICIAL 2026-11-16 fast-restart (core/LateInteriors.h): at the main menu the lamp-shadow records are made once the workers finish them;
+	// the warm-ups (native D3D9) wait for that, so they draw those records too, as before
+	if (LateInteriors::Any()) { SessionLog::StageScope late("lamp-shadow records"); LateInteriors::Tick(Player && Player->parentCell); }
+	if (!LateInteriors::Any()) {
+		{ SessionLog::StageScope warm("shader warm-up"); ShaderWarmUp::OnInterfaceFrame(); }	// UNOFFICIAL: at the main menu, draw the shaders used in play once (ShaderWarmUp.h)
+		{ SessionLog::StageScope warm("shader warm-up 2"); ShaderWarmUp2::OnInterfaceFrame(); }	// UNOFFICIAL: at the main menu, draw the recorded drawing setups once (ShaderWarmUp2.h)
+	}
 	{ SessionLog::StageScope movie("the main menu movie"); RenderMainMenuMovie(); }
 	ImGuiManager::NewFrame();
 	const auto original = kRenderInterfaceDetour.GetOverwrittenAddr();
@@ -5597,7 +5782,7 @@ void* __fastcall ShowDetectorWindowHook(DetectorWindow* This, UInt32 edx, HWND H
 
 void DetectorWindowSetNodeName(char* Buffer, int Size, char* Format, char* ClassName, char* Name, float LPosX, float LPosY, float LPosZ) {
 
-	strcpy(Buffer, Name);
+	if (Buffer && Size > 0) strncpy_s(Buffer, (size_t)Size, Name ? Name : "", _TRUNCATE);	// (2026-11-17: was strcpy, ignoring Size)
 
 }
 

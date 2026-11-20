@@ -10,7 +10,6 @@
 #include "BeatSeries.h"	// UNOFFICIAL 2026-11-11 the beat detector's per-frame series
 #include "FlickerWatch.h"	// UNOFFICIAL 2026-10-23 test only
 #include "GpuProfiler.h"
-#include "HiZ.h"	// UNOFFICIAL 2026-10-26 (deep/fork-hiz)
 #include "PixelInspector.h"	// UNOFFICIAL 2026-10-26 (debugging tool)
 #include "Diagnostics.h"	// UNOFFICIAL 2026-11-01 the flash detector's stage probes (StageMark)
 #include "PointShadowSlots.h"
@@ -41,6 +40,8 @@
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback (the family's members loaded again after a drop)
 #include "GameShaderPairs.h"	// UNOFFICIAL 2026-11-13 [Main.Main.Misc] GameShaderPairCheck / GameShaderPairRepair (its settings, read below)
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16 BloodFlow and DustMotes are left out of release builds
+#include "ShaderPrecompile.h"	// UNOFFICIAL 2026-11-16 fast-restart (LateInteriors: the workers' jobs still running)
+#include "LateInteriors.h"	// UNOFFICIAL 2026-11-16 fast-restart
 #include <unordered_map>	// UNOFFICIAL 2026-10-27 RenderScale v2 (RenderRect::RescaleRegistered)
 extern D3DXVECTOR4 NvrGameMultisample;	// UNOFFICIAL 2026-11-04 Hooks/Settings.cpp (TESR_GameMultisample)
 
@@ -1092,51 +1093,11 @@ static void TouchCacheCopy(const char* sub, const char* name) {
 	CloseHandle(f);
 }
 
-/*
-* The pixel-shader version of the above, plus the UNOFFICIAL lamp-shadow records (interior forward shadows, RT exterior lamps).
-*/
-bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
-
-	NiD3DPixelShaderEx* pixel = (NiD3DPixelShaderEx*)Shader;
-	if (!ShaderSetsReady) {	// (UNOFFICIAL 2026-10-27, see LoadEarlyShaders)
-		LeaveToGame(pixel);
-		EarlyPixelShaders.push_back(Shader);
-		Logger::Log("UNOFFICIAL shader %s made before Vegas Shaders' shader sets: loaded once they exist", pixel->Name ? pixel->Name : "?");
-		return false;
-	}
-	ShaderCollection* family = GetShaderCollection(pixel->Name);
-	if (!family) { LeaveToGame(pixel); return false; }
-
-	const bool familyOn = family->Enabled;
-	ShaderTemplate tmpl = family->GetTemplate(pixel->Name);
-
-	// generic, exterior, interior: each where its file exists
-	static const char* const variantFolders[3] = { NULL, "Exteriors\\", "Interiors\\" };
-	// 2026-11-12 Puddles (combined puddles + sun-GI test): with puddles AND the albedo buffer compiled in, SLS2027's main record ran out of
-	// temp registers in game (it fits offline) and did not load at all: its objects fell back to the game's shader. A main record that
-	// does not load with puddles compiled in is made again with the lean puddle path (PUDDLES_LEAN, Cache\PuddlesLean); its copy, newer than
-	// the full one and than the sources, says the full one failed last time (the failed compile is not cached): straight to it then.
-	static D3DXMACRO puddlesLean[3] = { { "PUDDLES_LEAN", "1" }, { "PUDDLES_NOMAP", "1" }, { NULL, NULL } };	// (map mode: the in-shader lean path for this record)
-	const bool puddlesIn = TheSettingManager->GetSettingI("Shaders.Puddles.Status", "Enabled") && TheSettingManager->GetSettingI("Shaders.WetnessEffects.Status", "Enabled");
-	bool leanFirst = false;
-	if (puddlesIn) {
-		const std::string cache = std::string(ShadersPath) + "Cache\\";
-		WIN32_FILE_ATTRIBUTE_DATA lean = {}, full = {};
-		const bool hasLean = GetFileAttributesExA((cache + "PuddlesLean\\" + pixel->Name).c_str(), GetFileExInfoStandard, &lean) != 0;
-		const bool hasFull = GetFileAttributesExA((cache + pixel->Name).c_str(), GetFileExInfoStandard, &full) != 0;
-		leanFirst = hasLean && (!hasFull || CompareFileTime(&lean.ftLastWriteTime, &full.ftLastWriteTime) > 0) &&
-			FallbackNewerThanSources(lean.ftLastWriteTime, tmpl.Name, "Includes\\Wetness.hlsl");
-	}
-	for (int variant = ShaderRecordType::Default; variant <= ShaderRecordType::Interior; variant++)
-		pixel->ShaderProg[variant] = variant == ShaderRecordType::Default && leanFirst ? nullptr :
-			(ShaderRecordPixel*)ShaderRecord::LoadShader(pixel->Name, variantFolders[variant], tmpl);
-	if (!pixel->ShaderProg[ShaderRecordType::Default] && puddlesIn) {
-		pixel->ShaderProg[ShaderRecordType::Default] = (ShaderRecordPixel*)ShaderRecord::LoadShader(pixel->Name, NULL, tmpl, "PuddlesLean\\", puddlesLean);
-		if (pixel->ShaderProg[ShaderRecordType::Default]) {
-			if (!leanFirst) TouchCacheCopy("PuddlesLean\\", pixel->Name);
-			Logger::Log("UNOFFICIAL Puddles: %s's main record did not fit with the full puddles: made with the lean path (PUDDLES_LEAN).", pixel->Name);
-		}
-	}
+// UNOFFICIAL 2026-11-16 fast-restart (docs/next/FAST-RESTART.md): a lit pixel shader's lamp-shadow records, moved out of LoadShader
+// (pixel) unchanged so LateInteriors can make them after the start: the Interior record (with its shorter levels, FitLevel / Refused /
+// ReadDropped, and the deferred records made from its overrides: DeferredLamps::LoadRecord, DeferredRenderer::LoadInterior,
+// DeferredTransparents::Load), then the RT ExteriorForward record made from the shader the game uses outdoors.
+static void LoadLampShadowRecords(NiD3DPixelShaderEx* pixel, const ShaderTemplate& tmpl) {
 	// UNOFFICIAL interior forward point-light shadows (PointShadowForward.h): the lit pixel shaders get an Interior record
 	// from their own source with INTERIOR_SHADOWS, the sun's code compiled out (it never runs indoors). Only with the
 	// setting on at startup; exteriors keep their records.
@@ -1292,6 +1253,131 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 		}
 		else Logger::Log("[ERROR] UNOFFICIAL RT lamp shadows: %s with outdoor lamp shadows did not load (ExteriorForward): it stays without them outdoors.", pixel->Name);
 	}
+}
+
+// UNOFFICIAL 2026-11-16 fast-restart (core/LateInteriors.h, docs/next/FAST-RESTART.md): the Interior lamp-shadow records off the start.
+namespace LateInteriors {
+	struct Entry { NiD3DPixelShaderEx* shader; ShaderTemplate tmpl; };
+	static std::vector<Entry> Pending;	// in load order
+	static bool Attached = false;		// the first attach ran: every later load makes its records in place again
+	static int WantedState = -1;
+	static unsigned Made = 0;
+
+	bool Wanted() {
+		if (WantedState < 0) {
+			WantedState = TheSettingManager->GetSettingI("Main.Main.Performance", "ParallelShaderCompile") != 0 &&
+				TheSettingManager->GetSettingI("Shaders.ShadowsInteriors.Forward", "Enabled") != 0 && DeferredRenderer::Mode() != 1 ? 1 : 0;
+			// (DeferredRenderer 1: DeferredRenderer::Load, run at load, would make its LAMPS_DEFERRED 3 record from the default overrides for a
+			// shader whose Interior record is not there yet, and LoadInterior would then keep that one: that mode keeps the old order)
+		}
+		return WantedState == 1;
+	}
+	bool Defer(void* shader, const ShaderTemplate& tmpl) {
+		NiD3DPixelShaderEx* pixel = (NiD3DPixelShaderEx*)shader;
+		if (Attached || !Wanted() || pixel->ShaderProg[ShaderRecordType::Interior] || !pixel->ShaderProg[ShaderRecordType::Default] ||
+			!PointShadowForward::Eligible(pixel->Name, tmpl)) return false;
+		for (Entry& e : Pending) if (e.shader == pixel) { e.tmpl = tmpl; return true; }	// (loaded again: ShaderFallback, ReloadShaders)
+		Pending.push_back({ pixel, tmpl });
+		return true;
+	}
+	void Forget(void* shader) {
+		Pending.erase(std::remove_if(Pending.begin(), Pending.end(), [shader](const Entry& e) { return e.shader == shader; }), Pending.end());
+	}
+	bool Any() { return !Pending.empty(); }
+	// The deferred renderer's records were made at load with the Default record as their forward partner (DeferredRenderer::Load and
+	// DeferredSkin::Load take the Interior record when there is one): the blended-draw swap (Pairs) and the span-end swap (ForwardOf) get
+	// the Interior record now, as they would have at load.
+	static void FixForwardPartners(NiD3DPixelShaderEx* pixel) {
+		ShaderRecordPixel* interior = (ShaderRecordPixel*)pixel->ShaderProg[ShaderRecordType::Interior];
+		if (!interior || !interior->ShaderHandle) return;
+		auto fix = [interior](ShaderRecordPixel* deferred) {
+			if (!deferred || !deferred->ShaderHandle) return;
+			auto pair = DeferredRenderer::Pairs.find(deferred->ShaderHandle);
+			if (pair == DeferredRenderer::Pairs.end()) return;
+			pair->second.forward = interior;
+			DeferredLamps::ForwardOf[deferred->ShaderHandle] = interior->ShaderHandle;
+		};
+		auto r = DeferredRenderer::Records.find(pixel);
+		if (r != DeferredRenderer::Records.end()) fix(r->second);
+		auto k = DeferredSkin::Records.find(pixel);
+		if (k != DeferredSkin::Records.end()) fix(k->second);
+	}
+	// Every pending shader's records, in load order, as LoadShader would have made them (the workers' results taken; waits for the ones still
+	// compiling). where: for the log line.
+	static void Attach(const char* where) {
+		if (Pending.empty()) { Attached = true; return; }
+		const auto t0 = std::chrono::steady_clock::now();
+		const unsigned running = ShaderPrecompile::Running();
+		std::vector<Entry> list;
+		list.swap(Pending);
+		Attached = true;
+		const int countBefore = PointShadowForward::CompiledCount;
+		for (Entry& e : list) {
+			LoadLampShadowRecords(e.shader, e.tmpl);
+			FixForwardPartners(e.shader);
+		}
+		Made += (unsigned)list.size();
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		Logger::Log("UNOFFICIAL lamp-shadow records: the Interior records of %u lit shaders made at %s (%d loaded; %u compiles were still running then, "
+			"%.1f s spent here)%s", (unsigned)list.size(), where, PointShadowForward::CompiledCount - countBefore, running, ms / 1000.0,
+			running ? ": the start no longer waits for them, this was the one wait" : "");
+	}
+	void Tick(bool gameLoaded) {
+		if (Pending.empty()) return;
+		if (gameLoaded) Attach("the first world frame");
+		else if (ShaderPrecompile::Running() == 0) Attach("the main menu (their compiles had finished)");
+	}
+}
+
+/*
+* The pixel-shader version of the above, plus the UNOFFICIAL lamp-shadow records (interior forward shadows, RT exterior lamps).
+*/
+bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
+
+	NiD3DPixelShaderEx* pixel = (NiD3DPixelShaderEx*)Shader;
+	if (!ShaderSetsReady) {	// (UNOFFICIAL 2026-10-27, see LoadEarlyShaders)
+		LeaveToGame(pixel);
+		EarlyPixelShaders.push_back(Shader);
+		Logger::Log("UNOFFICIAL shader %s made before Vegas Shaders' shader sets: loaded once they exist", pixel->Name ? pixel->Name : "?");
+		return false;
+	}
+	ShaderCollection* family = GetShaderCollection(pixel->Name);
+	if (!family) { LeaveToGame(pixel); return false; }
+
+	const bool familyOn = family->Enabled;
+	ShaderTemplate tmpl = family->GetTemplate(pixel->Name);
+
+	// generic, exterior, interior: each where its file exists
+	static const char* const variantFolders[3] = { NULL, "Exteriors\\", "Interiors\\" };
+	// 2026-11-12 Puddles (combined puddles + sun-GI test): with puddles AND the albedo buffer compiled in, SLS2027's main record ran out of
+	// temp registers in game (it fits offline) and did not load at all: its objects fell back to the game's shader. A main record that
+	// does not load with puddles compiled in is made again with the lean puddle path (PUDDLES_LEAN, Cache\PuddlesLean); its copy, newer than
+	// the full one and than the sources, says the full one failed last time (the failed compile is not cached): straight to it then.
+	static D3DXMACRO puddlesLean[3] = { { "PUDDLES_LEAN", "1" }, { "PUDDLES_NOMAP", "1" }, { NULL, NULL } };	// (map mode: the in-shader lean path for this record)
+	const bool puddlesIn = TheSettingManager->GetSettingI("Shaders.Puddles.Status", "Enabled") && TheSettingManager->GetSettingI("Shaders.WetnessEffects.Status", "Enabled");
+	bool leanFirst = false;
+	if (puddlesIn) {
+		const std::string cache = std::string(ShadersPath) + "Cache\\";
+		WIN32_FILE_ATTRIBUTE_DATA lean = {}, full = {};
+		const bool hasLean = GetFileAttributesExA((cache + "PuddlesLean\\" + pixel->Name).c_str(), GetFileExInfoStandard, &lean) != 0;
+		const bool hasFull = GetFileAttributesExA((cache + pixel->Name).c_str(), GetFileExInfoStandard, &full) != 0;
+		leanFirst = hasLean && (!hasFull || CompareFileTime(&lean.ftLastWriteTime, &full.ftLastWriteTime) > 0) &&
+			FallbackNewerThanSources(lean.ftLastWriteTime, tmpl.Name, "Includes\\Wetness.hlsl");
+	}
+	for (int variant = ShaderRecordType::Default; variant <= ShaderRecordType::Interior; variant++)
+		pixel->ShaderProg[variant] = variant == ShaderRecordType::Default && leanFirst ? nullptr :
+			(ShaderRecordPixel*)ShaderRecord::LoadShader(pixel->Name, variantFolders[variant], tmpl);
+	if (!pixel->ShaderProg[ShaderRecordType::Default] && puddlesIn) {
+		pixel->ShaderProg[ShaderRecordType::Default] = (ShaderRecordPixel*)ShaderRecord::LoadShader(pixel->Name, NULL, tmpl, "PuddlesLean\\", puddlesLean);
+		if (pixel->ShaderProg[ShaderRecordType::Default]) {
+			if (!leanFirst) TouchCacheCopy("PuddlesLean\\", pixel->Name);
+			Logger::Log("UNOFFICIAL Puddles: %s's main record did not fit with the full puddles: made with the lean path (PUDDLES_LEAN).", pixel->Name);
+		}
+	}
+	// UNOFFICIAL 2026-11-16 fast-restart (LateInteriors below): while the start's shaders load, the lamp-shadow records wait for LateInteriors'
+	// attach (their compiles run on the worker threads after everything the start needs); any other time, and with ParallelShaderCompile
+	// off or DeferredRenderer 1, right here as before.
+	if (!LateInteriors::Defer(pixel, tmpl)) LoadLampShadowRecords(pixel, tmpl);
 	// UNOFFICIAL 2026-10-30 RT lamp shadows ExteriorForward on the land: the land shaders with lamps (TerrainTemplate, NUM_PT_LIGHTS) get an
 	// outdoor record with TERRAIN_LAMP_RT (their lamps matched by position to the traced entries). Only with terrain blending off: its
 	// depth takes s15, the one stage the land has left (register audit 2026-10-30).
@@ -1334,7 +1420,20 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 			else Logger::Log("[ERROR] UNOFFICIAL RT lamp shadows: %s (land) with outdoor lamp shadows did not load (ExteriorForward).", pixel->Name);
 		}
 	}
-	LightFreeRecords::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-14 full deferred renderer phase 0 (test only, off: nothing made)
+	{	// UNOFFICIAL 2026-11-14 full deferred renderer phase 0 (mode 2's lighting-free records)
+		// (2026-11-18 DeferredStandalone) with no forward record and puddles in, the lean copy newer than the full one and the sources says the
+		// full one failed last time (as the forward record's leanFirst above): straight to it, and its copy stamped when it was made again
+		bool lightFreeLeanFirst = false;
+		if (puddlesIn && !HasAnyRecord(pixel)) {
+			const std::string cache = std::string(ShadersPath) + "Cache\\";
+			WIN32_FILE_ATTRIBUTE_DATA lean = {}, full = {};
+			const bool hasLean = GetFileAttributesExA((cache + LightFreeRecords::kLeanCache + pixel->Name).c_str(), GetFileExInfoStandard, &lean) != 0;
+			const bool hasFull = GetFileAttributesExA((cache + LightFreeRecords::kCache + pixel->Name).c_str(), GetFileExInfoStandard, &full) != 0;
+			lightFreeLeanFirst = hasLean && (!hasFull || CompareFileTime(&lean.ftLastWriteTime, &full.ftLastWriteTime) > 0) &&
+				FallbackNewerThanSources(lean.ftLastWriteTime, tmpl.Name, "Includes\\Wetness.hlsl");
+		}
+		if (LightFreeRecords::Load(pixel, pixel->Name, tmpl, lightFreeLeanFirst) && !lightFreeLeanFirst) TouchCacheCopy(LightFreeRecords::kLeanCache, pixel->Name);
+	}
 	// (2026-11-15) the lamp pass may be compiled at the first record, before any Interior record handed DeferredLamps its lamp shape: take it here
 	if (DeferredRenderer::On() && !DeferredLamps::LampFalloffOverride) DeferredLamps::LampFalloffOverride = PBRShaders::LampFalloffInteriorDefine();
 	DeferredRenderer::Load(pixel, pixel->Name, tmpl);	// UNOFFICIAL 2026-11-14 full deferred renderer phase 2 ([Main.Main.Quality] DeferredRenderer; off: nothing)
@@ -1346,6 +1445,10 @@ bool ShaderManager::LoadShader(NiD3DPixelShader* Shader) {
 	if (HasAnyRecord(pixel)) {
 		family->PixelShaderList.push_back(pixel);
 		Logger::Log("Loaded %s Pixel Shader %s", family->Name, pixel->Name);
+	}
+	else if (DeferredRenderer::Records.count(pixel)) {	// (2026-11-18 DeferredStandalone: its deferred record only; listed so a reload or a family switch reaches it)
+		family->PixelShaderList.push_back(pixel);
+		Logger::Log("Loaded %s Pixel Shader %s (deferred record only: its forward record did not load)", family->Name, pixel->Name);
 	}
 	ShaderFallbackAfterLoad(this);	// UNOFFICIAL 2026-11-12 ShaderFallback: a feature dropped while this one loaded
 	return familyOn;

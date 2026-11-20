@@ -3,7 +3,15 @@
 #include "../CoverMap/CoverMap.h"	// UNOFFICIAL 2026-10-27 Persistent wetness
 #include "../../core/CapturedNormals.h"	// UNOFFICIAL 2026-11-12 PuddlesLandOnly (TESR_MaterialBuffer's classes)
 #include "../../core/RainState.h"	// UNOFFICIAL 2026-11-12 RainStateGuard
+#include "../../core/FdIndirect.h"	// UNOFFICIAL 2026-11-18 DeferredBumpedNormals
 #include <algorithm>	// std::clamp
+
+bool WetWorldEffect::ReflectionsOwnPuddles() const {
+	if (!reflectionsOwnPuddles) return false;
+	ReflectionsEffect* const reflections = TheShaderManager->Effects.Reflections;
+	if (!reflections || !reflections->Enabled || !reflections->IsLoaded() || reflections->Settings.RainWetness <= 0.0f) return false;
+	return Constants.Data.x > 0.0f || Constants.Data.z > 0.0f || (TheCoverMap && TheCoverMap->WetActive());
+}
 
 void WetWorldEffect::UpdateConstants() {
 	// UNOFFICIAL 2026-11-12 RainStateGuard (core/RainState.h): on, the one rain state drives both animators and fills Data.x (the rain),
@@ -35,11 +43,9 @@ void WetWorldEffect::UpdateConstants() {
 	const bool weaponOff = weaponRainHandOff && hud && hud->Enabled && hud->IsLoaded();
 	Constants.Look.y = (float)mode + (weaponOff ? 4.0f : 0.0f);
 	Constants.Look.z = puddlesMinObjectSize;
-	// ReflectionsOwnPuddles: only while the Reflections effect has wetness of its own to draw (it follows the rain falling now, not the
-	// puddles left after it: Reflections.cpp UpdateConstants); after the rain the puddles keep their own image.
-	ReflectionsEffect* const reflections = TheShaderManager->Effects.Reflections;
-	Constants.Look.w = reflectionsOwnPuddles && reflections && reflections->Enabled && reflections->IsLoaded() &&
-		reflections->Settings.RainWetness > 0.0f && Constants.Data.x > 0.0f ? 1.0f : 0.0f;
+	// ReflectionsOwnPuddles: stays active across falling rain, drying puddles (Data.z > 0) and persistent puddles (CoverMap::WetActive)
+	// so puddles never snap back to WetWorld's un-denoised 8-step SSR when rain stops.
+	Constants.Look.w = ReflectionsOwnPuddles() ? 1.0f : 0.0f;
 	// One line when it starts, one when it cannot run (while there is something wet to draw outdoors; at most 8 lines a session).
 	if ((Constants.Data.x > 0.0f || Constants.Data.z > 0.0f) && TheShaderManager->GameState.isExterior) {
 		const bool buffer = CapturedNormals::MaterialTexture != nullptr && CapturedNormals::MaterialData.x > 0.5f;	// (last frame's)
@@ -255,7 +261,7 @@ bool WetWorldEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	if (!extWet.Tried) {
 		extWet.Tried = true;
 		NVR_EXT_BINDING_DESC bindings[20] = {};
-		const UINT count = WetBindings(bindings, 13, 4);
+		const UINT count = WetBindings(bindings, 14, 4);	// (2026-11-18: + the shading normals, binding 13)
 		extWet.Pipeline = DxvkCompute::CreateGraphicsPipeline("WetWorld", bindings, count, sizeof(WetWorldPush), true);
 	}
 	if (!extMap.Pipeline || !extWet.Pipeline) return false;
@@ -331,11 +337,32 @@ bool WetWorldEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 		if (!drawPass(extMap, mapTextures, 6, mapSamplers, 2, blur, TheTextureManager->RenderedSurface, nullptr, false)) return true;
 	}
 
-	// Wet: the blurred wet map is the current image; TESR_SourceBuffer is the frame before the effect.
-	IDirect3DBaseTexture9* wetTextures[13] = { TheTextureManager->RenderedTexture, TheTextureManager->SourceTexture, depth, depthViewModel,
-		ortho, normals, pointShadow, ripple, splash, splashNormal, cloud, puddleNormal, streak };
+	// Wet: the blurred wet map is the current image; TESR_SourceBuffer is the frame before the effect. (2026-11-18 DeferredBumpedNormals)
+	// binding 13: the shading normals while the switch is on, else the normals buffer again (the same result as before)
+	IDirect3DBaseTexture9* wetTextures[14] = { TheTextureManager->RenderedTexture, TheTextureManager->SourceTexture, depth, depthViewModel,
+		ortho, normals, pointShadow, ripple, splash, splashNormal, cloud, puddleNormal, streak, ShadingNormals(Device, normals) };
 	ID3D9NvrExtSampler* wetSamplers[4] = { linearClamp, pointClamp, mipWrap, mipClamp };
 	const UINT wetMode = (fast ? 1u : 0u) | (fixTrace ? 2u : 0u);
-	drawPass(extWet, wetTextures, 13, wetSamplers, 4, wetMode, TheTextureManager->RenderedSurface, nullptr, true);
+	drawPass(extWet, wetTextures, 14, wetSamplers, 4, wetMode, TheTextureManager->RenderedSurface, nullptr, true);
 	return true;
+}
+
+// UNOFFICIAL 2026-11-18 [Main.Main.Quality] DeferredBumpedNormals (live, test only, off; core/FdIndirect.h, docs/bumped-normals-study.md): the
+// normal the wet surface is shaded and reflects with (Wet pass: WetWorld.fx.hlsl NVR_WetWorldShadingNormals, s15; WetWorld.frag binding 13).
+// On: the G-buffer's normal-mapped shading normal (made once a frame, shared with the reflections); off, or when it cannot be made: the
+// normals buffer itself, so the shader reads the same normal twice and draws exactly what it drew before.
+IDirect3DBaseTexture9* WetWorldEffect::ShadingNormals(IDirect3DDevice9* Device, IDirect3DBaseTexture9* normals) {
+	if (!normals || !FdIndirect::BumpedNormalsOn()) return normals;
+	std::string depthName = "TESR_DepthBuffer";
+	IDirect3DBaseTexture9** depth = TheTextureManager->GetTextureSlotByName(depthName);
+	return FdIndirect::ShadingNormals(Device, normals, depth ? *depth : nullptr);
+}
+
+// The D3D9 passes: stage 15 set before every Render (EffectChain), cleared after it. Only when the effect draws.
+void WetWorldEffect::BindShadingNormals(IDirect3DDevice9* Device) {
+	if (!Enabled || !Effect || !ShouldRender()) return;
+	std::string normalsName = "TESR_NormalsBuffer";
+	IDirect3DBaseTexture9** slot = TheTextureManager->GetTextureSlotByName(normalsName);
+	IDirect3DBaseTexture9* normals = slot ? *slot : nullptr;
+	if (normals) SetPassTexture(15, ShadingNormals(Device, normals));	// set after each pass begins (EffectRecord::PassTextures)
 }

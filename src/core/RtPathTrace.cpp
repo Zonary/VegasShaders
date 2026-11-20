@@ -16,6 +16,7 @@
 #include "RtDenoise.h"
 #include "ManyLamps.h"
 #include "../effects/PBR/PBR.h"	// (2026-11-04 rtgap) the game's light scale	// (2026-11-03 rtspec) PTGameLamps 4: the game's lamp table
+#include "RtLightUnits.h"	// UNOFFICIAL 2026-11-19 (Finding 4.1) shared PBR decode gamma + light / ambient / sky scales
 #include "FlashlightDeferred.h"	// (2026-11-07) the flashlight as its own pass draws it (LightParams)
 #include "RenderRect.h"	// (2026-11-03) RenderScale < 1: the trace over the frame's top-left rect (docs/next/RT-RENDERSCALE.md)
 #include "RtViewModel.h"	// (2026-11-07 ptaaa-firstperson) PTViewModel's prep pass (shared with tools/nvr-rt-host)
@@ -520,7 +521,7 @@ namespace {
 	// UNOFFICIAL 2026-11-04 (rtgap) the game's light scale: its lit shaders multiply the sun and the lamps by [Shaders.PBR.*] / [Shaders.Terrain.*]
 	// LightingScale, decoded to linear (LIN_SCALE_LIGHT, TESR_LinearScales.x): 0.725 by day outdoors = 0.49 linear, 1 indoors and at night.
 	// Without it the reference's sunlit surfaces were 2.06x the game's at Goodsprings noon (rtgap-gs); with the game's own lights only.
-	inline float GameLightScale() { PBRShaders* pbr = TheShaderManager->Shaders.PBR; return pbr ? pbr->Constants.LinearScales.x : 1.0f; }
+	inline float GameLightScale() { return RtLightUnits::LightScale(); }
 
 	// The lamps that light the hits: the shadow slots' lamps and the tracked ones as ShaderManager listed them this frame, nearest
 	// first, at most 8; scene space (world minus CameraPosition), colour linear x dimmer (as AmbientOcclusion.cpp RtGILamps).
@@ -540,13 +541,15 @@ namespace {
 			const D3DXVECTOR3 rel(p.x - eye.x, p.y - eye.y, p.z - eye.z);
 			for (int i = 0; i < found; i++)	// the same lamp in both lists
 				if (fabsf(lamps[i].pos.x - rel.x) < 1.0f && fabsf(lamps[i].pos.y - rel.y) < 1.0f && fabsf(lamps[i].pos.z - rel.z) < 1.0f) return;
-			// (2026-11-03 rtspec) PTGameLamps: the colour as the game's lamp table makes it (ManyLamps.h: diffuse x dimmer, the dimmer at most 1
-			// without HDR, then decoded to linear together; the light's LOD dimmer is not in these lists); off: diffuse decoded x dimmer, as RT GI
+			// (2026-11-03 rtspec / 2026-11-19 Finding 4.1) PTGameLamps: the colour as the game's lamp table makes it (ManyLamps.h / Object.hlsl:
+			// diffuse x dimmer, the dimmer at most 1 without HDR, then decoded to linear together with RtLightUnits::Gamma(), x LightScale in mode 4);
+			// off (0 / 1): diffuse decoded x dimmer, as RT GI
 			float dim = col.w;
-			const bool gameColour = (S.gameLamps & 2) != 0;
+			const bool gameColour = (S.gameLamps & 2) != 0 || S.gameLamps == 4;
 			if (gameColour && !*(const bool*)0x011F941E && dim > 1.0f) dim = 1.0f;	// BSShaderManager::bHDR
-			const D3DXVECTOR4 colour = gameColour ? D3DXVECTOR4(Lin(col.x * dim), Lin(col.y * dim), Lin(col.z * dim), 0.0f) :
-				D3DXVECTOR4(Lin(col.x) * col.w, Lin(col.y) * col.w, Lin(col.z) * col.w, 0.0f);
+			const D3DXVECTOR3 dec = gameColour ? RtLightUnits::DecodeLamp(D3DXVECTOR4(col.x, col.y, col.z, dim), S.gameLamps == 4 ? RtLightUnits::LightScale() : 1.0f) :
+				D3DXVECTOR3(Lin(col.x) * col.w, Lin(col.y) * col.w, Lin(col.z) * col.w);
+			const D3DXVECTOR4 colour(dec.x, dec.y, dec.z, 0.0f);
 			lamps[found++] = { D3DXVECTOR4(rel.x, rel.y, rel.z, p.w), colour,
 				(std::max)(D3DXVec3Length(&rel) - p.w, 0.0f) };
 		};
@@ -577,7 +580,11 @@ namespace {
 				const D3DXVECTOR4& fc = sm->SpotLightColor[0];
 				pos = D3DXVECTOR3(fp.x - eye.x, fp.y - eye.y, fp.z - eye.z); reach = fp.w;
 				axis = D3DXVECTOR3(fd.x, fd.y, fd.z); cosOuter = cosf(D3DXToRadian((std::min)((std::max)(fd.w, 1.0f), 89.0f)));
-				colour = D3DXVECTOR3(Lin(fc.x) * fc.w, Lin(fc.y) * fc.w, Lin(fc.z) * fc.w);
+				float fdim = fc.w;
+				const bool gameFlash = (S.gameLamps & 2) != 0 || S.gameLamps == 4;
+				if (gameFlash && !*(const bool*)0x011F941E && fdim > 1.0f) fdim = 1.0f;
+				colour = gameFlash ? RtLightUnits::DecodeLamp(D3DXVECTOR4(fc.x, fc.y, fc.z, fdim), S.gameLamps == 4 ? RtLightUnits::LightScale() : 1.0f) :
+					D3DXVECTOR3(Lin(fc.x) * fc.w, Lin(fc.y) * fc.w, Lin(fc.z) * fc.w);
 			}
 			const float len = D3DXVec3Length(&axis);
 			if (reach > 10.0f && len > 1.0e-3f && (colour.x + colour.y + colour.z) > 0.0f) {
@@ -601,11 +608,15 @@ namespace {
 		if (S.gameLamps == 4 && ManyLamps::TableFrame + 1 >= ManyLamps::FrameId && !source.empty()) {
 			static std::vector<Lamp> table;
 			table.clear();
+			const float ls = RtLightUnits::LightScale();	// (2026-11-04 rtgap) as the game's lamps: x LIN_SCALE_LIGHT
 			for (const ManyLamps::ActiveLamp& a : source) {
 				if (a.reach <= 0.0f) continue;
+				// (2026-11-17, as the test for the game's lamps above) a NaN / Inf lamp would break std::sort's ordering below
+				if (!(fabsf(a.pos[0]) + fabsf(a.pos[1]) + fabsf(a.pos[2]) + fabsf(a.reach) < 1.0e30f)) continue;
 				const D3DXVECTOR3 rel(a.pos[0] - eye.x, a.pos[1] - eye.y, a.pos[2] - eye.z);
-				const float ls = GameLightScale();	// (2026-11-04 rtgap) as the game's lamps: x LIN_SCALE_LIGHT
-				table.push_back({ D3DXVECTOR4(rel.x, rel.y, rel.z, a.reach), D3DXVECTOR4(a.colour[0] * ls, a.colour[1] * ls, a.colour[2] * ls, 0.0f),
+				const D3DXVECTOR3 tc = ManyLamps::LinearCompiled ? D3DXVECTOR3(a.colour[0] * ls, a.colour[1] * ls, a.colour[2] * ls) :
+					RtLightUnits::DecodeColor(a.colour[0], a.colour[1], a.colour[2], ls);
+				table.push_back({ D3DXVECTOR4(rel.x, rel.y, rel.z, a.reach), D3DXVECTOR4(tc.x, tc.y, tc.z, 0.0f),
 					(std::max)(D3DXVec3Length(&rel) - a.reach, 0.0f) });
 			}
 			for (Lamp& l : table) physical(l);
@@ -646,6 +657,7 @@ namespace {
 		std::vector<Pick> picks;
 		for (const RtCore::GlowLight& g : RtCore::GlowLights()) {
 			if (!(g.radius > 0.0f) || g.radius > 512.0f) continue;
+			if (!(fabsf(g.center[0]) + fabsf(g.center[1]) + fabsf(g.center[2]) + fabsf(g.rgb[0]) + fabsf(g.rgb[1]) + fabsf(g.rgb[2]) < 1.0e30f)) continue;	// (2026-11-17: a NaN weight in the sort below)
 			const float luma = 0.2126f * g.rgb[0] + 0.7152f * g.rgb[1] + 0.0722f * g.rgb[2] + 0.05f;
 			const float d2 = g.center[0] * g.center[0] + g.center[1] * g.center[1] + g.center[2] * g.center[2];
 			picks.push_back({ &g, luma * g.radius * g.radius / (std::max)(d2, g.radius * g.radius) });
@@ -744,8 +756,47 @@ namespace {
 	}
 	// (2026-11-11 PTScreenOwn) viewModel: the view model's part (as before); own: the marks (RtViewModel.h; tw, th the render rect, jitter the
 	// depth's, as the trace's ScreenHit). At least one of the two.
+	// UNOFFICIAL 2026-11-19 (Finding 4.2) RtViewModel::kPrepPS + FD_SV_F0 bridge: when c8.z > 0.5, decodes the lighting-free G-buffer's
+	// dielectric highlight F0 slot s (1..9 -> F0 0.00..0.08, Includes/DeferredPixel.hlsl FDSunVisCode) from TESR_CapturedNormalsBuffer.a
+	// and carries +s/128 in the clean / ownMaybe sub-band of gNormals.a (exact in fp16; preserves every existing nv.a predicate).
+	const char* const kVmPrepF0PS =
+		"sampler2D N : register(s0); sampler2D C : register(s1); sampler2D M : register(s2); sampler2D D : register(s3); sampler2D K : register(s4);"
+		"sampler2D W : register(s5);"
+		"float4 P : register(c0); float4 Q : register(c1); row_major float4x4 V : register(c2);"
+		"float4 S : register(c6); float4 R : register(c7); float4 T : register(c8); float4 U : register(c9);"
+		"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+		"  float4 nb = tex2D(N, uv); float4 c = tex2D(C, uv); float raw = tex2D(M, uv).x; float dw = tex2D(D, uv).x; float ka = tex2D(K, uv).a;"
+		"  float wm = tex2D(W, uv * U.yz).x;"
+		"  bool rev = Q.x > 0.5;"
+		"  bool vm = S.x > 0.5 && (rev ? raw > 0.01 : raw < 0.9);"
+		"  if (!vm) {"
+		"    if (U.x > 0.5 && wm > (U.w > 0.0 ? U.w : 0.45)) return float4(nb.rgb, -1.0);"
+		"    float a = c.a > 1.5 ? 2.0 : 1.0;"
+		"    if (S.y > 0.5 && dw > 0.0 && dw < 0.9999 && c.a > 0.99) {"
+		"      float2 r = uv * R.xy + R.zw;"
+		"      float dist = length(float3((r.x * 2.0 - 1.0) * P.x * Q.y, (1.0 - r.y * 2.0) * P.y * Q.y, 1.0)) * dw * P.w;"
+		"      float gap = c.b - dist; float tol = c.b * S.z + S.w;"
+		"      bool bare = c.a > 1.5 && (T.x > 1.5 ? ka <= 0.0 : T.x > 0.5);"
+		"      if (bare || gap > tol + T.y) a += 0.5;"
+		"      else if (gap > tol) a += 0.25;"
+		"    }"
+		"    if (T.z > 0.5 && frac(a) < 0.375 && c.a > 0.99 && c.a < 2.005) {"
+		"      float qf = floor(abs(c.a - (c.a > 1.5 ? 2.0 : 1.0)) * 1024.0 + 0.5);"
+		"      a += floor((qf + 0.5) / 48.0) * (1.0 / 128.0);"
+		"    }"
+		"    return float4(nb.rgb, a);"
+		"  }"
+		"  float z = rev ? P.z * P.w / (P.z + raw * (P.w - P.z)) : P.z * P.w / (P.w - raw * (P.w - P.z));"
+		"  float3 vp = float3((uv.x * 2.0 - 1.0) * P.x, (1.0 - uv.y * 2.0) * P.y, 1.0) * z;"
+		"  float d = length(vp);"
+		"  if (!(c.a > 0.99 && abs(c.b - d) <= d * Q.z + Q.w)) return float4(nb.rgb, -1.0);"
+		"  float3 n = float3(c.rg, 1.0 - abs(c.r) - abs(c.g)); float t = saturate(-n.z);"
+		"  n.xy += float2(n.x >= 0.0 ? -t : t, n.y >= 0.0 ? -t : t); n = normalize(n);"
+		"  float3 nv = normalize(mul(n, (float3x3)V));"
+		"  return float4(nv * 0.5 + 0.5, 4.0 + Q.y); }";
+
 	UInt32		ownFrames = 0;
-	bool ViewModelPrep(IDirect3DDevice9* Device, IDirect3DBaseTexture9* normals, UINT w, UINT h, bool viewModel = true, bool own = false, UINT tw = 0, UINT th = 0, float jitterX = 0.0f, float jitterY = 0.0f) {
+	bool ViewModelPrep(IDirect3DDevice9* Device, IDirect3DBaseTexture9* normals, UINT w, UINT h, bool viewModel = true, bool own = false, UINT tw = 0, UINT th = 0, float jitterX = 0.0f, float jitterY = 0.0f, bool f0 = false) {
 		auto constant = [](const char* name) { auto f = TheShaderManager->ConstantsTable.find(name); return f == TheShaderManager->ConstantsTable.end() ? nullptr : f->second; };
 		auto texture = [](const char* name) -> IDirect3DBaseTexture9* { auto f = TheTextureManager->TextureNames.find(name); return f == TheTextureManager->TextureNames.end() || !f->second ? nullptr : *f->second; };
 		IDirect3DBaseTexture9* captured = texture("TESR_CapturedNormalsBuffer");
@@ -758,12 +809,12 @@ namespace {
 		// UNOFFICIAL 2026-11-12 PTWaterMask (core/WaterMask.h; RtViewModel.h c9 / s5): the pixels this frame's world scene drew water on (null: no
 		// water in view, the key off, or the mask not made): coded -1, the game's own pixel. The pass also runs for the mask alone.
 		IDirect3DTexture9* water = WaterMask::ThisFrame(Device, TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0);
-		if (vmPrepFailed || !normals || !captured || (!viewModel && !own && !water) || !view || !camera || camera->y <= 0.0f) return false;
+		if (vmPrepFailed || !normals || !captured || (!viewModel && !own && !water && !f0) || !view || !camera || camera->y <= 0.0f) return false;
 		// the skin blur's albedo target, where this span's skin draws bound it (CapturedNormals::SkinAlbedoFill copied it into the AlbedoBuffer)
 		IDirect3DBaseTexture9* skinAlbedo = own && CapturedNormals::SkinAlbedoTex && !CapturedNormals::SkinAlbedoFillFailed ? (IDirect3DBaseTexture9*)CapturedNormals::SkinAlbedoTex : nullptr;
 		if (!vmPrepPS) {
-			// the source and its constants: core/RtViewModel.h (also run by tools/nvr-rt-host scene `vmprep`)
-			vmPrepPS = CapturedNormals::FullScreenShader(Device, RtViewModel::kPrepPS, "RT path trace view model", vmPrepFailed);
+			// the source and its constants: core/RtViewModel.h (+ Finding 4.2 FD_SV_F0 bridge when c8.z > 0.5)
+			vmPrepPS = CapturedNormals::FullScreenShader(Device, kVmPrepF0PS, "RT path trace view model", vmPrepFailed);
 			if (!vmPrepPS) return false;
 		}
 		if (vmNormals) { D3DSURFACE_DESC d = {}; vmNormals->GetLevelDesc(0, &d); if (d.Width != w || d.Height != h) { DxvkCompute::Drop(vmNormalsSurface); DxvkCompute::Drop(vmNormals); } }
@@ -783,7 +834,7 @@ namespace {
 			{ view->_31, view->_32, view->_33, view->_34 }, { view->_41, view->_42, view->_43, view->_44 },
 			{ viewModel ? 1.0f : 0.0f, own ? 1.0f : 0.0f, RtViewModel::kFrontShare, RtViewModel::kFrontUnits },
 			{ tw ? (float)w / (float)tw : 1.0f, th ? (float)h / (float)th : 1.0f, jitterX, jitterY },
-			{ !own ? 0.0f : skinAlbedo ? 2.0f : 1.0f, reach, 0.0f, 0.0f },
+			{ !own ? 0.0f : skinAlbedo ? 2.0f : 1.0f, reach, f0 ? 1.0f : 0.0f, 0.0f },
 			// (PTWaterMask) c9: the mask on; its uv scale: this target's uv -> the share of the render rect (c7) -> the mask's own rect (the
 			// viewport its water draws had, top-left) of its own size. 1, 1 whenever the mask and the depth buffer share one layout
 			{ water ? 1.0f : 0.0f, water && WaterMask::Made.Width ? (tw ? (float)w / (float)tw : 1.0f) * (float)WaterMask::Rect.Width / (float)WaterMask::Made.Width : 0.0f,
@@ -919,8 +970,9 @@ namespace {
 		const D3DXMATRIX& view = TheRenderManager->viewMatrix;
 		const D3DXMATRIX& proj = TheRenderManager->projMatrix;
 		const D3DXVECTOR4& camera = TheRenderManager->CameraPosition;
+		const float uKey = S.gameLamps == 4 ? (RtLightUnits::Gamma() * 17.0f + RtLightUnits::LightScale() * 257.0f + RtLightUnits::SkyScale() * 4099.0f + RtLightUnits::AmbientScale() * 65537.0f) : 0.0f;
 		const float key[8] = { (float)S.bounces + 100.0f * (float)S.bounceHalf + 1000.0f * (float)S.lastSky + 10000.0f * (float)S.lastBounce + 100000.0f * (float)S.lampFalloff + 1000000.0f * S.lampGain,
-			S.sky + 100.0f * (float)S.restirDIRays + 1000.0f * (float)S.bounceLights, S.ambient,	// (perf-ptcost: + the ray budget keys)
+			S.sky + 100.0f * (float)S.restirDIRays + 1000.0f * (float)S.bounceLights, S.ambient + uKey,	// (perf-ptcost: + the ray budget keys; 2026-11-19: + live PBR unit scales)
 			S.glow + (S.emissive > 0 ? 1000.0f : 0.0f) + 16.0f * S.materials.glass + 64.0f * S.materials.glassTint + 256.0f * S.materials.foliage + 1024.0f * S.materials.skin + 4096.0f * S.materials.sheen, S.clamp + 1000.0f * S.indirectClamp, (float)S.debugView + (S.primary ? 16.0f : 0.0f) + (S.specular ? 32.0f : 0.0f) + (S.glowLights ? 64.0f : 0.0f) + 128.0f * (float)S.gameLamps + (S.lightGrid ? 1024.0f : 0.0f) + 2048.0f * (float)S.bounceAlpha + 8192.0f * floorf(S.bounceDistance), proj._11, proj._22 };	// (2026-11-04: PTLightGrid too, so an A/B starts each mean fresh)
 		bool moved = !lastValid;
 		for (int i = 0; i < 16 && !moved; i++) moved = fabsf(((const float*)&view)[i] - ((const float*)&lastView)[i]) > 1.0e-4f;
@@ -1033,13 +1085,17 @@ namespace {
 		if (waterWant) WaterMask::Request(TheFrameRateManager->FrameNumber);
 		bool prepped = false;
 		const bool maskWant = primary && (WaterMask::Enabled || WaterMask::GrassOn);	// (2026-11-12 PTGrassOwnPixel: the mask may hold grass alone)
-		if ((vmWant || ownWant || (maskWant && WaterMask::WrittenFrame == TheFrameRateManager->FrameNumber)) && gNormals && albedoData && albedoData->x > 0.5f) {
-			prepped = ViewModelPrep(Device, gNormals, w, h, vmWant, ownWant, tw, th, c.rect[0], c.rect[1]);
+		const bool f0Want = primary && S.specular && !CapturedNormals::MsaaSurface && !CapturedNormals::AlbedoMsaa && capturedData && capturedData->x > 0.5f;
+		if ((vmWant || ownWant || f0Want || (maskWant && WaterMask::WrittenFrame == TheFrameRateManager->FrameNumber)) && gNormals && albedoData && albedoData->x > 0.5f) {
+			prepped = ViewModelPrep(Device, gNormals, w, h, vmWant, ownWant, tw, th, c.rect[0], c.rect[1], f0Want);
 			vmThisFrame = prepped && vmWant;
 		}
+		// (2026-11-19) RenderRect::On (tw < w || th < h): copy only the active top-left render rect of the screen-shaped G-buffer / frame textures
+		const RECT subRect = { 0, 0, (LONG)tw, (LONG)th };
+		const RECT* const inRect = (!fullRect && tw > 0 && th > 0) ? &subRect : nullptr;
 		IDirect3DBaseTexture9* normalsIn = prepped ? (IDirect3DBaseTexture9*)vmNormals : gNormals;
 		if (primary && imageDepth >= 0 && imageNormals >= 0 && imageAlbedo >= 0 && c.forward[3] > 0.0f && albedoData && albedoData->x > 0.5f &&
-			gDepth && normalsIn && gAlbedo && RtCore::CopyIn(imageDepth, gDepth) && RtCore::CopyIn(imageNormals, normalsIn) && RtCore::CopyIn(imageAlbedo, gAlbedo))
+			gDepth && normalsIn && gAlbedo && RtCore::CopyIn(imageDepth, gDepth, inRect) && RtCore::CopyIn(imageNormals, normalsIn, inRect) && RtCore::CopyIn(imageAlbedo, gAlbedo, inRect))
 			flags |= 8u;
 		else vmThisFrame = false;
 		// the next frame's first-person render captures the model while the path tracer can light it (the screen's G-buffer, the full rect)
@@ -1048,7 +1104,7 @@ namespace {
 		// (2026-11-02 e) the screen's roughness / metal (CapturedNormals' MaterialBuffer) with the first hit's G-buffer
 		const D3DXVECTOR4* materialData = constant("TESR_MaterialBufferData");
 		IDirect3DBaseTexture9* gMaterial = texture("TESR_MaterialBuffer");
-		if ((flags & 8u) && S.specular && imageMaterial >= 0 && materialData && materialData->x > 0.5f && gMaterial && RtCore::CopyIn(imageMaterial, gMaterial))
+		if ((flags & 8u) && S.specular && imageMaterial >= 0 && materialData && materialData->x > 0.5f && gMaterial && RtCore::CopyIn(imageMaterial, gMaterial, inRect))
 			flags |= 256u;
 		if (S.specular) flags |= 128u;
 		if ((S.gameLamps & 1) || S.gameLamps == 4) flags |= 2048u;	// (2026-11-03 rtspec) PTGameLamps: the game's falloff
@@ -1083,7 +1139,9 @@ namespace {
 		// (2026-11-02 c) the frame as drawn so far (the world, the sky; NVR's effects not yet): camera rays that leave the RT scene show it
 		IDirect3DSurface9* frame = nullptr;
 		if (primary && imageFrame >= 0 && SUCCEEDED(Device->GetRenderTarget(0, &frame)) && frame) {
-			if (RtCore::CopyIn(imageFrame, frame)) flags |= 32u;
+			D3DSURFACE_DESC fd = {};
+			const RECT* const frameRect = (inRect && SUCCEEDED(frame->GetDesc(&fd)) && fd.Width >= tw && fd.Height >= th) ? inRect : nullptr;
+			if (RtCore::CopyIn(imageFrame, frame, frameRect)) flags |= 32u;
 			frame->Release();
 		}
 		const int normalAtlas = RtCore::NormalAtlasImage();	// (2026-11-02 d) NormalTextures
@@ -1093,14 +1151,21 @@ namespace {
 		c.accum[0] = (float)samples; c.accum[1] = (float)S.bounces; c.accum[2] = (float)S.samples; c.accum[3] = (float)flags;
 		const ShaderConstants& k = TheShaderManager->ShaderConst;
 		memcpy(c.sunDir, &sunKey, 16);
-		const float lightScale = S.gameLamps == 4 ? GameLightScale() : 1.0f;	// (2026-11-04 rtgap)
-		c.sunColor[0] = Lin(k.sunColor.x) * lightScale; c.sunColor[1] = Lin(k.sunColor.y) * lightScale; c.sunColor[2] = Lin(k.sunColor.z) * lightScale;
+		if (S.gameLamps == 4) {	// UNOFFICIAL 2026-11-19 (Finding 4.1) match forward / deferred PBR decode gamma + light / sky / ambient scales
+			RtLightUnits::DecodeColor(c.sunColor, k.sunColor.x, k.sunColor.y, k.sunColor.z, RtLightUnits::LightScale());
+			RtLightUnits::DecodeColor(c.skyZenith, k.skyColor.x, k.skyColor.y, k.skyColor.z, RtLightUnits::SkyScale() * S.sky);
+			RtLightUnits::DecodeColor(c.skyHorizon, k.horizonColor.x, k.horizonColor.y, k.horizonColor.z, RtLightUnits::SkyScale() * S.sky);
+			RtLightUnits::DecodeColor(c.ambient, k.sunAmbient.x, k.sunAmbient.y, k.sunAmbient.z, RtLightUnits::AmbientScale() * S.ambient);
+		}
+		else {
+			c.sunColor[0] = Lin(k.sunColor.x); c.sunColor[1] = Lin(k.sunColor.y); c.sunColor[2] = Lin(k.sunColor.z);
+			c.skyZenith[0] = Lin(k.skyColor.x) * S.sky; c.skyZenith[1] = Lin(k.skyColor.y) * S.sky; c.skyZenith[2] = Lin(k.skyColor.z) * S.sky;
+			c.skyHorizon[0] = Lin(k.horizonColor.x) * S.sky; c.skyHorizon[1] = Lin(k.horizonColor.y) * S.sky; c.skyHorizon[2] = Lin(k.horizonColor.z) * S.sky;
+			c.ambient[0] = Lin(k.sunAmbient.x) * S.ambient; c.ambient[1] = Lin(k.sunAmbient.y) * S.ambient; c.ambient[2] = Lin(k.sunAmbient.z) * S.ambient;
+		}
 		c.sunColor[3] = tanf(0.5f * 0.53f * 0.0174532925f);	// the sun's disc
-		c.skyZenith[0] = Lin(k.skyColor.x) * S.sky; c.skyZenith[1] = Lin(k.skyColor.y) * S.sky; c.skyZenith[2] = Lin(k.skyColor.z) * S.sky;
 		c.skyZenith[3] = exterior ? 1.0f : 0.0f;
-		c.skyHorizon[0] = Lin(k.horizonColor.x) * S.sky; c.skyHorizon[1] = Lin(k.horizonColor.y) * S.sky; c.skyHorizon[2] = Lin(k.horizonColor.z) * S.sky;
 		c.skyHorizon[3] = S.glow;
-		c.ambient[0] = Lin(k.sunAmbient.x) * S.ambient; c.ambient[1] = Lin(k.sunAmbient.y) * S.ambient; c.ambient[2] = Lin(k.sunAmbient.z) * S.ambient;
 		c.ambient[3] = S.sky;	// the panorama's scale
 		c.misc[0] = (float)Lamps(c);
 		// (2026-11-03) all the lamps through the lamp image (G32R32F, 4 texels a lamp), when it can be filled and copied this frame

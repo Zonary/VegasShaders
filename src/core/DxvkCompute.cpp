@@ -236,9 +236,13 @@ bool DxvkCompute::KeptOnD3D9(const char* Name) {
 }
 
 bool DxvkCompute::PassesOn() {
-	// UNOFFICIAL 2026-10-27 RenderScale v2: the Vulkan passes are off in rect frames (they draw the whole target; Available stays
-	// true, FSR runs through the extension).
+	// UNOFFICIAL 2026-10-27 RenderScale v2: unverified legacy .frag passes stay off in rect frames (they draw the whole target; Available
+	// stays true, FSR and PassesOnRect effects run through the extension).
 	return TheSettingManager->SettingsMain.Main.NvrDxvkPasses && !RenderRect::Active() && Available();
+}
+
+bool DxvkCompute::PassesOnRect() {
+	return TheSettingManager->SettingsMain.Main.NvrDxvkPasses && Available();
 }
 
 void DxvkCompute::ProfileTick(bool On) {
@@ -272,10 +276,11 @@ void DxvkCompute::ProfileTick(bool On) {
 	const double dxvkWorkMs = apiMs - presentWaitMs - csSyncMs - gpuSyncMs;
 	const double csBusyMs = frameMs - (double)(now.CsIdleUs - last.CsIdleUs) / 1000.0 / f;
 	const double gpuBusyMs = frameMs - (double)(now.GpuIdleUs - last.GpuIdleUs) / 1000.0 / f;
+	const char* passesKind = PassesOn() ? "Vulkan" : (PassesOnRect() && RenderRect::Active()) ? "Vulkan (rect)" : "D3D9";
 	Logger::Log("DXVK PROFILE frame %.2f ms (%.0f frames, passes %s) | game thread: outside D3D9 %.2f, inside D3D9 %.2f = DXVK work %.2f + "
 		"present wait %.2f + wait for DXVK thread %.2f + wait for GPU %.2f (%.0f calls) | DXVK thread busy %.2f | GPU busy %.2f | per frame: "
 		"draws %.0f, render passes %.0f, barriers %.0f, submits %.1f, chunks %.0f | new pipelines %llu",
-		frameMs, f, PassesOn() ? "Vulkan" : "D3D9", frameMs - apiMs, apiMs, dxvkWorkMs, presentWaitMs, csSyncMs, gpuSyncMs, timed > 0.0 ? calls / timed : 0.0,
+		frameMs, f, passesKind, frameMs - apiMs, apiMs, dxvkWorkMs, presentWaitMs, csSyncMs, gpuSyncMs, timed > 0.0 ? calls / timed : 0.0,
 		csBusyMs, gpuBusyMs, (double)(now.Draws - last.Draws) / f, (double)(now.RenderPasses - last.RenderPasses) / f,
 		(double)(now.Barriers - last.Barriers) / f, (double)(now.Submits - last.Submits) / f, (double)(now.CsChunks - last.CsChunks) / f,
 		(unsigned long long)(now.GraphicsPipelines - last.GraphicsPipelines));

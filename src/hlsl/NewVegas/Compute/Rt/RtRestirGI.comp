@@ -52,6 +52,7 @@ layout(set = 0, binding = 16, rg32f) uniform readonly image2D prevSurf;   // las
 layout(set = 0, binding = 17, rg32f) uniform writeonly image2D curSurf;
 #define RT_ALPHA_ATLAS alphaAtlas
 #include "RtAlpha.glsl"
+#include "RtHidden.glsl"
 #include "RtRestirGI.glsl"
 
 uint state;
@@ -195,9 +196,16 @@ bool Visible(vec3 from, vec3 to) {
 	const vec3 d = to - from;
 	const float len = length(d);
 	if (len < 1.0) return true;
+	const float tMax = max(len - 2.0, 0.0);
+	if (!(tMax > 0.0)) return true;
+	const vec3 orig = from + p.origin.xyz;
+	const vec3 dir = d / len;
+	// UNOFFICIAL 2026-11-19: pass over NVR_RT_CUSTOM_HIDDEN near eye (1st-person body must not block GI reuse rays)
+	if (rtHiddenPassOver(orig, orig + dir * tMax, p.origin.xyz))
+		return !rtBlockedPassHidden(orig, dir, 0.0, tMax, 0xFFu, AlphaTest(), kRtAnyHit);
 	rayQueryEXT q;
-	rayQueryInitializeEXT(q, scene, gl_RayFlagsTerminateOnFirstHitEXT | (AlphaTest() ? 0u : gl_RayFlagsOpaqueEXT), 0xFFu, from + p.origin.xyz,
-		0.0, d / len, max(len - 2.0, 0.0));
+	rayQueryInitializeEXT(q, scene, gl_RayFlagsTerminateOnFirstHitEXT | (AlphaTest() ? 0u : gl_RayFlagsOpaqueEXT), 0xFFu, orig,
+		0.0, dir, tMax);
 	ProceedShadow(q);
 	return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
 }
@@ -287,8 +295,10 @@ void main() {
 	const float target = Target(sel, x1, n1);
 	float W = target > 0.0 ? wSum / (M * target) : 0.0;
 	const vec3 lift = x1 + n1 * (1.0 + 0.002 * t1);
-	if (fromNeighbour && W > 0.0 && !Visible(lift, sel.x2)) W = 0.0;   // a neighbour's sample this surface does not see
-	if (isnan(W) || isinf(W)) W = 0.0;
+	// UNOFFICIAL 2026-11-19: when a neighbour sample is killed by visibility, also reset M to <= 1 so a high-M black
+	// reservoir does not poison subsequent temporal/spatial merges (fixes CGNS/ReSTIR GI dark-reservoir poisoning).
+	if (fromNeighbour && W > 0.0 && !Visible(lift, sel.x2)) { W = 0.0; M = min(M, 1.0); }
+	if (isnan(W) || isinf(W)) { W = 0.0; M = 0.0; }
 	M = min(M, maxM);
 
 	// the first bounce's light: colour / pi x cos x L x W (the game's units fold pi into the light: a cosine sample alone gives colour x L)

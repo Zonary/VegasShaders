@@ -104,6 +104,9 @@ bool peopleBlock = false;
 bool blockedByPeople(vec3 origin, vec3 segment, float tMin, float tMax) {
 	uint people = uint(p.rect.w) & (uint(p.params2.y) | uint(p.params2.z));
 	if (people == 0u || !(tMax > tMin)) return false;
+	// UNOFFICIAL 2026-11-19: pass over NVR_RT_CUSTOM_HIDDEN near eye/Pip-Boy so hidden first-person body doesn't cap temporal history
+	if (rtHiddenPassOver(origin, origin + segment, p.origin.xyz))
+		return rtBlockedPassHidden(origin, segment, tMin, tMax, people, false, kRtAnyHit);
 	rayQueryEXT q;
 	rayQueryInitializeEXT(q, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, people, origin, tMin, segment, tMax);
 	for (uint rtCap_ = 0u; rayQueryProceedEXT(q); ) if (++rtCap_ > 256u) { rayQueryTerminateEXT(q); break; } else {}
@@ -124,8 +127,14 @@ bool reaches(vec3 origin, float offset, int s, float rr, float ang) {
 	float invLen = inversesqrt(dot(segment, segment));
 	float tEnd = clamp(1.0 - stop * invLen, 0.0, 1.0);
 	float tMin = min(offset * invLen, tEnd);
-	float tSplit = clamp(1.0 - p.params2.x * invLen, tMin, tEnd);
-	bool lit = !blocked(origin, segment, tMin, tSplit, uint(p.params2.y)) && !blocked(origin, segment, tSplit, tEnd, uint(p.params2.z));
+	uint farMask = uint(p.params2.y), nearMask = uint(p.params2.z);
+	bool lit;
+	if (farMask == nearMask) {
+		lit = !blocked(origin, segment, tMin, tEnd, farMask);
+	} else {
+		float tSplit = clamp(1.0 - p.params2.x * invLen, tMin, tEnd);
+		lit = !blocked(origin, segment, tMin, tSplit, farMask) && !blocked(origin, segment, tSplit, tEnd, nearMask);
+	}
 	if (!lit && !peopleBlock && blockedByPeople(origin, segment, tMin, tEnd)) peopleBlock = true;
 	return lit;
 }

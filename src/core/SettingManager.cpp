@@ -3,6 +3,7 @@
 #include "InstallCheck.h"	// 2026-11-03: the user toml's unknown keys and version mark, for the install self-check
 #include "GpuDebug.h"	// UNOFFICIAL 2026-10-26: GpuDebugLabels / RenderDoc capture key ([Main.Develop.Main])
 #include "SettingForce.h"	// UNOFFICIAL 2026-11-14 full deferred renderer: its prerequisites read as forced
+#include "StalePresetValues.h"	// UNOFFICIAL 2026-11-18: settings step 90 moves the old defaults presets and scripts saved
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: a release build reads [Shaders.ShadowsInteriors.Capsules] Enabled as off
 
 // A settings file in <game>\Data\NVSE\Plugins (the game folder is read once, Paths::GameRoot: common-dialog calls can change the
@@ -17,9 +18,9 @@ static void ConfigPathOf(char (&dest)[MAX_PATH], Paths::File file, bool forWrite
 
 // A section's storage path split into its steps: the tables are kept under a leading "_" ("_Shaders.Bloom.Main").
 static void StorageKeys(const char* section, StringList* steps) {
-	char path[MAX_PATH] = { '_' };
-	strcat(path, section);
-	SettingManager::SplitString(path, ".", steps);
+	// (2026-11-17: a string, was char[MAX_PATH] + strcat: a preset's or a script's section name of any length arrives here)
+	const std::string path = std::string("_") + section;
+	SettingManager::SplitString(path.c_str(), ".", steps);
 }
 
 // Bounded copy into a node's 80-byte text: cut at 79 characters, always terminated.
@@ -58,12 +59,35 @@ template <> std::string SettingManager::ToString<int>(const int number) {
 }
 
 // The user config's [_Unofficial] SettingsVersion this build brings it up to (UpdateOldDefaults, below).
-static const int UnofficialSettingsVersion = 89;  // (89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
+static const int UnofficialSettingsVersion = 93;  // (93, 2026-11-19: a New Vegas Reloaded settings file gets LegacyFog + LegacyAs441, FormsNear -> Forms, and no terrain sky fill or ShadowBounce; 92, 2026-11-19: HelperWait 1, RideMainExchange + FollowRenderScale + ReplaceForward + ReflectionsOwnPuddles on, SunGI/RoomGI/AmbientReplace/HiZ/FFX retired; 91, 2026-11-18: [Shaders.PBR.Rmaos] MetalFromMap on, _rmaos maps decide metal; 90, 2026-11-18: old defaults of fixes that a Cartographer / Atlas / old preset batch left in the saved file move once, when 5 or more are found; 89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
 
 // UNOFFICIAL 2026-10-30: a setting is read only when the defaults file lists it (FillNode), so a line in the user's toml that
 // this build does not know (a key from a newer or an older build, a typo) silently did nothing. Each one is logged once per
 // load; a whole unknown section is one line. [_Unofficial] is NVR's own bookkeeping, never in the defaults.
 // 2026-11-03: also returns them (section.key), for the install check (InstallCheck.h)
+// UNOFFICIAL 2026-11-18: retired settings skipped quietly (no unknown-key warning for configs saved on an older build).
+static bool RetiredSetting(const std::string& Name) {
+	static const char* const kKeys[] = {
+		"Shaders.Puddles.Main.Streaks", "Shaders.Puddles.Main.StreakWidth", "Shaders.Puddles.Main.StreakSpeed",	// (2026-11-18: wall streaks removed)
+		// (2026-11-19: retired HiZ, FFX reflection denoiser clip, LegacyTilt, and SunGI/RoomGI/AmbientReplace/SkyMiss ambient-subtraction sprawl)
+		"Shaders.AmbientLight.Main.HiZ", "Shaders.AmbientLight.Main.SunGI", "Shaders.AmbientLight.Main.RoomGI",
+		"Shaders.AmbientLight.Main.AmbientReplace", "Shaders.AmbientLight.Main.AmbientFloor",
+		"Shaders.AmbientLight.Main.AmbientReplaceNight", "Shaders.AmbientLight.Main.AmbientFloorNight",
+		"Shaders.AmbientLight.Main.AmbientReplaceInterior", "Shaders.AmbientLight.Main.AmbientFloorInterior",
+		"Shaders.AmbientOcclusion.RT.GISky", "Shaders.AmbientOcclusion.RT.GISkyNight",
+		"Shaders.AmbientOcclusion.RT.GIAmbient", "Shaders.AmbientOcclusion.RT.GIAmbientInterior",
+		"Shaders.AmbientOcclusion.RT.SkyMissSH", "Shaders.AmbientOcclusion.RT.SkyMissNightAmbient",
+		"Shaders.AmbientOcclusion.RT.GIScreenAmbientOut", "Shaders.AmbientOcclusion.RT.GIDenoiseSunGI",
+		"Shaders.AmbientOcclusion.RT.GIDenoiseRoomGI", "Shaders.AmbientOcclusion.RT.RoomGIGlow",
+		"Shaders.AmbientOcclusion.RT.LegacyTilt", "Shaders.AmbientOcclusion.RT.LegacyTiltInterior",
+		"Shaders.Reflections.Main.HiZ", "Shaders.Reflections.Main.HiZSafeCells",
+		"Shaders.Reflections.Main.HiZCheck", "Shaders.Reflections.Main.HiZInteriorsTest",
+		"Shaders.Reflections.RT.DenoiserClip",
+	};
+	for (const char* k : kKeys) if (Name == k) return true;
+	return false;
+}
+
 static std::vector<std::string> WarnUnknownKeys(const tomlValue& User, const tomlValue& Defaults) {
 	std::vector<std::string> unknown;
 	if (!User.is_table() || !Defaults.is_table()) return unknown;
@@ -78,7 +102,9 @@ static std::vector<std::string> WarnUnknownKeys(const tomlValue& User, const tom
 			const bool known = defaults.contains(key);
 			if (known && value.is_table() && defaults.at(key).is_table()) { self(self, value, defaults.at(key), name(path, key)); continue; }
 			if (known) continue;
-			unknown.push_back(name(path, key));
+			const std::string full = name(path, key);
+			if (RetiredSetting(full)) continue;
+			unknown.push_back(full);
 			if (logged >= 40) { more++; continue; }
 			logged++;
 			if (value.is_table())
@@ -113,23 +139,26 @@ void SettingManager::Configuration::Init() {
 		Logger::Log("error loading defaults toml: %s", failure.what());
 	}
 
-	try {
-		Logger::Log("Loading settings from file %s", userFile);
-		if (Paths::OldIsNewer(Paths::PluginsDir(), Paths::File::UserSettings)) {	// 2026-11-02: a New Vegas Reloaded preset copied in later
-			Logger::Log("UNOFFICIAL settings: %s is newer than %s (a preset made for New Vegas Reloaded?): it is read; the next Save writes it as %s", Paths::OldName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings));
-			Paths::AddOldFilesNotice("Settings read from %s (newer than %s: a New Vegas Reloaded preset?). Save keeps them as %s.", Paths::OldName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings));
-		}
-		TomlConfig = toml::parse<toml::discard_comments, std::map>(std::string_view(userFile)).as_table();
-		userFileRead = true;
-	}
-	catch (const std::exception& failure) {
-		// UNOFFICIAL 2026-10-19: no settings file yet (a new install, or a test run that moved it aside) is no error
-		const bool noFile = GetFileAttributesA(userFile) == INVALID_FILE_ATTRIBUTES;
-		if (noFile)
-			Logger::Log("No settings file yet (%s): one will be made from the defaults.", userFile);
-		else
-			Logger::Log("error loading toml: %s, new config will be created from defaults.", failure.what());
+	// UNOFFICIAL 2026-11-19: check file existence before calling toml::parse so a fresh install with no settings file
+	// does not throw a first-chance std::ios_base::failure exception into the vectored exception handler (LOAD: C++ exception).
+	if (GetFileAttributesA(userFile) == INVALID_FILE_ATTRIBUTES) {
+		Logger::Log("No settings file yet (%s): one will be made from the defaults.", userFile);
 		TomlConfig = toml::table{};	// starts empty: every read fills in its default
+	}
+	else {
+		try {
+			Logger::Log("Loading settings from file %s", userFile);
+			if (Paths::OldIsNewer(Paths::PluginsDir(), Paths::File::UserSettings)) {	// 2026-11-02: a New Vegas Reloaded preset copied in later
+				Logger::Log("UNOFFICIAL settings: %s is newer than %s (a preset made for New Vegas Reloaded?): it is read; the next Save writes it as %s", Paths::OldName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings));
+				Paths::AddOldFilesNotice("Settings read from %s (newer than %s: a New Vegas Reloaded preset?). Save keeps them as %s.", Paths::OldName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings), Paths::NewName(Paths::File::UserSettings));
+			}
+			TomlConfig = toml::parse<toml::discard_comments, std::map>(std::string_view(userFile)).as_table();
+			userFileRead = true;
+		}
+		catch (const std::exception& failure) {
+			Logger::Log("error loading toml: %s, new config will be created from defaults.", failure.what());
+			TomlConfig = toml::table{};	// starts empty: every read fills in its default
+		}
 	}
 
 	configLoaded = true;
@@ -207,7 +236,14 @@ bool SettingManager::Configuration::FillNode(ConfigNode* node, const char* secti
 	tomlValue* userTable = FindSection(&TomlConfig, &steps);
 	StorageKeys(section, &steps);
 	tomlValue* defaultTable = FindSection(&DefaultConfig, &steps);
-	if (!defaultTable) return false;	// not a setting of this build
+	if (!defaultTable || !defaultTable->is_table()) return false;	// not a setting of this build (or, 2026-11-17, a path onto a value)
+	if (userTable && !userTable->is_table()) userTable = nullptr;	// a user file with a value where the section should be: the defaults
+	// 2026-11-17: the node keeps the names in 40 bytes each and takes the part between the first two dots (below); a name that
+	// does not fit that is not one of this build's settings (a hand-made preset, script or defaults file).
+	{
+		const char* firstDot = strchr(section, '.');
+		if (strlen(section) >= sizeof(node->Section) || strlen(key) >= sizeof(node->Key) || !firstDot || !strchr(firstDot + 1, '.')) return false;
+	}
 
 	bool usedDefault = true;
 	std::string text;	// the value as text: toml's own format, or a String setting's whole text
@@ -288,7 +324,7 @@ bool SettingManager::Configuration::FillNode(ConfigNode* node, const char* secti
 	// UNOFFICIAL 2026-10-15 Max Quality: its value in place of the user's, after the write above so it never reaches their file.
 	if (MaxQualityActive) {
 		StorageKeys(section, &steps);
-		if (tomlValue* layer = FindSection(&MaxQualityConfig, &steps)) {
+		if (tomlValue* layer = FindSection(&MaxQualityConfig, &steps); layer && layer->is_table()) {
 			auto found = layer->as_table().find(key);
 			if (found != layer->as_table().end()) {
 				const tomlValue& forced = found->second;
@@ -342,7 +378,7 @@ tomlValue* SettingManager::Configuration::FindSection(tomlValue* table, StringLi
 		try {
 			level = &level->at(keys->front().c_str());
 		}
-		catch (const std::out_of_range&) {
+		catch (const std::exception&) {	// no such step, or (2026-11-17) a step that is a value, not a table: toml's type error went uncaught
 			return nullptr;
 		}
 		if (keys->size() == 1) return level;
@@ -371,7 +407,10 @@ void SettingManager::Configuration::FillSettings(SettingList* nodes, const char*
 tomlValue* SettingManager::Configuration::UserSection(const char* section) {
 	StringList steps;
 	StorageKeys(section, &steps);
-	return FindSection(&TomlConfig, &steps);
+	// 2026-11-17 (security review 2): only a table. A user file with a value where the section should be ([_Shaders] Bloom = 1)
+	// came back as that value, and the migration's contains() on it threw toml's type error out of the plugin's load.
+	tomlValue* found = FindSection(&TomlConfig, &steps);
+	return found && found->is_table() ? found : nullptr;
 }
 
 // A saved value that equals a replaced default is moved to the new default once. The menu's Save writes every
@@ -683,10 +722,31 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 			const double v = value.is_integer() ? (double)value.as_integer() : value.is_floating() ? value.as_floating() : -1.0e9;
 			if (v != k.oldDefault) { touched = &k; break; }
 		}
-		if (touched)
+		if (touched) {
 			Logger::Log("UNOFFICIAL settings: this build's new daylight look was NOT applied, because your saved %s.%s is your own value. To try it: "
 				"[Shaders.Sky.Main] TintDay 0.55 0.78 1.0, SaturationDay 1.6; [Shaders.Tonemapping.Main] Exposure 2.5, SkyMultiplier 0.6; LightingScale 1.15 in "
 				"[Shaders.PBR.Main], [Shaders.Terrain.Main] and their Rain groups; [Shaders.Grass.Main] Brightness 1.3.", touched->section, touched->key);
+			// 2026-11-18 (old NVR presets on VS, bench: memory vs-old-preset-look-caffeine): a look of the player's own keeps its OLD values for
+			// the look keys it never saved. A preset or settings file made for New Vegas Reloaded has no [Shaders.Sky.Main] TintDay* /
+			// SaturationDay at all (they came later), so the new look's blue sky tint and saturation 1.6 filled them in and Caffeine's warm
+			// sky came out blue. Only reached by files from before this step (a menu Save writes every key, so a newer file has none unsaved).
+			std::string kept;
+			for (const LookKey& k : look) {
+				StringList steps;
+				StorageKeys(k.section, &steps);
+				tomlValue* table = &TomlConfig;
+				for (const std::string& step : steps) {
+					if (!table->contains(step) || !table->at(step).is_table()) (*table)[step] = toml::table();
+					table = &table->at(step);
+				}
+				if (table->contains(k.key)) continue;
+				(*table)[k.key] = k.oldDefault;
+				kept += std::string(kept.empty() ? "" : ", ") + k.section + "." + k.key;
+			}
+			if (!kept.empty())
+				Logger::Log("UNOFFICIAL settings: your look's settings that your file did not have keep the old look's values (not the new look's): %s.",
+					kept.c_str());
+		}
 		else if (anySaved) {
 			for (const LookKey& k : look) if (k.oldDefault != k.newDefault) replace(k.section, k.key, k.oldDefault, k.newDefault, false);
 			Logger::Log("UNOFFICIAL settings: the new daylight look was applied (none of its values had been changed). The old look: [Shaders.Sky.Main] TintDay "
@@ -833,6 +893,133 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 			}
 		}
 	}
+	// 90 (2026-11-18, owner: players switching from NVR keep their Cartographer / Atlas presets): those mods replay every value they
+	// captured through NVRSetSetting, which went into this table, and the menu's Save wrote it to the file after the steps above had run,
+	// so the old defaults of the fixes stayed. Since this build a preset or script can no longer set them (StalePresetValues.h); this
+	// step cleans a file saved before. A captured batch leaves many of them at once; one or two may be the player's own pick (a fix turned
+	// off on purpose), so they move only when 5 or more are found, all together, to this build's default. Anti-aliasing never moves here.
+	if (version < 90) {
+		struct Hit { tomlValue* saved; const StalePresetValues::OldDefault* old; const tomlValue* fresh; };
+		std::vector<Hit> hits;
+		for (const StalePresetValues::OldDefault& old : StalePresetValues::kOldDefaults) {
+			if (old.playerChoice) continue;
+			tomlValue* saved = UserSection(old.section);
+			if (!saved || !saved->contains(old.key)) continue;
+			const tomlValue& value = saved->at(old.key);
+			const double number = value.is_boolean() ? (value.as_boolean() ? 1.0 : 0.0) : value.is_integer() ? (double)value.as_integer() :
+				value.is_floating() ? value.as_floating() : -1.0e9;
+			if (!StalePresetValues::SameNumber((float)number, old.oldValue)) continue;
+			StringList steps;
+			StorageKeys(old.section, &steps);
+			const tomlValue* defaults = FindSection(&DefaultConfig, &steps);
+			if (!defaults || !defaults->is_table() || !defaults->contains(old.key)) continue;
+			hits.push_back({ saved, &old, &defaults->at(old.key) });
+		}
+		if (hits.size() >= 5) {
+			for (const Hit& hit : hits) {
+				const tomlValue& fresh = *hit.fresh;
+				if (fresh.is_boolean()) (*hit.saved)[hit.old->key] = fresh.as_boolean();
+				else if (fresh.is_integer()) (*hit.saved)[hit.old->key] = fresh.as_integer();
+				else if (fresh.is_floating()) (*hit.saved)[hit.old->key] = fresh.as_floating();
+				else continue;
+				changed += std::string(changed.empty() ? "" : ", ") + hit.old->section + "." + hit.old->key + " (old default left by a preset or script)";
+			}
+		}
+		else if (!hits.empty())
+			Logger::Log("UNOFFICIAL settings: %u setting(s) in your file still hold the default of an older build (first: [%s] %s); fewer than 5, so "
+				"taken as your own choice and left as they are.", (unsigned)hits.size(), hits[0].old->section, hits[0].old->key);
+	}
+	// 91 (2026-11-18, owner: "maps decide"): [Shaders.PBR.Rmaos] MetalFromMap false -> true. A hand-made _rmaos map's metal (its green) was
+	// ignored since 2026-10-28 and a colour guess used instead, which turned first-person guns with a map into one uniform metal sheen
+	// (effects/PBR/defaults.toml). A menu save holds the old false, which moves once; a false saved after this step stays.
+	if (version < 91) {
+		tomlValue* saved = UserSection("Shaders.PBR.Rmaos");
+		if (saved && saved->contains("MetalFromMap") && saved->at("MetalFromMap").is_boolean() && !saved->at("MetalFromMap").as_boolean()) {
+			(*saved)["MetalFromMap"] = true;
+			changed += std::string(changed.empty() ? "" : ", ") + "Shaders.PBR.Rmaos.MetalFromMap false -> true (_rmaos maps decide metal)";
+		}
+	}
+	// 92 (2026-11-19): RT helper handover wait (HelperWait 0 -> 1, eliminates 5-8 ms GPU queue handover stall), Reflections RT
+	// RideMainExchange + FollowRenderScale on (single exchange + RenderScale sub-rect copies), ReplaceForward + ReflectionsOwnPuddles on,
+	// and legacy SunGI / RoomGI migrated to Shaders.AmbientOcclusion.RT.{Enabled, GI}.
+	if (version < 92) {
+		replace("Main.Main.RayTracing", "HelperWait", 0, 1, true);
+		auto toTrue = [&](const char* section, const char* key) {
+			tomlValue* saved = UserSection(section);
+			if (!saved || !saved->contains(key) || !saved->at(key).is_boolean() || saved->at(key).as_boolean()) return;
+			(*saved)[key] = true;
+			changed += std::string(changed.empty() ? "" : ", ") + section + "." + key + " false -> true";
+		};
+		toTrue("Shaders.Reflections.RT", "RideMainExchange");
+		toTrue("Shaders.Reflections.RT", "FollowRenderScale");
+		toTrue("Shaders.Reflections.Main", "ReplaceForward");
+		toTrue("Shaders.WetWorld.Main", "ReflectionsOwnPuddles");
+		tomlValue* alMain = UserSection("Shaders.AmbientLight.Main");
+		const bool hadSunOrRoomGI = alMain && alMain->is_table() &&
+			((alMain->contains("SunGI") && alMain->at("SunGI").is_boolean() && alMain->at("SunGI").as_boolean()) ||
+			 (alMain->contains("RoomGI") && alMain->at("RoomGI").is_boolean() && alMain->at("RoomGI").as_boolean()));
+		if (hadSunOrRoomGI) {
+			toTrue("Shaders.AmbientLight.Status", "Enabled");
+			toTrue("Shaders.AmbientLight.Main", "AlbedoBuffer");
+			toTrue("Shaders.AmbientOcclusion.RT", "Enabled");
+			toTrue("Shaders.AmbientOcclusion.RT", "GI");
+		}
+	}
+	// 93 (2026-11-18/19, merged from claude/preset-old-values, renumbered 92 -> 93 after RT overhaul took 92): a settings file from New Vegas
+	// Reloaded itself (no [_Unofficial] SettingsVersion: never saved by this project's builds), as preset packs ship it (Caffeine, Riven).
+	// (a) Its fog keys (SimpleFog*, HeightFog*, MinimumBaseFog...) are this build's LEGACY fog keys, read only with LegacyFog: without it
+	//     the current fog drew its own look and the preset's fog was lost. LegacyAs441 with it: 4.4.1's weaker height fog (VolumetricFog.cpp).
+	// (b) [Shaders.ShadowsExteriors.FormsNear/Middle/Far/Lod] became the one [Shaders.ShadowsExteriors.Forms]: FormsNear (the cascade near
+	//     the camera, the one people see) carries over when Forms itself was never saved.
+	// A file with LegacyFog or ClassicLook saved chose its fog already; one saved by this project's builds (version > 0) is left as it is.
+	if (version == 0) {
+		tomlValue* fog = UserSection("Shaders.VolumetricFog.Main");
+		if (fog && fog->is_table() && !fog->contains("LegacyFog") && !fog->contains("ClassicLook")) {
+			bool legacyKeys = false;
+			for (const char* key : { "SimpleFogBlend", "SimpleFogHeight", "HeightFogDensity", "HeightFogDist", "HeightFogBlend", "MinimumBaseFog" })
+				legacyKeys = legacyKeys || fog->contains(key);
+			if (legacyKeys) {
+				(*fog)["LegacyFog"] = true;
+				(*fog)["LegacyAs441"] = true;
+				changed += std::string(changed.empty() ? "" : ", ") + "Shaders.VolumetricFog.Main.LegacyFog and LegacyAs441 on (a New Vegas Reloaded settings file: "
+					"its fog as 4.4.1 drew it; LegacyFog false = this build's fog)";
+			}
+		}
+		const tomlValue* nearForms = UserSection("Shaders.ShadowsExteriors.FormsNear");
+		const tomlValue* forms = UserSection("Shaders.ShadowsExteriors.Forms");
+		tomlValue* exteriors = UserSection("Shaders.ShadowsExteriors");
+		StringList steps;
+		StorageKeys("Shaders.ShadowsExteriors.Forms", &steps);
+		const tomlValue* formsDefaults = FindSection(&DefaultConfig, &steps);
+		if (nearForms && exteriors && formsDefaults && formsDefaults->is_table() && (!forms || forms->as_table().empty())) {
+			tomlValue::table_type carried;
+			for (const auto& [key, value] : nearForms->as_table())
+				if (formsDefaults->contains(key) && !value.is_table()) carried[key] = value;
+			if (!carried.empty()) {
+				(*exteriors)["Forms"] = carried;
+				changed += std::string(changed.empty() ? "" : ", ") + "Shaders.ShadowsExteriors.FormsNear copied to Shaders.ShadowsExteriors.Forms (one list for every cascade now)";
+			}
+		}
+		// (c) 2026-11-18: the ground lit as 4.4.1 lit it, without this build's sky fill on the land (Terrain SkylightingScale) and the light
+		//     given back into the ground's cracks (Parallax ShadowBounce). Only keys the file never had.
+		if (UserSection("Shaders.Terrain")) {
+			auto zeroIfUnsaved = [&](const char* section, const char* key) {
+				StringList steps;
+				StorageKeys(section, &steps);
+				tomlValue* table = &TomlConfig;
+				for (const std::string& step : steps) {
+					if (!table->contains(step) || !table->at(step).is_table()) (*table)[step] = toml::table();
+					table = &table->at(step);
+				}
+				if (table->contains(key)) return;
+				(*table)[key] = 0.0;
+				changed += std::string(changed.empty() ? "" : ", ") + section + "." + key + " 0 (as New Vegas Reloaded 4.4.1 lit the ground)";
+			};
+			for (const char* group : { "Shaders.Terrain.Main", "Shaders.Terrain.Rain", "Shaders.Terrain.Night", "Shaders.Terrain.NightRain" })
+				zeroIfUnsaved(group, "SkylightingScale");
+			zeroIfUnsaved("Shaders.Terrain.Parallax", "ShadowBounce");
+		}
+	}
 	if (!changed.empty())
 		Logger::Log("UNOFFICIAL settings: old defaults saved by an earlier build moved to the new defaults: %s. "
 			"Change them in the menu and press Save if you want the old values back.", changed.c_str());
@@ -881,11 +1068,14 @@ void SettingManager::Configuration::SetValueIn(tomlValue& Target, ConfigNode* no
 	if (!FindSection(&DefaultConfig, &steps)) return;	// not a setting of this build: nothing is written
 
 	// a section the target lacks is built level by level
-	if (!table) {
+	// 2026-11-17 (security review 2): a value where a table should be (a hand-made or downloaded file) is replaced by a table;
+	// contains() and [] on a value threw toml's type error.
+	if (!table || !table->is_table()) {
 		StorageKeys(node->Section, &steps);
 		table = &Target;
+		if (!table->is_table()) return;
 		for (const std::string& step : steps) {
-			if (!table->contains(step)) (*table)[step] = toml::table();
+			if (!table->contains(step) || !table->at(step).is_table()) (*table)[step] = toml::table();
 			table = &table->at(step);
 		}
 	}
@@ -1277,9 +1467,9 @@ void SettingManager::LoadSettings() {
 
 	{
 		const char* sec = "Main.Menu.Style";
-		strcpy(SettingsMain.Menu.TextFont, GetSettingS(sec, "TextFont", text));
+		strncpy_s(SettingsMain.Menu.TextFont, GetSettingS(sec, "TextFont", text), _TRUNCATE);	// (2026-11-17: 40 bytes; the text can be 79)
 		SettingsMain.Menu.TextSize = GetSettingI(sec, "TextSize");
-		strcpy(SettingsMain.Menu.TextFontStatus, GetSettingS(sec, "TextFontStatus", text));
+		strncpy_s(SettingsMain.Menu.TextFontStatus, GetSettingS(sec, "TextFontStatus", text), _TRUNCATE);
 		SettingsMain.Menu.TextSizeStatus = GetSettingI(sec, "TextSizeStatus");
 		FillFromString(GetSettingS(sec, "TextColorNormal", text), ",", SettingsMain.Menu.TextColorNormal);
 		FillFromString(GetSettingS(sec, "TextShadowColorNormal", text), ",", SettingsMain.Menu.TextShadowColorNormal);
@@ -1378,7 +1568,8 @@ void SettingManager::LoadSettings() {
 			sprintf(colorKey, "Color%i", colorType);
 			SplitString(GetSettingS(colorsPath.c_str(), colorKey, text), " ", &colorTriples);
 			for (int when = 0; when < TESWeather::kNumTimeOfDay; ++when) {
-				FillFromString(colorTriples[when].c_str(), ",", rgb);
+				rgb[0] = rgb[1] = rgb[2] = 0;
+				if (when < (int)colorTriples.size()) FillFromString(colorTriples[when].c_str(), ",", rgb);	// (2026-11-17: a short list read past its end)
 				auto& color = SE.Colors[colorType].colors[when];
 				color.r = rgb[0];
 				color.g = rgb[1];
@@ -2023,14 +2214,6 @@ SettingManager::MenuSwitch SettingManager::GetMenuShaderSwitch(const char* Name)
 bool SettingManager::GetMenuShaderEnabled(const char* name) {
 	// UNOFFICIAL 2026-11-04 HudRaindrops has no section of its own: it is switched under Wetness Effects (HudRaindropsEffect::UpdateSettings).
 	if (!strcmp(name, "HudRaindrops")) return GetSettingI("Shaders.WetnessEffects.HudRaindrops", "Enabled") != 0;
-	// UNOFFICIAL 2026-11-12 (sungi p4) SunGI ([Shaders.AmbientLight.Main] SunGI, the one switch for the exterior sun bounce) implies AmbientLight's
-	// Status Enabled: it is on at load and after a revert (the runtime flag; AmbientLight::UpdateSettings follows a live change). The toml is not written;
-	// AmbientLight::ShouldRender keeps it off indoors while only SunGI has it on, so interiors stay as the user set them.
-	if (!strcmp(name, "AmbientLight")) {
-		Configuration::ConfigNode sunGi;
-		if (Config.FillNode(&sunGi, "Shaders.AmbientLight.Main", "SunGI") && sunGi.BoolValue) return true;
-		if (Config.FillNode(&sunGi, "Shaders.AmbientLight.Main", "RoomGI") && sunGi.BoolValue) return true;
-	}
 
 	char section[256];
 
@@ -2157,23 +2340,22 @@ T SettingManager::FromString(const char* text) {
 	return parsed;
 }
 
-// The pieces of text between the delimiter characters (empty pieces dropped); text is at most 255 characters.
+// The pieces of text between the delimiter characters (empty pieces dropped). Any length (2026-11-17: was a 256-byte buffer).
 void SettingManager::SplitString(const char* text, const char* delimiters, StringList* parts) {
-	char buffer[256];
-	strcpy(buffer, text);
+	std::string buffer(text);
 	parts->clear();
-	for (char* piece = strtok(buffer, delimiters); piece != NULL; piece = strtok(NULL, delimiters))
+	for (char* piece = strtok(buffer.data(), delimiters); piece != NULL; piece = strtok(NULL, delimiters))
 		parts->push_back(piece);
 }
 
-// Parses the pieces of text into consecutive slots of values (the caller sizes values for them).
-template <class T>
-void SettingManager::FillFromString(const char* text, const char* delimiters, T* values) {
-	char buffer[256];
-	strcpy(buffer, text);
-	T* slot = values;
-	for (char* piece = strtok(buffer, delimiters); piece != NULL; piece = strtok(NULL, delimiters))
-		*slot++ = FromString<T>(piece);
+// Parses the pieces of text into consecutive slots of values, at most as many as the array has (2026-11-17: was as many as
+// the text had, written past the array's end).
+template <class T, size_t N>
+void SettingManager::FillFromString(const char* text, const char* delimiters, T (&values)[N]) {
+	std::string buffer(text);
+	size_t slot = 0;
+	for (char* piece = strtok(buffer.data(), delimiters); piece != NULL && slot < N; piece = strtok(NULL, delimiters))
+		values[slot++] = FromString<T>(piece);
 }
 
 bool SettingManager::IsShaderForced(const char* /*name*/) {

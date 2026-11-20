@@ -71,6 +71,15 @@ layout(set = 2, binding = 0, std140) uniform Constants {
     vec4 puddle;                // 2026-11-08 Puddles (src/effects/Puddles): TESR_PuddleData: x water level, y Coverage, z 1 / Size,
                                 // w Quality (0: off, or ReflectionPuddles off)
     vec4 puddle2;               // x slope start, y slope full, z the water's roughness, w edge softness
+    vec4 wetFx;                 // 2026-11-19 WetnessEffects consolidation: x 1 = active (+2 = SkylightingMode 1), y rainWetness, z puddleWetness, w MinRainWetness
+    vec4 wetFx2;                // x MaxPuddleWetness, y PuddleMaxAngle, z t_albedo valid (Composite), w t_capNormals GBufferV2 valid (Composite)
+    vec4 skySh[9];              // TESR_SkyIrradianceObjects[0..8] (SkylightingMode 0 WetSkyReflection)
+    vec4 skyLowColor;           // TESR_SkyLowColor (SkylightingMode 1 WetSkyReflection)
+    vec4 sunPosition;           // TESR_SunPosition
+    vec4 skyData;               // TESR_SkyData
+    vec4 sunAmount;             // TESR_SunAmount
+    vec4 sunDiskColor;          // TESR_SunDiskColor
+    vec4 sunsetColor;           // TESR_SunsetColor
 } cb;
 
 layout(push_constant) uniform Push {
@@ -277,7 +286,29 @@ float WaterReflectivity(float depth, out float roughness) {
 
 // REFL_MATERIAL_ON: the material buffer.
 float SurfaceMetal = 0.0;     // set by Reflectivity: the surface's metal (0 without material data)
+float SurfaceWetGloss = 0.0;  // 2026-11-19 WetnessEffects water film gloss (0..1)
+float SurfaceWetRough = 1.0;  // 2026-11-19 WetnessEffects water film roughness
 vec4 MaterialAt(vec2 uv) { return cb.material.x > 0.5 ? textureLod(sampler2D(t_material, POINT_S), uv, 0.0) : vec4(0.0); }
+
+void ComputeWetFxFilm(vec2 uv, float depth, vec3 worldNormal) {
+    SurfaceWetGloss = 0.0;
+    SurfaceWetRough = 1.0;
+    if (cb.wetFx.x < 0.5 || depth >= DrawDistance || depth >= farZ * 0.98 || depth > 10240.0 || IsWeapon(uv)) return;
+    float open = RoofMaskOn > 0.5 ? OpenAbove(uv, depth) : 1.0;
+    if (open <= 0.0) return;
+    float nearFactor = 1.0 - smoothstep(0.0, 10240.0, depth);
+    float minAngle = saturate(max(cb.wetFx.w, worldNormal.z));
+    float rain = saturate(cb.wetFx.y * minAngle) * open * nearFactor;
+    float standing = PuddleStanding(uv, depth, worldNormal.z) * open;
+    if (PuddlesOn) {
+        SurfaceWetGloss = saturate(max(rain, standing));
+        SurfaceWetRough = mix(max(mix(1.0, 0.22, rain), 0.05), max(cb.puddle2.z, 0.01), standing);
+    } else {
+        float puddle = max(rain, saturate(cb.wetFx.z * minAngle * cb.wetFx2.x * 0.5) * open * nearFactor);
+        SurfaceWetGloss = saturate(puddle);
+        SurfaceWetRough = max(1.0 - SurfaceWetGloss, 0.05);
+    }
+}
 
 float MaterialReflectivity(vec2 uv, float depth, float floorShare, vec4 material, out float roughness) {
     float worldZ = cb.cameraPosition.z + toWorld(uv).z * depth;
@@ -288,9 +319,10 @@ float MaterialReflectivity(vec2 uv, float depth, float floorShare, vec4 material
     float wetness = Wetness * floorShare;
     float standing = floorShare > 0.0 ? PuddleStanding(uv, depth, ViewToWorldDir(ViewNormal(uv)).z) : 0.0;   // 2026-11-08 Puddles
     if ((wetness > 0.0 || standing > 0.0) && RoofMaskOn > 0.5) { float open = OpenAbove(uv, depth); wetness *= open; standing *= open; }   // the rain wets open ground only
-    wetness = max(wetness, standing);
+    wetness = max(max(wetness, standing), SurfaceWetGloss);
     float amount = dry + wetness;
-    roughness = mix(roughness, WetRoughness, wetness / max(amount, 1.0e-4));
+    float wetTargetRough = cb.wetFx.x > 0.5 && SurfaceWetGloss > 0.0 ? SurfaceWetRough : WetRoughness;
+    roughness = mix(roughness, wetTargetRough, wetness / max(amount, 1.0e-4));
     roughness = mix(roughness, cb.puddle2.z, standing);
     SurfaceMetal = material.g;
     float fade = 1.0 - smoothstep(0.7 * DrawDistance, DrawDistance, depth);
@@ -304,6 +336,8 @@ const float GlassRoughness = 0.03;
 // How much a surface reflects (before Fresnel) and how rough it is. 0 where it never reflects.
 float ReflectivityOwn(vec2 uv, float depth, vec3 viewNormal, out float roughness) {
     roughness = DryRoughness;
+    SurfaceWetGloss = 0.0;
+    SurfaceWetRough = 1.0;
     if (MaterialOn) SurfaceMetal = 0.0;
     // UNOFFICIAL 2026-10-31 RT water: the water (flat, at the water height) at any distance, before DrawDistance's cut.
     if (WaterRtOn && depth < farZ * 0.98 && !IsWeapon(uv) && ViewToWorldDir(viewNormal).z > 0.75 &&
@@ -340,18 +374,27 @@ float ReflectivityOwn(vec2 uv, float depth, vec3 viewNormal, out float roughness
         return cb.material.w * (1.0 - smoothstep(0.7 * DrawDistance, DrawDistance, depth));
     }
     vec3 worldNormal = ViewToWorldDir(viewNormal);
+    ComputeWetFxFilm(uv, depth, worldNormal);
     float floorShare = saturate((worldNormal.z - 0.75) / 0.2);
     if (MaterialOn) {
         vec4 material = MaterialAt(uv);
         if (material.b > 0.75) return MaterialReflectivity(uv, depth, floorShare, material, roughness);
     }
-    if (floorShare <= 0.0) return 0.0;
     float worldZ = cb.cameraPosition.z + toWorld(uv).z * depth;
-    if (abs(worldZ - cb.waterSettings.x) < max(2.0, depth * 0.002)) return WaterReflectivity(depth, roughness);   // water reflects on its own (RT water: rays)
+    if (floorShare > 0.0 && abs(worldZ - cb.waterSettings.x) < max(2.0, depth * 0.002)) return WaterReflectivity(depth, roughness);   // water reflects on its own (RT water: rays)
+    float fade = 1.0 - smoothstep(0.7 * DrawDistance, DrawDistance, depth);
+    if (floorShare <= 0.0) {
+        if (SurfaceWetGloss > 0.01) {
+            if (MaterialOn) { vec4 merged = MaterialAt(uv); if (merged.b > 0.25 && merged.b <= 0.75) SurfaceMetal = merged.g; }
+            roughness = SurfaceWetRough;
+            return SurfaceWetGloss * (1.0 - smoothstep(0.35, 0.75, SurfaceWetRough)) * fade;
+        }
+        return 0.0;
+    }
     float wetness = Wetness;
     float standing = PuddleStanding(uv, depth, worldNormal.z);   // 2026-11-08 Puddles: the standing water mirrors after the rain too
     if ((wetness > 0.0 || standing > 0.0) && RoofMaskOn > 0.5) { float open = OpenAbove(uv, depth); wetness *= open; standing *= open; }   // the rain wets open ground only
-    wetness = max(wetness, standing);
+    wetness = max(max(wetness, standing), SurfaceWetGloss);
     float amount = DryReflect + wetness;
     // UNOFFICIAL 2026-10-30 MaterialBufferRoughness: where the game's shader wrote the roughness it lit the surface with (TESR_MaterialBuffer:
     // r class > 0, b roughness, -1 none), the dry surface takes it instead of the one DryRoughness (polished floors sharp, carpets blurred).
@@ -362,9 +405,9 @@ float ReflectivityOwn(vec2 uv, float depth, vec3 viewNormal, out float roughness
         vec4 written = textureLod(sampler2D(t_matbuf, POINT_S), uv, 0.0);
         if (written.r > 0.5 && written.b >= 0.0) dryRoughness = saturate(written.b);
     }
-    roughness = mix(dryRoughness, WetRoughness, wetness / max(amount, 1.0e-4));
+    float wetTargetRough = cb.wetFx.x > 0.5 && SurfaceWetGloss > 0.0 ? SurfaceWetRough : WetRoughness;
+    roughness = mix(dryRoughness, wetTargetRough, wetness / max(amount, 1.0e-4));
     roughness = mix(roughness, cb.puddle2.z, standing);
-    float fade = 1.0 - smoothstep(0.7 * DrawDistance, DrawDistance, depth);
     return min(amount, 2.0) * floorShare * fade;   // above 1: stronger than a real surface, for taste
 }
 
@@ -386,24 +429,20 @@ float Reflectivity(vec2 uv, float depth, vec3 viewNormal, out float roughness) {
     return amount;
 }
 
-// Split-sum environment BRDF (Karis's fit) for a dielectric (F0 0.04).
-float EnvironmentFresnel(float roughness, float NdotV) {
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
-    vec4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
-    vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
-    return 0.04 * ab.x + ab.y;
-}
-
-// The same with any F0 (MaterialAware: metal).
+// Split-sum environment BRDF (Karis's fit) with roughness-damped grazing F90 (so rough dirt/rock gets no chalky white horizon rim).
 vec3 EnvironmentFresnelF0(float roughness, float NdotV, vec3 F0) {
     const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
     const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
     vec4 r = roughness * c0 + c1;
     float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
     vec2 ab = vec2(-1.04, 1.04) * a004 + r.zw;
-    return F0 * ab.x + ab.y;
+    float f90 = clamp(50.0 * dot(F0, vec3(0.3333)), 0.0, 1.0) * clamp(1.0 - roughness, 0.0, 1.0);
+    vec3 F90 = max(vec3(f90), F0);
+    return F0 * ab.x + F90 * ab.y;
+}
+
+float EnvironmentFresnel(float roughness, float NdotV) {
+    return EnvironmentFresnelF0(roughness, NdotV, vec3(0.04)).x;
 }
 
 // UNOFFICIAL 2026-10-31 SkyPanorama ([Shaders.Reflections.RT]): the sky as seen (ReflectionsSkyPano.frag), hemi-octahedral, z up; below

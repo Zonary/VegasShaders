@@ -322,6 +322,7 @@ void SunFarEffect::RenderFactor(IDirect3DDevice9* Device, IDirect3DSurface9* Sce
 	VolumetricCloudsEffect* volumetric = TheShaderManager->Effects.VolumetricClouds;
 	if (volumetric) volumetric->shadowsViaSunFar = false;
 	if (!Enabled || !Effect || !ShouldRender()) return;
+	CapturedNormals::SunFarDrew = true;	// UNOFFICIAL 2026-11-17 fast-restart: the grass's own normal for this pass from the next frame (CapturedNormals.h)
 	static GpuTimer timer("Sun far shadows (land, clouds)");
 	GpuProfileScope gpu(timer, Device);
 	// The cloud layers on stages 5-12 (NVR_CloudLayer*, NVR_CloudBlend*), set after the pass begins (EffectRecord::PassTextures).

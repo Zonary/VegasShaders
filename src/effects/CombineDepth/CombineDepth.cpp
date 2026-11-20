@@ -60,7 +60,8 @@ static bool ReadCentreTexel(IDirect3DDevice9* Device, IDirect3DSurface9* surface
 	bool read = false;
 	if (SUCCEEDED(Device->CreateRenderTarget(1, 1, desc.Format, D3DMULTISAMPLE_NONE, 0, FALSE, &probe, NULL)) &&
 		SUCCEEDED(Device->CreateOffscreenPlainSurface(1, 1, desc.Format, D3DPOOL_SYSTEMMEM, &readable, NULL))) {
-		const RECT centre = { (LONG)desc.Width / 2, (LONG)desc.Height / 2, (LONG)desc.Width / 2 + 1, (LONG)desc.Height / 2 + 1 };
+		const LONG cx = (LONG)RenderRect::Width(desc.Width) / 2, cy = (LONG)RenderRect::Height(desc.Height) / 2;
+		const RECT centre = { cx, cy, cx + 1, cy + 1 };
 		D3DLOCKED_RECT locked = {};
 		if (SUCCEEDED(Device->StretchRect(surface, &centre, probe, NULL, D3DTEXF_NONE)) &&
 			SUCCEEDED(Device->GetRenderTargetData(probe, readable)) &&

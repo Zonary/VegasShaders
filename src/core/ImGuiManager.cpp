@@ -1328,6 +1328,11 @@ static const ConflictRule kConflictRules[] = {
 		"Terrain blending turns off GPU grass: the GPU grass will not show while this is on." },
 	{ "Shaders.Grass.GPUGrass", "Enabled", "true", []() { return SettingOn("Shaders.Terrain.Blending", "Enabled"); },
 		"GPU grass will not show while Terrain blending is on (blending turns grass-first drawing off)." },
+	// UNOFFICIAL 2026-11-16 grass-cull (docs/next/GRASS-CULL.md): the strands are made from the grass drawn before the ground
+	{ "Shaders.Grass.GPUGrass", "Enabled", "true", []() { return !SettingOn("Shaders.Grass.Main", "DrawFirst"); },
+		"Strand grass is made from the grass drawn before the ground: with Grass > Draw first off, no strands are drawn and the game's flat grass stays." },
+	{ "Shaders.Grass.Main", "DrawFirst", "false", []() { return SettingOn("Shaders.Grass.GPUGrass", "Enabled"); },
+		"Strand grass (GPU grass) is on and needs this: with it off, no strands are drawn and the game's flat grass is used instead." },
 	{ "Main.Main.Misc", "PresetManagerEnabled", "true", nullptr,
 		"Location presets will change your settings by themselves as you move between places." },
 	{ "Main.Main.ReducedQuality", "FXAA", "true", []() { return EffectOn("SMAA"); },
@@ -3544,7 +3549,7 @@ static const MenuGroup kMenuGroups[] = {
 		"ClassicLook 1 = at half resolution (faster), 2 = every pixel at full resolution, as the original did (slower). Its density, "
 		"wind and height come from the current fog's settings.", nullptr },
 	{ kFogMain, "Legacy fog (for older presets)",
-		"LegacyFog, MinimumBaseFog, SunPower, HeightFogDensity, HeightFogFalloff, HeightFogDist, HeightFogSkyColor, HeightFogHeight, HeightFogBlend, "
+		"LegacyFog, LegacyAs441, MinimumBaseFog, SunPower, HeightFogDensity, HeightFogFalloff, HeightFogDist, HeightFogSkyColor, HeightFogHeight, HeightFogBlend, "
 		"HeightFogRolloff, HeightFogSaturation, HeightFogInscattering, FogNight, SimpleFogSkyColor, SimpleFogHeight, SimpleFogBlend",
 		FogType::Legacy, false, "The fog from before this build's fog rewrite (a simple fog plus a height fog), for presets made for it "
 		"(Uranium Haze and others). It also uses the shared settings above.", nullptr },
@@ -3787,7 +3792,7 @@ static const MenuGroup kMenuGroups[] = {
 	{ "Shaders.AmbientOcclusion.RT", "Sky visibility", "Sky, SkyRays, SkyDistance",
 		FogType::None, false, "How much of the sky each spot sees, from rays instead of a top-down map.", nullptr },
 	{ "Shaders.AmbientOcclusion.RT", "Bounce light",
-		"GI, GIDistance, GIStrength, GIOffscreen, GIScreenLight, GIGameLamps, GIClamp, GIAmbient, GISky, GIStrengthNight, GISkyNight, LegacyTilt, GIStrengthInterior, GIAmbientInterior, GIClampInterior, GIDistanceInterior, GlowGIInterior, GlowDirectInterior, LegacyTiltInterior, GISpatial, GIReuse, GIInterleave, GIMovingHistory, GlowGI, GlowDirect",
+		"GI, GIDistance, GIStrength, GIOffscreen, GIScreenLight, GIGameLamps, GIClamp, GIStrengthNight, GIStrengthInterior, GIClampInterior, GIDistanceInterior, GlowGIInterior, GlowDirectInterior, GISpatial, GIReuse, GIInterleave, GIMovingHistory, GlowGI, GlowDirect",
 		FogType::None, true, "One bounce of light from walls and floors, and glowing signs and windows lighting what is near them.", nullptr },
 	{ "Shaders.AmbientOcclusion.RT", "Light that bounces more than once",
 		"RadianceCache, CacheStrength, CacheCellSize, CacheRays, CacheFrames, CacheExteriors, CacheSpread, CacheRaysExterior, CacheSpreadExterior",
@@ -3802,10 +3807,8 @@ static const MenuGroup kMenuGroups[] = {
 	{ "Shaders.Reflections.Main", "Materials",
 		"MaterialAware, MaterialReflect, RoughnessOverrides, MaterialMaxRoughness, MaterialBufferRoughness, GlassReflect",
 		FogType::None, false, "Reflections that follow each surface's own material (polished, rough, metal, glass).", nullptr },
-	{ "Shaders.Reflections.Main", "Blending with the surface", "ReflectAdd, SpecularOcclusion, SpecularOcclusionLevel",
+	{ "Shaders.Reflections.Main", "Blending with the surface", "ReflectAdd, SpecularOcclusion, SpecularOcclusionLevel, ReplaceForward",
 		FogType::None, false, "Whether the reflection replaces or adds to the surface, and darker reflections where the room is dark.", nullptr },
-	{ "Shaders.Reflections.Main", "Faster ray walk (test)", "HiZ, HiZSafeCells, HiZCheck, HiZInteriorsTest",
-		FogType::None, false, "Measured slower: leave off.", nullptr },
 
 	// Shaders.Reflections.RT
 	{ "Shaders.Reflections.RT", "What reflections show off screen",

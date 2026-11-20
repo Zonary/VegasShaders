@@ -78,6 +78,7 @@ namespace DeferredSkin {
 			return;
 		}
 		ShaderRecordPixel* forward = (ShaderRecordPixel*)(shader->ShaderProg[ShaderRecordType::Interior] ? shader->ShaderProg[ShaderRecordType::Interior] : shader->ShaderProg[ShaderRecordType::Default]);
+		ShaderRecordPixel* outdoor = DeferredRenderer::OutdoorRecord(shader);
 		Records[shader] = record;
 		Handles.insert(record->ShaderHandle);
 		CapturedNormals::SkinDeferredCodes = true;	// SkinFill / SkinAlbedoFill leave COLOR3.a 3.5+ alone (their shaders are made at their first use, later)
@@ -86,8 +87,9 @@ namespace DeferredSkin {
 		// skin are kept as forward keeps them (muted by [Shaders.Skin.Main] MuteGameHighlights, the default)
 		DeferredRenderer::Handles.insert(record->ShaderHandle);
 		DeferredRenderer::PlainHandles.insert(record->ShaderHandle);
-		DeferredRenderer::Pairs[record->ShaderHandle] = { record, forward && forward->ShaderHandle ? forward : nullptr };
+		DeferredRenderer::Pairs[record->ShaderHandle] = { record, forward && forward->ShaderHandle ? forward : nullptr, outdoor && outdoor->ShaderHandle ? outdoor : nullptr };
 		if (forward && forward->ShaderHandle) DeferredLamps::ForwardOf[record->ShaderHandle] = forward->ShaderHandle;
+		if (outdoor && outdoor->ShaderHandle) DeferredLamps::ForwardOfOutdoor[record->ShaderHandle] = outdoor->ShaderHandle;
 		// a lighting-free record's binds open DeferredSun's pass for the span (mode 2; DeferredSun::OnBind counts this set)
 		if (DeferredRenderer::Mode() >= 2) DeferredSun::FoliageHandles.insert(record->ShaderHandle);
 		DeferredLamps::EnsurePass();
@@ -357,9 +359,11 @@ namespace DeferredSkin {
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
 				"  float4 n = tex2D(N, uv); clip(n.a - 3.5);"
 				"  float a = tex2D(A, uv).a; float keep = saturate(a > 4.5 ? a - 5.0 : a > 2.5 ? a - 3.0 : a > 1.0001 ? a - 1.0 : a);"
-				"  float3 f = max(tex2D(F, uv).rgb, 0.0); float3 s = max(tex2D(S, uv).rgb, 0.0) * keep; float3 d = max(f - s, 0.0);"
+				"  float3 f = max(tex2D(F, uv).rgb, 0.0); float3 s = max(tex2D(S, uv).rgb, 0.0) * keep;"
 				"  float e = G.x > 1.0 ? 1.0 / G.x : 1.0;"
-				"  float3 share = G.y > 0.5 ? pow(f, e) - pow(d, e) : s;"
+				"  float3 fLin = G.y > 0.5 ? f : (G.x > 1.0 ? pow(f, G.x) : f);"
+				"  float3 dLin = max(fLin - s, 0.0);"
+				"  float3 share = (G.y > 0.5 || G.x > 1.0) ? (G.y > 0.5 ? pow(fLin, e) : f) - pow(dLin, e) : s;"
 				"  return float4(max(share, 0.0), n.b); }";
 			// G: x the linear lighting's gamma (1 = none), y 1 = the frame is linear now. Written as the forward skin record writes them
 			// (SkinTemplate.hlsl COLOR2): the albedo as the texture holds it (saturate(texColor): the G-buffer's LinColor undone), and the luminance

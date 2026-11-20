@@ -466,7 +466,9 @@ void ShadowsExteriorEffect::UpdateSettings() {
 		maps.CharacterMapOthers = ShadowSettingI(shadowMapsSection, "CharacterShadowMapOthers") != 0;
 		maps.CharacterMapLog = ShadowSettingI(shadowMapsSection, "CharacterShadowMapLog") != 0;
 		maps.CharacterMapDebug = std::clamp(ShadowSettingI(shadowMapsSection, "CharacterShadowMapDebug"), 0, 3);
-		if (maps.CharacterMap && !CharacterMapCompiled) {
+		// UNOFFICIAL 2026-11-19: only warn after RegisterTextures() has captured startup CharacterMapCompiled
+		// (UpdateSettings runs before RegisterTextures at startup, so checking earlier falsely fired on pure defaults).
+		if (texturesInitialized && maps.CharacterMap && !CharacterMapCompiled) {
 			static bool hinted = false;
 			if (!hinted) {
 				hinted = true;

@@ -79,8 +79,10 @@ float lampRay(vec3 point, vec3 lamp) {
 	if (len2 <= stop * stop) return 1.0;                                        // at the lamp
 	const float invLen = inversesqrt(len2);
 	const float tEnd = clamp(1.0 - stop * invLen, 0.0, 1.0);
+	const uint farMask = uint(p.params.z), nearMask = uint(p.params.w);
+	if (farMask == nearMask) return blocked(point, segment, 0.0, tEnd, farMask) ? 0.0 : 1.0;
 	const float tSplit = clamp(1.0 - p.params2.x * invLen, 0.0, tEnd);
-	return (blocked(point, segment, 0.0, tSplit, uint(p.params.z)) || blocked(point, segment, tSplit, tEnd, uint(p.params.w))) ? 0.0 : 1.0;
+	return (blocked(point, segment, 0.0, tSplit, farMask) || blocked(point, segment, tSplit, tEnd, nearMask)) ? 0.0 : 1.0;
 }
 
 // The first solid surface along a unit view direction from the eye, at most tMax away (the fog's own clip is the depth buffer's surface:

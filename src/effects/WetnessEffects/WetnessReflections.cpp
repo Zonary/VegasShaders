@@ -1,10 +1,12 @@
 #include <algorithm>
 
 #include "WetnessReflections.h"
+#include "../../core/FdIndirect.h"	// UNOFFICIAL 2026-11-18 DeferredBumpedNormals
 
 void WetnessReflectionsEffect::RegisterConstants() {
 	TheShaderManager->RegisterConstant("TESR_WetnessReflectionData", &Constants.Data);
 	TheShaderManager->RegisterConstant("TESR_WetnessReflectionFade", &Constants.Fade);
+	TheShaderManager->RegisterConstant("TESR_WetnessReflectionBump", &Constants.Bump);	// UNOFFICIAL 2026-11-18 DeferredBumpedNormals
 }
 
 // Part of Wetness Effects: [Shaders.WetnessEffects.Reflections], switched on there. It has no Status of its
@@ -25,19 +27,39 @@ void WetnessReflectionsEffect::UpdateSettings() {
 void WetnessReflectionsEffect::UpdateConstants() {
 	Constants.Data = D3DXVECTOR4(Settings.Strength, Settings.MaxDistance, Settings.Thickness, Settings.Steps);
 	Constants.Fade = D3DXVECTOR4(Settings.RoughnessCutoff, Settings.EdgeFade, Settings.DebugView ? 1.0f : 0.0f, Settings.MaxCameraDistance);
+	Constants.Bump.y = (float)TheSettingManager->GetSettingI("Shaders.PBR.Main", "SkylightingMode");
 }
 
-// Only while something is wet: Wetness Effects on and active (its flag, set while anything is wet or
-// a shore is near), its Reflections on, outdoors and above water.
-// The debug view runs outdoors whatever the weather, so it shows that nothing is wet too.
+// Yields to Reflections when Reflections is active (Reflections owns wet-film & puddle reflections across SSR, Vulkan and RT + denoiser).
+// Falls back to this standalone pass only when the user explicitly disables Reflections. Supports both SkylightingMode 0 and 1.
 bool WetnessReflectionsEffect::ShouldRender() {
 	if (!Settings.Enabled) return false;
-	// VegasShaders: the effect takes the sky the forward shaders reflected as the spherical harmonic one (SkylightingMode 0, the
-	// default; Effects/WetnessReflections.fx.hlsl).
-	if (TheSettingManager->GetSettingI("Shaders.PBR.Main", "SkylightingMode") != 0) return false;
 	if (!TheShaderManager->GameState.isExterior || TheShaderManager->GameState.isUnderwater) return false;
 	WetnessEffectsShaders* Wetness = TheShaderManager->Shaders.Wetness;
 	if (!Wetness || !Wetness->Enabled) return false;
+	if (TheShaderManager->Effects.Reflections && TheShaderManager->Effects.Reflections->Enabled &&
+		TheShaderManager->Effects.Reflections->IsLoaded() && TheShaderManager->Effects.Reflections->ShouldRender())
+		return false;
 	if (Settings.DebugView) return true;
 	return Wetness->Constants.Flags.x > 0.5f && Settings.Strength > 0.0f;
+}
+
+// UNOFFICIAL 2026-11-18 [Main.Main.Quality] DeferredBumpedNormals (live, test only, off; core/FdIndirect.h, docs/bumped-normals-study.md):
+// the shader's NVR_WetShadingNormals (s4) has no texture slot, so it is set here before every Render (EffectChain): the G-buffer's
+// normal-mapped shading normal while the switch is on, else TESR_NormalsBuffer itself; TESR_WetnessReflectionBump.x says which (0: the
+// shader takes exactly its old path). The caller clears the stage after the Render (ClearPassTextures).
+void WetnessReflectionsEffect::BindShadingNormals(IDirect3DDevice9* Device) {
+	Constants.Bump.x = 0.0f;
+	if (!Enabled || !Effect || !ShouldRender()) return;	// Render draws nothing: no shading-normals pass for it either
+	std::string normalsName = "TESR_NormalsBuffer", depthName = "TESR_DepthBuffer";
+	IDirect3DBaseTexture9** normalsSlot = TheTextureManager->GetTextureSlotByName(normalsName);
+	IDirect3DBaseTexture9* normals = normalsSlot ? *normalsSlot : nullptr;
+	if (!normals) return;
+	IDirect3DBaseTexture9* shading = normals;
+	if (FdIndirect::BumpedNormalsOn()) {
+		IDirect3DBaseTexture9** depth = TheTextureManager->GetTextureSlotByName(depthName);
+		shading = FdIndirect::ShadingNormals(Device, normals, depth ? *depth : nullptr);
+	}
+	Constants.Bump.x = shading != normals ? 1.0f : 0.0f;
+	SetPassTexture(4, shading);	// set after each pass begins (EffectRecord::PassTextures)
 }

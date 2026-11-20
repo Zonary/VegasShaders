@@ -533,7 +533,7 @@ bool TAAEffect::RayReconstruct(IDirect3DDevice9* Device, IDirect3DSurface9* Rend
 	// on, the guides take G-buffer v2: its albedo (the RRAlbedo 2 path whatever RRAlbedo says) and its normal-mapped shading normal in place
 	// of the smooth normals buffer (the same view-space encoding: DlssRRGuides.comp reads it unchanged). Off: as before.
 	const bool fdGuides = FdIndirect::RRGuidesOn();
-	if (fdGuides) normals = FdIndirect::ShadingNormals(Device, normals, depth);
+	if (fdGuides || FdIndirect::BumpedNormalsOn()) normals = FdIndirect::ShadingNormals(Device, normals, depth);
 	bool albedoOn = (RRSettings.Albedo == 2 || fdGuides) && albedoData && albedoData->x > 0.5f && albedo && albedo->GetType() == D3DRTYPE_TEXTURE;
 	if (albedoOn) {
 		D3DSURFACE_DESC desc = {};

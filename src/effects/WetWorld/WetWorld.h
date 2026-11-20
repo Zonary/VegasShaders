@@ -36,6 +36,7 @@ public:
 	// sky / cloud image and screen-space trace under it are a second reflection. On: left out while it rains and that effect runs.
 	bool	weaponRainHandOff = false;
 	bool	reflectionsOwnPuddles = false;
+	bool	ReflectionsOwnPuddles() const;	// 2026-11-19: true while Reflections owns wet/drying/persistent puddles
 	// UNOFFICIAL 2026-11-12 RainStateGuard (core/RainState.h): Constants.Data (x the rain, z the puddles) drives much more than this
 	// effect: the land's and the objects' Rain setting groups (Terrain.cpp, PBR.cpp), skin, the heat haze, the water's ripples. On
 	// (default): RainState::Tick fills it every frame from the weather, whether this effect or Precipitations is on or off, always
@@ -60,6 +61,8 @@ public:
 	void	RegisterConstants();
 	void	UpdateSettings();
 	bool	ShouldRender();
+	void	BindShadingNormals(IDirect3DDevice9* Device);	// UNOFFICIAL 2026-11-18 DeferredBumpedNormals: stage 15 for the next Render (D3D9)
+	static IDirect3DBaseTexture9* ShadingNormals(IDirect3DDevice9* Device, IDirect3DBaseTexture9* normals);	// ... the texture for both paths
 
 	// UNOFFICIAL 2026-10-17 FastPaths ([Shaders.WetWorld.Main] FastPaths): technique 2 of WetWorld.fx is the same picture with
 	// the wet pass's early returns and lamp loop as real branches (the compiler had flattened them: every pixel, sky included,

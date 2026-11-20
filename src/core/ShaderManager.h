@@ -160,7 +160,6 @@ public:
 	void					PreStep_SkyViewTable(ChainContext& ctx);
 	void					PreStep_VolumetricClouds(ChainContext& ctx);
 	void					PreStep_AmbientLightTakeover(ChainContext& ctx);
-	void					PreStep_HiZ(ChainContext& ctx);
 	void					PreStep_CompositePlan(ChainContext& ctx);
 	void					PreStep_ShadowApply(ChainContext& ctx);
 	void					PreStep_CoverMapUpdate(ChainContext& ctx);

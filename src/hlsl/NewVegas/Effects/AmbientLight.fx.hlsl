@@ -96,6 +96,9 @@ sampler2D NVR_ALGIHistory : register(s5) = sampler_state { ADDRESSU = CLAMP; ADD
 // search. 0 (never set, the key off, nothing traced): Estimate exactly as before.
 float4 NVR_ALRT;
 sampler2D NVR_ALRTAO : register(s6) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = LINEAR; MINFILTER = LINEAR; MIPFILTER = NONE; };
+// DeferredBumpedNormals shading normals bound on s3 for Apply (Estimate's blue-noise stage, unused in Apply; NVR_ALBump.x 1 = bound).
+float4 NVR_ALBump;
+sampler2D NVR_ALShadingNormals : register(s3) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
 
 static const float Radius = max(TESR_AmbientLightData.x, 1.0f);
 static const float OcclusionStrength = TESR_AmbientLightData.y;
@@ -901,6 +904,12 @@ float3 SurfaceAlbedo(float2 uv, float3 lin) {
 	float take = step(0.5f, NVR_ALFlags.z) * step(0.5f, a.a);
 	return lerp(SurfaceColourCap(lin, FallbackCap()), max(a.rgb, 0.0f), take);
 }
+float3 MultiBounceAO(float v, float3 albedo) {
+	float3 a =  2.0404f * albedo - 0.3324f;
+	float3 b = -4.7951f * albedo + 0.6417f;
+	float3 c =  2.7552f * albedo + 0.6903f;
+	return max(v.xxx, ((v * a + b) * v + c) * v);
+}
 
 // UNOFFICIAL 2026-10-18 (ambfix2, user: "indoors it's too powerful ... it diverges from the original mood of each vanilla room"):
 // indoors the room keeps its own brightness. The game's interior ambient already stands in for all the light bouncing round the
@@ -1032,8 +1041,9 @@ float4 Apply(VSOUT IN, uniform bool sky) : COLOR0 {
 	ambient.a = edgeReject > 0.5f && weights < 0.01f ? nearestValue : ambient.a;	// (EdgeReject: no tap at this depth, the nearest)
 
 	float3 lin = linearize(color.rgb);
+	float shadedLuma = luma(lin);
 	float ao = lerp(DarkestAO, 1.0f, ambient.a);
-	ao = lerp(ao, 1.0f, saturate((luma(lin) - BrightFade) * 3.0f));   // bright surfaces keep their light, as the old AO
+	ao = lerp(ao, 1.0f, saturate((shadedLuma - BrightFade) * 3.0f));   // bright surfaces keep their light, as the old AO
 	// UNOFFICIAL 2026-10-14 (user: the occlusion still shimmers on grass): where the depth is busy (grass, bushes: neighbouring
 	// pixels on different blades, a bend in the depth no flat surface has, even seen edge on), the occlusion is mostly chance
 	// (which blade covers the pixel this frame, swaying), and the blur and the frame history cannot settle it (they keep
@@ -1128,18 +1138,25 @@ float4 Apply(VSOUT IN, uniform bool sky) : COLOR0 {
 		float3 c0 = linearize(tex2Dlod(TESR_SourceBuffer, float4(IN.UVCoord, 0.0f, 0.0f)).rgb);
 		float3 localSum = c0;
 		float localWeight = 1.0f;
-		for (int t = 0; t < 4; t++) {
+		[unroll] for (int t = 0; t < 4; t++) {
 			float2 o = float2((t == 1 || t == 3) ? 4.0f : -4.0f, t >= 2 ? 4.0f : -4.0f) * px;
-			float w = step(abs(readDepthLod(IN.UVCoord + o) - depth), max(depth * 0.02f, 1.0f));
-			localSum += linearize(tex2Dlod(TESR_SourceBuffer, float4(IN.UVCoord + o, 0.0f, 0.0f)).rgb) * w;
+			float2 tap = clampToRectIfOn(IN.UVCoord + o, px);
+			float w = step(abs(readDepthLod(tap) - depth), max(depth * 0.02f, 1.0f));
+			localSum += linearize(tex2Dlod(TESR_SourceBuffer, float4(tap, 0.0f, 0.0f)).rgb) * w;
 			localWeight += w;
 		}
 		float3 localLin = localSum / localWeight;
-		float shade = luma(linearize(color.rgb)) / max(luma(c0), 1.0e-4f);	// the sun shadow on this pixel
+		float shade = shadedLuma / max(luma(c0), 1.0e-4f);	// the sun shadow on this pixel
 		float detail = clamp(luma(c0) / max(luma(localLin), 1.0e-4f), 0.0f, 2.0f);
-		float3 guess = SurfaceColourCap(localLin * shade, FallbackCap()) * detail;	// (2026-11-10 AlbedoFallbackCap)
 		float4 a = tex2Dlod(NVR_ALAlbedo, float4(IN.UVCoord, 0.0f, 0.0f));
-		lin += giLight * lerp(guess, max(a.rgb, 0.0f), step(0.5f, NVR_ALFlags.z) * step(0.5f, a.a));
+		float hasAlbedo = step(0.5f, NVR_ALFlags.z) * step(0.5f, a.a);
+		float3 giAlbedo = lerp(SurfaceColourCap(localLin * shade, FallbackCap()), max(a.rgb, 0.0f), hasAlbedo);
+		float detailRelief = clamp(detail, 0.5f, 1.35f);
+		float3 nSmooth = normalize(tex2Dlod(TESR_NormalsBuffer, float4(IN.UVCoord, 0.0f, 0.0f)).xyz * 2.0f - 1.0f);
+		float3 nBump = normalize(tex2Dlod(NVR_ALShadingNormals, float4(IN.UVCoord, 0.0f, 0.0f)).xyz * 2.0f - 1.0f);
+		float bumpRelief = clamp(0.35f + 0.65f * max(dot(nBump, nSmooth), 0.0f), 0.35f, 1.15f);
+		float relief = lerp(detailRelief, bumpRelief, step(0.5f, NVR_ALBump.x) * hasAlbedo);
+		lin += (giLight * relief) * giAlbedo * MultiBounceAO(ao, giAlbedo);
 	}
 	return delinearize(float4(lin, color.a));
 }

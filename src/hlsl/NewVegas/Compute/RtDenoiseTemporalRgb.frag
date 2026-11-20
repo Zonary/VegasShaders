@@ -84,9 +84,10 @@ vec3 FireflyExcess(vec3 excess, vec3 kept) {
 // The anti-lag's fast history then takes the clamped sample (fed the raw one, a firefly pulled the long history up to it: a dot).
 float FireflyLimit(vec2 at) {
     float m = 0.0;
+    const vec2 lo = 0.5 * pc.params.zw, hi = max(pc.rect.xy - 0.5 * pc.params.zw, lo);
     for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++)
-            if (dx != 0 || dy != 0) m = max(m, luma(textureLod(sampler2D(t_noisy, NVR_SAMPLER(pc.samplerIndex)), at + vec2(dx, dy) * pc.params.zw, 0.0).rgb));
+            if (dx != 0 || dy != 0) m = max(m, luma(textureLod(sampler2D(t_noisy, NVR_SAMPLER(pc.samplerIndex)), clamp(at + vec2(dx, dy) * pc.params.zw, lo, hi), 0.0).rgb));
     return m;
 }
 
@@ -182,9 +183,10 @@ void main() {
                     // wide (clampK deviations: one noisy path a pixel has a wide spread) so a still picture keeps accumulating.
                     if (pc.clampK > 0.0) {
                         vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+                        const vec2 lo = 0.5 * pc.params.zw, hi = max(pc.rect.xy - 0.5 * pc.params.zw, lo);
                         for (int dy = -1; dy <= 1; dy++)
                             for (int dx = -1; dx <= 1; dx++) {
-                                const vec3 q3 = textureLod(sampler2D(t_noisy, NVR_SAMPLER(pc.samplerIndex)), uv + vec2(dx, dy) * pc.params.zw, 0.0).rgb;
+                                const vec3 q3 = textureLod(sampler2D(t_noisy, NVR_SAMPLER(pc.samplerIndex)), clamp(uv + vec2(dx, dy) * pc.params.zw, lo, hi), 0.0).rgb;
                                 m1 += q3; m2 += q3 * q3;
                             }
                         m1 /= 9.0; m2 /= 9.0;
@@ -195,9 +197,7 @@ void main() {
                     // history's luminance leaves the fast mean's window (k standard errors of that mean: the LONG history's per-sample
                     // spread / sqrt(kFast), + 2 %), the light really changed there (a shadow moved, a lamp went on, something walked off):
                     // the long history is pulled to the window's edge and restarts at kFast frames, so a trail lasts a few frames, not
-                    // PTDenoiseHistory. (Simulated 2026-11-07, 20000 pixels: a 0 -> 1 step reaches 0.70 after 6 frames, 0.17 without; a still
-                    // Bernoulli 0.3 pixel keeps mean 0.3000 and the same noise. The fast history's OWN spread was 3x slower: a step inflates it.
-                    // The old 3 x 3 clamp of the raw sample darkened the picture 5 %.)
+                    // PTDenoiseHistory.
                     const float kFast = pc.fastFrames > 0.0 ? pc.fastFrames : 4.0;   // (perf-history: was 4.0)
                     // (ptaaa-denoiser) AntiFirefly with a history: the limit is also k x this pixel's recent raw mean
                     if (NVR_FIREFLY_K > 0.0) {

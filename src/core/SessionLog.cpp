@@ -1,5 +1,6 @@
 // UNOFFICIAL 2026-11-01: the session header, live changes, heartbeat, exit / crash summary and the frame journal (SessionLog.h).
 #include "SessionLog.h"
+#include "TestTools.h"	// NVR_TEST_TOOLS (CrashTest, StallTest)
 #include "FrameTimeStats.h"
 #include "DxvkCompute.h"
 #include "Diagnostics.h"
@@ -975,6 +976,7 @@ void SessionLog::OnFrame() {
 		const bool on = TheSettingManager->GetSettingI("Main.Develop.Main", "FrameJournal") != 0;
 		if (on != FrameJournal::On) Logger::Log("FJ frame journal %s (%u of %u lines used)", on ? "ON" : "off", FrameJournal::Lines, FrameJournal::Cap);
 		FrameJournal::On = on;
+#if NVR_TEST_TOOLS	// 2026-11-17 (security review 2): development builds only; a downloaded settings file could switch both on in a release
 		// 2026-11-04 [Main.Develop.Main] CrashTest: a crash on purpose, to check the CRASH lines (inside the effects stage)
 		if (const int crash = TheSettingManager->GetSettingI("Main.Develop.Main", "CrashTest")) {
 			Logger::Log("SESSION CrashTest %d: crashing the game on purpose now", crash);
@@ -992,6 +994,7 @@ void SessionLog::OnFrame() {
 			}
 			lastStallTest = stall;
 		}
+#endif
 		FlushChanges(false);
 		{	// UNOFFICIAL 2026-11-12 (memleak): one warning when the address space gets tight (3000 MB of a large-address-aware game's 4096;
 			// three quarters of whatever the process has otherwise). The game's own out-of-memory loop starts near 3.2-3.3 GB.

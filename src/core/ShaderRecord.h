@@ -59,6 +59,10 @@ public:
 	static long				ShippedSeeds();
 	// UNOFFICIAL 2026-11-16: makes every missing level of a folder path (CreateDirectoryA makes only the last one).
 	static void				CreateFolders(const std::string& Path);
+	// UNOFFICIAL 2026-11-17 fast-restart (ShaderRecord.cpp): a record with the clouds' lookup that did not compile is remembered by its exact
+	// preprocessed text (<cache entry>.hlsl.nocloud), so the next start goes straight to its build without the lookup.
+	static bool				KnownCloudFailure(const std::string& PreprocessedPath, ID3DXBuffer* Source);
+	static void				NoteCloudFailure(const std::string& PreprocessedPath, ID3DXBuffer* Source);
 
 	// Drops the cached IDirect3DTexture9* for a named sampler so that SetCT re-resolves it
 	// on the next draw. MUST be called on every consumer of a texture that is released and
@@ -96,7 +100,8 @@ public:
 	bool					PointShadowForward = false;	// UNOFFICIAL: compiled with INTERIOR_SHADOWS (PointShadowForward.h)
 	bool					UsedOnce = false;			// UNOFFICIAL: SetCT ran once this session (ShaderWarmUp.h)
 	bool					IsLandLight = false;			// UNOFFICIAL 2026-10-25: a land pixel shader reading the game's SunDir in c18 (LandLight.h)
-	bool					CloudSunReg = false;			// UNOFFICIAL 2026-11-04 ForwardCloudShadows: declares NVR_CloudSun (c169, pixel) or NVR_CloudSunVS (c240-c241, vertex)
+	bool					CloudSunReg = false;
+	bool					CloudSunFoliage = false;		// UNOFFICIAL 2026-11-16 fast-restart: ... and it is a grass or SpeedTree leaf pixel shader (its strength follows PlantShadows)			// UNOFFICIAL 2026-11-04 ForwardCloudShadows: declares NVR_CloudSun (c169, pixel) or NVR_CloudSunVS (c240-c241, vertex)
 	unsigned char			DisplaceFamily = 0;			// UNOFFICIAL 2026-10-28: registered for tessellation under this family (DxvkCompute::DisplaceBind)
 };
 

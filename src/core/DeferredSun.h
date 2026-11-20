@@ -416,7 +416,9 @@ namespace DeferredSun {
 		// ForwardCloudShadows::ForShader, whose strength is 0 when the last object pass drawn was a plant's with PlantShadows off (PassPlant):
 		// the whole frame's cloud shadow then came and went with the last object drawn. Here the frame's own strength, whatever was drawn last
 		// (put back with the other pixel constants below). Plants with PlantShadows off: their pixels are told apart in the shader (batch D).
-		if (ForwardCloudShadows::Compiled) ForwardCloudShadows::SendFrame(d);
+		ForwardCloudShadows::SendFrame(d);	// (2026-11-16 fast-restart: always; strength 0 while off)
+		// (2026-11-16 fast-restart) the foliage records' clouds: with ForwardShadows on, as every pixel's; off: none (SunFar shades them, as before)
+		const float foliageW = ForwardCloudShadows::FoliageW(pass->CloudSunReg && ForwardCloudShadows::Active);
 		// the pass's own (c6-c9)
 		const NiPoint3& dir = sun->direction;
 		D3DXVECTOR3 toSun(-dir.x, -dir.y, -dir.z);
@@ -432,7 +434,8 @@ namespace DeferredSun {
 			{ objectFresh ? LandLight::ObjectColor[0] : sun->Diff.r * sun->Dimmer, objectFresh ? LandLight::ObjectColor[1] : sun->Diff.g * sun->Dimmer,
 			  // w (2026-11-16 fd-merged-1116, FD-BATCH-D item 22): 1 = the forward clouds shade plants ([Shaders.VolumetricClouds.Main]
 			  // PlantShadows), 0 = they do not: DeferredSun.hlsl leaves model 5's pixels out of the cloud term then, as forward's PassPlant does
-			  objectFresh ? LandLight::ObjectColor[2] : sun->Diff.b * sun->Dimmer, ForwardCloudShadows::PlantShadows ? 1.0f : 0.0f },
+			  // (2026-11-16 fast-restart) the clouds' strength for the foliage records' pixels (ForwardShadows on; 0 off), -1 = PlantShadows off
+			  objectFresh ? LandLight::ObjectColor[2] : sun->Diff.b * sun->Dimmer, foliageW },
 			// w (2026-11-14, read only by the foliage branch, FD_FOLIAGE): 2 = [Shaders.Grass.Main] ShadowFix (the grass's lookup takes the world's up)
 			{ (float)DebugView, linearDepth ? 1.0f : 0.0f, Shadows ? 1.0f : 0.0f, FoliageCompiled && TheSettingManager->GetSettingI("Shaders.Grass.Main", "ShadowFix") ? 2.0f : 1.0f },
 			{ proj._33, proj._43, 0.01f, 2.0f } };

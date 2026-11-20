@@ -26,6 +26,7 @@ namespace DeferredLamps {
 
 	inline std::unordered_map<const void*, ShaderRecordPixel*> Records;	// NiD3DPixelShaderEx* -> its deferred record (the ExteriorRecords pattern)
 	inline std::unordered_map<IDirect3DPixelShader9*, IDirect3DPixelShader9*> ForwardOf;	// deferred handle -> the forward Interior handle
+	inline std::unordered_map<IDirect3DPixelShader9*, IDirect3DPixelShader9*> ForwardOfOutdoor;	// UNOFFICIAL 2026-11-19: deferred handle -> the forward Exterior / Default handle (FORWARD_SHADOWS = 1)
 	inline ShaderRecordPixel* Pass = nullptr;
 	inline bool PassFailed = false;	// the lamp pass did not compile (for the session)
 	// UNOFFICIAL 2026-11-15 DeferredSkin (core/DeferredSkin.h; DeferredLamps.hlsl FD_SKIN / DL_SKIN_ONLY): the skin lamp pass, drawn right after the
@@ -444,12 +445,18 @@ namespace DeferredLamps {
 		IDirect3DPixelShader9* bound = nullptr;
 		d->GetPixelShader(&bound);
 		if (bound) {
+			const bool exterior = TheShaderManager && TheShaderManager->GameState.isExterior;
+			auto fo = exterior ? ForwardOfOutdoor.find(bound) : ForwardOfOutdoor.end();
 			auto f = ForwardOf.find(bound);
-			if (f != ForwardOf.end()) { d->SetPixelShader(f->second); StatRestored++; }
+			if (fo != ForwardOfOutdoor.end()) { d->SetPixelShader(fo->second); StatRestored++; }
+			else if (f != ForwardOf.end()) { d->SetPixelShader(f->second); StatRestored++; }
 			bound->Release();
 		}
+		// UNOFFICIAL 2026-11-19: do not gate on PointShadowForward::AtlasTexture — ShadowAtlas::Update runs only indoors
+		// (ShadowManager.cpp), so loading an outdoor save at night left AtlasTexture null and skipped the entire outdoor
+		// lamp pass (buildings, terrain, skin). Outdoors PutTiles writes no tiles (sTile.z == 0), so stage 8 is never sampled.
 		if (!CapturedNormals::Drawn || !CapturedNormals::AlbedoTexture || !CapturedNormals::MaterialTexture || !CapturedNormals::Texture ||
-			!ManyLamps::Table || !PointShadowForward::AtlasTexture || !EnsurePass() || skipDraw) { StatSkipped++; return; }
+			!ManyLamps::Table || !EnsurePass() || skipDraw) { StatSkipped++; return; }
 		IDirect3DSurface9* target = nullptr;
 		d->GetRenderTarget(0, &target);
 		if (!target) { StatSkipped++; return; }
@@ -620,7 +627,7 @@ namespace DeferredLamps {
 		d->SetTexture(3, ManyLamps::Table);
 		d->SetTexture(4, CapturedNormals::MaterialTexture);
 		d->SetTexture(5, CapturedNormals::Texture);
-		d->SetTexture(8, PointShadowForward::AtlasTexture);
+		d->SetTexture(8, PointShadowForward::AtlasTexture ? (IDirect3DBaseTexture9*)PointShadowForward::AtlasTexture : (IDirect3DBaseTexture9*)ManyLamps::Table);
 		// UNOFFICIAL 2026-11-14 DeferredDistant (DL_LINEAR_DEPTH, DeferredLamps.hlsl DLViewZ): this frame's exact linear view z (DeferredDepth 2,
 		// made by DeferredDepth::AtSpanEnd just before), c10.w 1 below; else nothing on s7 and the half-float distance as before
 		const bool linearZ = DeferredDistant::CompiledIn() && DeferredDepth::LinearReady() && !Vm.on;	// (the world's view z: not the view model's)

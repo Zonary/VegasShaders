@@ -81,7 +81,7 @@
 #define RT_SUN_ROWW_REG c195
 #define RT_SUN_DATA_REG c196
 #include "includes/Shadow.hlsl"	// shared code
-// UNOFFICIAL 2026-11-04 ForwardCloudShadows: the clouds' shadow per vertex (texc.z; w the sentinel), compiled in only when on at startup.
+// UNOFFICIAL 2026-11-04 ForwardCloudShadows: the clouds' shadow per vertex (texc.z; w the sentinel); always compiled in, its strength (c160.w) switches it live.
 #if FORWARD_CLOUD_SHADOWS && FORWARD_SHADOWS && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS)
     #define TERRAIN_CLOUD 1
 #else
@@ -574,6 +574,17 @@ PS_OUTPUT main(PS_INPUT pin) {
         if (TESR_TerrainBlendData.w <= 0.0f && TESR_TerrainBlendExtra.w > 0.5f && terrainKeep >= 0.0f && terrainKeep < 0.004f)
             clip(-1.0f);
     }
+    // UNOFFICIAL 2026-11-18 (a co-developer: terrain blending made land shaders fail with X4505 on DXVK): debug views 3 and 4 are
+    // worked out here, into one value, instead of at the end. Read at the end, they kept the gap's depth and angle and the normal's
+    // z alive through the whole shader: with Wetness Effects + Puddles, or Wetness Effects + SkylightingMode 1, that was the
+    // temp register too many (fxc X4505, also with PREFER_FLOW_CONTROL; the game's own shader drew that ground). The same colours:
+    // -1 = nothing behind the land (dark blue), else the grey. 0 when neither view is on.
+    float blendDebugGrey = 0.0f;
+    [branch] if (TESR_TerrainBlendData.w > 2.5f && TESR_TerrainBlendData.x > 0.0f) {
+        if (blendGap.covered < 0.0f) blendDebugGrey = -1.0f;
+        else if (TESR_TerrainBlendData.w < 3.5f) blendDebugGrey = saturate(blendGap.covered * TESR_TerrainBlendData.y * 0.25f);
+        else blendDebugGrey = saturate(terrainBlendDepthRange(blendGap, 1.0f - blendNormal.z) * TESR_TerrainBlendData.y);
+    }
 #endif
 
     int texLayers = TEX_COUNT;  // Macro.
@@ -804,11 +815,8 @@ PS_OUTPUT main(PS_INPUT pin) {
     // all), 3 how deep the object is below the surface (black at the surface, white at four times BlendDistance; dark blue:
     // nothing behind the land), 4 how deep the fade reaches (white: the full BlendDistance, grey: a shallow object's seam).
     float blendDebug = TESR_TerrainBlendData.w;
-    [branch] if (blendDebug > 2.5f && TESR_TerrainBlendData.x > 0.0f) {
-        if (blendGap.covered < 0.0f) outCol = float3(0.0f, 0.0f, 0.3f);
-        else if (blendDebug < 3.5f) outCol = saturate(blendGap.covered * TESR_TerrainBlendData.y * 0.25f);
-        else outCol = saturate(terrainBlendDepthRange(blendGap, 1.0f - blendNormal.z) * TESR_TerrainBlendData.y);
-    }
+    [branch] if (blendDebug > 2.5f && TESR_TerrainBlendData.x > 0.0f)	// views 3 and 4: worked out at the top (blendDebugGrey)
+        outCol = blendDebugGrey < 0.0f ? float3(0.0f, 0.0f, 0.3f) : blendDebugGrey.xxx;
     else if (blendDebug > 1.5f && terrainKeep >= 0.0f) outCol = terrainKeep;
     else if (blendDebug > 0.5f && terrainKeep >= 0.0f) outCol = lerp(float3(1.0f, 0.0f, 1.0f), outCol, terrainKeep);
 #endif
@@ -846,17 +854,12 @@ PS_OUTPUT main(PS_INPUT pin) {
     #if CAPTURED_NORMALS_ON >= 4
         // UNOFFICIAL 2026-11-14 GBufferV2 (Includes/CapturedNormals.hlsl): the blended layers' normal-mapped normal in world axes (exact: the land
         // is not rotated, tbnMat is its own frame), in g / a. (CAPTURED_PT 2's land code is not compiled with it: ShaderRecord caps CAPTURED_PT at 1.)
-        #ifdef TERRAIN_WETNESS
-            po.capturedPad2 = CapturedShadingNormal(po.capturedPad2, wetWorldNormal);
-        #else
-            po.capturedPad2 = CapturedShadingNormal(po.capturedPad2, mul(combinedNormal, tbnMat));
-        #endif
+        // (2026-11-18: one normal for both, the one the forward lighting uses: with the water layer it is combinedNormal AFTER standing
+        // water flattened it (above, Puddles). wetWorldNormal is the normal before that, and the deferred sun, lamps and reflections lit
+        // a puddle with the ground's bumps showing through the water.)
+        po.capturedPad2 = CapturedShadingNormal(po.capturedPad2, mul(combinedNormal, tbnMat));
     #elif defined(CAPTURED_PT) && CAPTURED_PT >= 2 && CAPTURED_NORMALS_ON >= 3 && TEX_COUNT <= 5
-        #ifdef TERRAIN_WETNESS
-            po.capturedPad2 = CapturedLandBumpOut(wetWorldNormal);
-        #else
-            po.capturedPad2 = CapturedLandBumpOut(mul(combinedNormal, tbnMat));
-        #endif
+        po.capturedPad2 = CapturedLandBumpOut(mul(combinedNormal, tbnMat));	// (2026-11-18: after the standing water's flatten, as above)
     #endif
     #if defined(NVR_LIGHT_DEFERRED) && CAPTURED_NORMALS_ON >= 3
         // UNOFFICIAL 2026-11-14 DeferredSun (Includes/DeferredPixel.hlsl; Shaders/DeferredSun.hlsl's land model): the lighting-free code

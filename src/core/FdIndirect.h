@@ -19,6 +19,7 @@
 #include "CapturedNormals.h"
 #include "SettingForce.h"
 #include "FdIndirectShaders.h"
+#include "RtAmbient.h"
 
 namespace FdIndirect {
 	inline const char* kSection = "Main.Main.Quality";
@@ -28,8 +29,15 @@ namespace FdIndirect {
 	inline bool Key(const char* key) { return TheSettingManager->GetSettingI(kSection, key) != 0; }
 	inline bool MaterialNow() { return CapturedNormals::MaterialTexture && CapturedNormals::MaterialData.x > 0.5f; }
 	inline bool ReflectionsOn() { return Base() && MaterialNow() && Key("DeferredReflections"); }
-	inline bool ALAlbedoOn() { return Base() && MaterialNow() && CapturedNormals::AlbedoTexture && CapturedNormals::AlbedoData.x > 0.5f && Key("DeferredALAlbedo"); }
+	// UNOFFICIAL 2026-11-19: RT GI always splits diffuse albedo by (1 - metal) so metals receive zero diffuse GI (reflections carry metal indirect).
+	inline bool ALAlbedoOn() { return Base() && MaterialNow() && CapturedNormals::AlbedoTexture && CapturedNormals::AlbedoData.x > 0.5f && (Key("DeferredALAlbedo") || (RtAmbient::Current.Enabled && RtAmbient::Current.GI)); }
 	inline bool RRGuidesOn() { return Base() && MaterialNow() && Key("DeferredRRGuides"); }
+	// UNOFFICIAL 2026-11-18/19 DeferredBumpedNormals (live, default on; docs/bumped-normals-study.md): feeds the G-buffer's normal-mapped
+	// shading normals (with distance fade and grazing silhouette softening) to Reflections (SSR, Vulkan & RT), WetnessReflections, WetWorld,
+	// and DLSS Ray Reconstruction guide normals. AO, bounce light and shadows keep the smooth normals buffer so they never shimmer or self-shadow.
+	inline bool BumpedNormalsOn() { return Base() && MaterialNow() && Key("DeferredBumpedNormals"); }
+	inline constexpr float kBumpFadeStart = 1500.0f;	// game units (~21 m): full normal-map bump detail up to here
+	inline constexpr float kBumpFadeEnd = 4000.0f;		// game units (~57 m): smoothly relaxed to smooth normal past here (no distant aliasing)
 
 	// One render target, remade when the size or format it must have changes.
 	struct Target {
@@ -45,6 +53,7 @@ namespace FdIndirect {
 				Logger::Log("[ERROR] UNOFFICIAL %s: its %ux%u target could not be made: off for this session", what, w, h);
 				return false;
 			}
+			d->ColorFill(Surface, NULL, D3DCOLOR_ARGB(0, 0, 0, 0));	// clean border outside active RenderRect on first make
 			Width = w; Height = h; Format = f;
 			return true;
 		}
@@ -57,7 +66,7 @@ namespace FdIndirect {
 		return found == TheShaderManager->ConstantsTable.end() ? nullptr : found->second;
 	}
 
-	// --- the shading normals (DeferredReflections, DeferredRRGuides) -------------------------------------------------------------------
+	// --- the shading normals (DeferredReflections, DeferredRRGuides, DeferredBumpedNormals) ---------------------------------------------
 	inline Target Normals;
 	inline IDirect3DPixelShader9* NormalsPS = nullptr;  inline bool NormalsPSFailed = false;
 	inline UInt32 NormalsFrame = 0xFFFFFFFFu;  inline IDirect3DBaseTexture9* NormalsFrom = nullptr;  inline bool NormalsMade = false;
@@ -74,7 +83,7 @@ namespace FdIndirect {
 		const D3DXMATRIX* proj = (const D3DXMATRIX*)Constant("TESR_ProjectionTransform");
 		const D3DXVECTOR4* camera = Constant("TESR_CameraData");
 		const D3DXVECTOR4* scale = Constant("TESR_RenderScale");
-		if (!view || !proj || !camera || !TextureDesc(normals, desc) || !Normals.Ensure(d, desc.Width, desc.Height, desc.Format, "DeferredReflections / DeferredRRGuides shading normals")) return normals;
+		if (!view || !proj || !camera || !TextureDesc(normals, desc) || !Normals.Ensure(d, desc.Width, desc.Height, desc.Format, "DeferredReflections / DeferredRRGuides / DeferredBumpedNormals shading normals")) return normals;
 		if (!NormalsPS && !(NormalsPS = CapturedNormals::FullScreenShader(d, FdIndirectShaders::kShadingNormalsPS, "UNOFFICIAL FdIndirect shading normals", NormalsPSFailed))) return normals;
 		static GpuTimer timer("FD shading normals");
 		GpuProfileScope gpu(timer, d);
@@ -85,22 +94,13 @@ namespace FdIndirect {
 			{ scale ? scale->x : 1.0f, scale ? scale->y : 1.0f, scale ? scale->z : 1.0f, scale ? scale->w : 1.0f },
 			{ view->_11, view->_12, view->_13, view->_14 }, { view->_21, view->_22, view->_23, view->_24 },
 			{ view->_31, view->_32, view->_33, view->_34 }, { view->_41, view->_42, view->_43, view->_44 },
-			{ CapturedNormals::Data.y, CapturedNormals::Data.z, 0.0f, 0.0f } };
+			{ CapturedNormals::Data.y, CapturedNormals::Data.z, kBumpFadeStart, kBumpFadeEnd } };
 		d->SetPixelShaderConstantF(0, &c[0][0], 7);
-		// stage 3 (FullScreenPass takes three): the depth, point / clamp, put back after
-		IDirect3DBaseTexture9* tex3 = nullptr; d->GetTexture(3, &tex3);
-		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
-		const DWORD wantS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
-		DWORD savedS[sizeof(kSS) / sizeof(kSS[0])];
-		for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) { if (FAILED(d->GetSamplerState(3, kSS[i], &savedS[i]))) savedS[i] = wantS[i]; if (savedS[i] != wantS[i]) d->SetSamplerState(3, kSS[i], wantS[i]); }
-		d->SetTexture(3, depth);
-		CapturedNormals::FullScreenPass(d, Normals.Surface, NormalsPS, normals, false, D3DBLEND_ONE, D3DBLEND_ZERO, CapturedNormals::Texture, CapturedNormals::MaterialTexture);
-		d->SetTexture(3, tex3); if (tex3) tex3->Release();
-		for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) if (savedS[i] != wantS[i]) d->SetSamplerState(3, kSS[i], savedS[i]);
+		CapturedNormals::FullScreenPass(d, Normals.Surface, NormalsPS, normals, false, D3DBLEND_ONE, D3DBLEND_ZERO, CapturedNormals::Texture, CapturedNormals::MaterialTexture, depth);
 		d->SetPixelShaderConstantF(0, &saved[0][0], 7);
 		NormalsMade = true;
-		if (!NormalsRuns++) Logger::Log("UNOFFICIAL FdIndirect: the shading normals made (%ux%u): the G-buffer's normal-mapped normal where the normals buffer shows the captured surface (least cosine %.2f)",
-			desc.Width, desc.Height, CapturedNormals::Data.w);
+		if (!NormalsRuns++) Logger::Log("UNOFFICIAL FdIndirect: the shading normals made (%ux%u): the G-buffer's normal-mapped normal where the normals buffer shows the captured surface (least cosine %.2f, distance fade %.0f-%.0f)",
+			desc.Width, desc.Height, CapturedNormals::Data.w, kBumpFadeStart, kBumpFadeEnd);
 		return Normals.Texture;
 	}
 

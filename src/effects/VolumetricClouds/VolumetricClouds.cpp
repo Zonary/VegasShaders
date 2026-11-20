@@ -560,15 +560,15 @@ void VolumetricCloudsEffect::ProbeLayer(IDirect3DDevice9* Device) {
 	ProbeJob job = probeQueue.front();
 	probeQueue.erase(probeQueue.begin());
 	float fill = -1.0f;
-	Device->SetTexture(13, job.texture);
-	TheRenderManager->renderState->NoteDeviceTexture(13, job.texture);
+	Device->SetTexture(14, job.texture);
+	TheRenderManager->renderState->NoteDeviceTexture(14, job.texture);
 	const DWORD states[][2] = { {D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP}, {D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP},
 		{D3DSAMP_MAGFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MINFILTER, D3DTEXF_LINEAR}, {D3DSAMP_MIPFILTER, D3DTEXF_LINEAR} };
-	for (const auto& state : states) TheRenderManager->SetSamplerState(13, (D3DSAMPLERSTATETYPE)state[0], state[1]);
+	for (const auto& state : states) TheRenderManager->SetSamplerState(14, (D3DSAMPLERSTATETYPE)state[0], state[1]);
 	Constants.Motion.z = job.lod;
 	TheShaderManager->RenderEffectToRT(Textures.ProbeSurface, this, false, 5);
-	Device->SetTexture(13, nullptr);
-	TheRenderManager->renderState->NoteDeviceTexture(13, nullptr);
+	Device->SetTexture(14, nullptr);
+	TheRenderManager->renderState->NoteDeviceTexture(14, nullptr);
 	D3DLOCKED_RECT locked;
 	if (SUCCEEDED(Device->GetRenderTargetData(Textures.ProbeSurface, probeReadback)) && SUCCEEDED(probeReadback->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
 		fill = (float)(*(const UInt32*)locked.pBits >> 24) / 255.0f;

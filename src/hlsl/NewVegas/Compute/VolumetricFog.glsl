@@ -864,7 +864,9 @@ void ModernFogTerms(vec2 coord, out vec3 fogMul, out vec3 fogAdd, out float nigh
 
         float sunScattering = pows(compress(sunDir), mix(8.0, 1.0, PhaseAsymmetry) + sunStrength);
         sunScattering *= pow(1.0 - sunHeight, 2.0) * isDayTimeFog * cb.fogData.z;
-        sun = sunColorV * sunScattering * shadowVisibility * cb.pbrData.z * 100.0 * (classic ? 1.0 : cb.fogSun.x);
+        // UNOFFICIAL 2026-11-19 (VolumetricFog.fx.hlsl ModernFogTerms): gate sun glare off sky dome, attenuate in overcast weather, scale by SkyMultiplier (cb.sunsetColor.w).
+        float sunGlowScale = classic ? 1.0 : (cb.fogSun.x * (1.0 - isSkyDome) * mix(0.25, 1.0, WeatherFilterBlend) * cb.sunsetColor.w);
+        sun = sunColorV * sunScattering * shadowVisibility * cb.pbrData.z * 100.0 * sunGlowScale;
 
         distantFog = pows(hlslSmoothstep(DistantFogRange, 1.0, normalizedDepth), 0.5);
         // UNOFFICIAL 2026-10-30 (VolumetricFog.fx.hlsl, claude/terrain-flicker 80b1dd4b): at most 1 (below z 0 the exp passed 1 and the sky lerp
@@ -921,7 +923,7 @@ void ModernFogTerms(vec2 coord, out vec3 fogMul, out vec3 fogAdd, out float nigh
     fogMul *= aerialScale;
     fogAdd *= aerialScale;
 
-    float distantBlend = distantFog * saturate(DistantFogBlend) * distantHeightFade * isExterior;
+    float distantBlend = distantFog * saturate(DistantFogBlend) * distantHeightFade * isExterior * (classic ? 1.0 : (1.0 - isSkyDome));
     fogMul *= 1.0 - distantBlend;
     fogAdd = mix(fogAdd, skyColor.rgb, distantBlend);
 

@@ -18,7 +18,9 @@ namespace FdIndirectShaders {
 	//    cosine c0.z of COLOR3's smooth normal. Water, glass, grass and anything drawn over the G-buffer later keep the buffer's own normal,
 	//  - the shading normal faces the camera (a normal map bent past the silhouette keeps the smooth one).
 	// s0 the normals buffer, s1 COLOR3, s2 COLOR2, s3 TESR_DepthBuffer (linear: x far = view z). c0: 1 / proj _11, 1 / proj _22, least
-	// cosine, far; c1: TESR_RenderScale (zw the reciprocal of the drawn share); c2-c5: TESR_ViewTransform's rows; c6: share, units. Alpha:
+	// cosine, far; c1: TESR_RenderScale (zw the reciprocal of the drawn share); c2-c5: TESR_ViewTransform's rows; c6: share, units,
+	// bump-fade start distance, bump-fade end distance (when c6.w > c6.z: smoothly relaxes bumped -> smooth over distance to kill
+	// distant normal-map shimmer/aliasing, and over grazing angles -0.12..-0.02 so curved silhouettes never pop hard). Alpha:
 	// the normals buffer's own.
 	inline const char* kShadingNormalsPS =
 		"sampler2D N : register(s0); sampler2D C : register(s1); sampler2D M : register(s2); sampler2D D : register(s3);"
@@ -32,9 +34,13 @@ namespace FdIndirectShaders {
 		"  float3 vn = normalize(mul(Oct(float2(m.g, m.a)), (float3x3)V));"
 		"  float2 s = uv * R.zw;"
 		"  float3 vp = float3((s.x * 2.0f - 1.0f) * P.x, (1.0f - s.y * 2.0f) * P.y, 1.0f) * z; float d = length(vp);"
+		"  float ndv = dot(vn, vp);"
 		"  bool take = m.r > 0.5f && abs(m.g) <= 1.001f && c.a > 0.99f && abs(c.b - d) <= d * G.x + G.y && z < P.w * 0.99f &&"
-		"    dot(vb, vs) > P.z && dot(vn, vp) < -0.02f * d;"
-		"  return take ? float4(vn * 0.5f + 0.5f, nb.a) : nb; }";
+		"    dot(vb, vs) > P.z && ndv < -0.02f * d;"
+		"  float fade = G.w > G.z ? max(smoothstep(G.z, G.w, d), smoothstep(-0.12f, -0.02f, ndv / max(d, 1e-4f))) : 0.0f;"
+		"  float3 bl = fade > 0.0f ? lerp(vn, vb, fade) : vn;"
+		"  float3 outN = fade > 0.0f ? (dot(bl, bl) > 1e-5f ? normalize(bl) : vb) : vn;"
+		"  return take ? float4(outN * 0.5f + 0.5f, nb.a) : nb; }";
 
 	// The reflections' own material copy (Reflections' 8-bit target: r roughness, g metal, b 1 = reflects by its smoothness whatever way it
 	// faces (MaterialAware's rule), b 0.5 = the floor guess with this roughness and metal; alpha 0) from G-buffer v2, blended

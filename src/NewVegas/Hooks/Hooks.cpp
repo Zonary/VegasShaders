@@ -100,7 +100,8 @@ void AttachHooks() {
 
 	// UNOFFICIAL KeepLampsInView (PointShadowForward.h): the game's one lamp view test call, with forward shadows, unless another
 	// plugin has taken it.
-	if (TheSettingManager->GetSettingI("Shaders.ShadowsInteriors.Forward", "Enabled")) {
+	if (TheSettingManager->GetSettingI("Shaders.ShadowsInteriors.Forward", "Enabled") ||
+		TheSettingManager->GetSettingI("Shaders.ShadowsInteriors.Forward", "KeepLampsInView")) {
 		const UInt32 site = PointShadowForward::kTestFrustumCallSite;
 		if (*(UInt8*)site == 0xE8 && site + 5 + *(SInt32*)(site + 1) == PointShadowForward::kTestFrustumCull) {
 			WriteRelCall(site, (UInt32)&PointShadowForward::TestFrustumCullHook);

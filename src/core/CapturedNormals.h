@@ -23,6 +23,7 @@
 #include <d3d9.h>
 #include <unordered_set>
 #include "DxvkCompute.h"
+#include "RenderRect.h"	// UNOFFICIAL 2026-11-19: RenderRect-aware G-buffer clears and FullScreenPass sub-rect viewport
 #include "GBufferCensus.h"	// UNOFFICIAL 2026-11-14 GBufferCensus (test only): every draw of a census frame, after BeforeDraw
 #include "MergeCopies.h"	// UNOFFICIAL 2026-11-14 MergeCopies (test only): its merged draw / checks in the innermost draw hook
 #include "DisplaceHeight.h"	// UNOFFICIAL 2026-11-01 SameHeight: the draw hook gives it each draw
@@ -125,6 +126,14 @@ namespace CapturedNormals {
 	inline bool GrassOwnBeam = false;	// the grass shaders light the grass by the deferred flashlight's beam this frame
 	inline bool GrassForGI = false;		// this frame's grass records are written for the raster frame's RT GI (no path tracing)
 	inline bool GrassMergeNow = false;	// this frame: the grass's own normal goes into TESR_NormalsBuffer (MergeIntoNormals)
+	// UNOFFICIAL 2026-11-17 fast-restart (testers: grass glowing orange under a volumetric cloud's shadow, docs/next/FAST-RESTART.md section 3):
+	// SunFar (effects/SunFar) takes a cloud's or a mountain's shadow off each pixel by its normal's N.L against the sun. On grass whose own
+	// normal is not in TESR_NormalsBuffer (the late grass, DrawFirst off; any grass while the deferred renderer is not live: no records then)
+	// that is the normal rebuilt from depth, which on a thin blade points anywhere: where it faces away from the sun SunFar takes nothing,
+	// and those tufts stayed in full sun, glowing orange under the cloud (base, 2026-11-16 bench: also the early grass with
+	// CapturedGrassNormals off). SunFarDrew (SunFarEffect::RenderFactor, each frame it draws) makes the grass write its records then too, so
+	// MergeIntoNormals puts the tuft's normal there, as for the early grass under the deferred renderer: SunFar shades it as the ground.
+	inline bool SunFarDrew = false, SunFarRecent = false, GrassForSunFar = false;
 	// UNOFFICIAL 2026-11-12 CapturedGrassTint: the grass's colour keys as GrassShaders::UpdateSettings read them (tint, colour, saturation),
 	// for the self-check's line only (AlbedoCheck): the log then says which settings its numbers were measured with.
 	inline float GrassColourKeys[3] = { 1.0f, 1.0f, 1.0f };
@@ -344,62 +353,186 @@ namespace CapturedNormals {
 		if (code) code->Release();
 		return out;
 	}
-	// One full-screen draw of ps into target (the whole surface, uv 0-1) reading source on stage 0, optionally blended
+	// UNOFFICIAL 2026-11-19: RenderRect-aware surface clear (saves ~55% of G-buffer ColorFill write bandwidth at RenderScale = 0.67).
+	// forceFull clears the entire surface once on first use or after RenderScale shrinks so texels outside the active rect hold 0, never stale/NaN data.
+	inline void ClearSurface(IDirect3DDevice9* d, IDirect3DSurface9* surface, UINT w, UINT h, D3DCOLOR color = D3DCOLOR_ARGB(0, 0, 0, 0), bool forceFull = false) {
+		if (!d || !surface) return;
+		if (!forceFull && RenderRect::Active() && w == TheRenderManager->width && h == TheRenderManager->height) {
+			const UINT rw = RenderRect::Width(w), rh = RenderRect::Height(h);
+			if (rw > 0 && rh > 0 && (rw < w || rh < h)) {
+				const RECT r = { 0, 0, (LONG)rw, (LONG)rh };
+				if (SUCCEEDED(d->ColorFill(surface, &r, color))) return;
+			}
+		}
+		d->ColorFill(surface, NULL, color);
+	}
+	inline void ClearSurface(IDirect3DDevice9* d, IDirect3DSurface9* surface, D3DCOLOR color = D3DCOLOR_ARGB(0, 0, 0, 0), bool forceFull = false) {
+		if (!d || !surface) return;
+		D3DSURFACE_DESC desc = {};
+		if (SUCCEEDED(surface->GetDesc(&desc))) ClearSurface(d, surface, desc.Width, desc.Height, color, forceFull);
+		else d->ColorFill(surface, NULL, color);
+	}
+
+	// Cached scalar-only state blocks for FullScreenPass (16 render states + 4x6 sampler states + viewport; no COM pointers or shader constants held).
+	// Eliminates ~38 GetRenderState / GetSamplerState / GetViewport / GetFVF round-trips per FullScreenPass while staying 100% safe on D3D9 and DXVK.
+	inline IDirect3DDevice9* PassSBDevice = nullptr;
+	inline IDirect3DStateBlock9* PassSavedSB = nullptr;
+	inline IDirect3DStateBlock9* PassApplySB = nullptr;
+	inline bool PassSBFailed = false;
+	inline void ReleasePassStateBlocks() {
+		if (PassSavedSB) { PassSavedSB->Release(); PassSavedSB = nullptr; }
+		if (PassApplySB) { PassApplySB->Release(); PassApplySB = nullptr; }
+		PassSBDevice = nullptr;
+		PassSBFailed = false;
+	}
+	inline bool EnsurePassStateBlocks(IDirect3DDevice9* d) {
+		if (!d) return false;
+		if (PassSBDevice && PassSBDevice != d) ReleasePassStateBlocks();
+		if (PassSavedSB && PassApplySB) return true;
+		if (PassSBFailed) return false;
+		const SharedDrawState::TrackedState savedT = SharedDrawState::T;
+		static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHATESTENABLE, D3DRS_CULLMODE, D3DRS_STENCILENABLE,
+			D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_COLORWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+			D3DRS_BLENDOP, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_FOGENABLE, D3DRS_FILLMODE, D3DRS_CLIPPLANEENABLE };
+		static const DWORD kWantRS[] = { D3DZB_FALSE, FALSE, FALSE, D3DCULL_NONE, FALSE, FALSE, FALSE, 0xFu, FALSE,
+			D3DBLEND_ONE, D3DBLEND_ZERO, D3DBLENDOP_ADD, FALSE, FALSE, D3DFILL_SOLID, 0u };
+		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
+		static const DWORD kWantSS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
+		auto recordStates = [&](bool withViewport) -> IDirect3DStateBlock9* {
+			if (FAILED(d->BeginStateBlock())) return nullptr;
+			if (withViewport) {
+				const D3DVIEWPORT9 vp = { 0, 0, 1, 1, 0.0f, 1.0f };
+				d->SetViewport(&vp);
+			}
+			for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) d->SetRenderState(kRS[i], kWantRS[i]);
+			for (DWORD s = 0; s < 4; s++)
+				for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) d->SetSamplerState(s, kSS[i], kWantSS[i]);
+			IDirect3DStateBlock9* sb = nullptr;
+			if (FAILED(d->EndStateBlock(&sb))) sb = nullptr;
+			return sb;
+		};
+		PassSavedSB = recordStates(true);
+		PassApplySB = PassSavedSB ? recordStates(false) : nullptr;
+		SharedDrawState::T = savedT;
+		if (!PassSavedSB || !PassApplySB) {
+			ReleasePassStateBlocks();
+			PassSBFailed = true;
+			return false;
+		}
+		PassSBDevice = d;
+		return true;
+	}
+
+	// One full-screen draw of ps into target (clipped to the active RenderRect when screen-shaped, with exact D3D9 texel-centre uv = (x + 0.5) / W
+	// and identical VPOS inside [0, activeW) x [0, activeH)) reading source on stage 0 (and optional source2..4 on stages 1..3), optionally blended
 	// (src x srcBlend + dest x destBlend); everything it changes is put back.
 	inline void FullScreenPass(IDirect3DDevice9* d, IDirect3DSurface9* target, IDirect3DPixelShader9* psNew, IDirect3DBaseTexture9* source,
 		bool blendOn, DWORD srcBlend, DWORD destBlend, IDirect3DBaseTexture9* source2 = nullptr,	// source2: UNOFFICIAL 2026-10-31 AlbedoBuffer, on stage 1
-		IDirect3DBaseTexture9* source3 = nullptr) {	// source3: UNOFFICIAL 2026-11-14 GBufferView, on stage 2 (with source2)
+		IDirect3DBaseTexture9* source3 = nullptr, IDirect3DBaseTexture9* source4 = nullptr) {	// source3/4: UNOFFICIAL 2026-11-14/19 stages 2 & 3
 		D3DSURFACE_DESC t = {};
-		if (!target || !psNew || FAILED(target->GetDesc(&t))) return;
-		D3DVIEWPORT9 vp = {}; d->GetViewport(&vp);
-		IDirect3DSurface9* rt[4] = {};
-		for (DWORD i = 0; i < 4; i++) d->GetRenderTarget(i, &rt[i]);
-		for (DWORD i = 1; i < 4; i++) if (rt[i]) d->SetRenderTarget(i, nullptr);
-		d->SetRenderTarget(0, target);
-		const D3DVIEWPORT9 full = { 0, 0, t.Width, t.Height, 0.0f, 1.0f };
-		d->SetViewport(&full);
+		if (!d || !target || !psNew || FAILED(target->GetDesc(&t))) return;
+		if (!source2) { source3 = nullptr; source4 = nullptr; }
+		else if (!source3) source4 = nullptr;
+		const bool subRect = RenderRect::Active() && t.Width == TheRenderManager->width && t.Height == TheRenderManager->height;
+		const UINT drawW = subRect ? RenderRect::Width(t.Width) : t.Width;
+		const UINT drawH = subRect ? RenderRect::Height(t.Height) : t.Height;
+		if (!drawW || !drawH) return;
+
+		const SharedDrawState::TrackedState savedT = SharedDrawState::T;
+		const bool savedValid = SharedDrawState::Valid;
+		const bool useSB = EnsurePassStateBlocks(d);
+
+		D3DVIEWPORT9 vp = {};
+		if (useSB) PassSavedSB->Capture();
+		else d->GetViewport(&vp);
+
+		IDirect3DSurface9* rt0 = nullptr;
+		IDirect3DSurface9* extraRt[4] = {};
+		d->GetRenderTarget(0, &rt0);
+		if (InSpan) {
+			for (DWORD i = 1; i < 4; i++)
+				if (SUCCEEDED(d->GetRenderTarget(i, &extraRt[i])) && extraRt[i]) d->SetRenderTarget(i, nullptr);
+		}
+		if (rt0 != target) d->SetRenderTarget(0, target);
+		const D3DVIEWPORT9 activeVp = { 0, 0, drawW, drawH, 0.0f, 1.0f };
+		d->SetViewport(&activeVp);
+
 		IDirect3DVertexShader9* vs = nullptr; IDirect3DPixelShader9* ps = nullptr; IDirect3DVertexDeclaration9* decl = nullptr;
 		IDirect3DVertexBuffer9* vb = nullptr; UINT vbOffset = 0, vbStride = 0; DWORD fvf = 0;
-		IDirect3DBaseTexture9* tex0 = nullptr; IDirect3DBaseTexture9* tex1 = nullptr; IDirect3DBaseTexture9* tex2 = nullptr;
-		if (!source2) source3 = nullptr;
-		d->GetVertexShader(&vs); d->GetPixelShader(&ps); d->GetVertexDeclaration(&decl); d->GetFVF(&fvf);
-		d->GetStreamSource(0, &vb, &vbOffset, &vbStride); d->GetTexture(0, &tex0); if (source2) d->GetTexture(1, &tex1); if (source3) d->GetTexture(2, &tex2);
+		IDirect3DBaseTexture9* tex[4] = {};
+		d->GetVertexShader(&vs); d->GetPixelShader(&ps); d->GetVertexDeclaration(&decl);
+		if (!decl) d->GetFVF(&fvf);
+		d->GetStreamSource(0, &vb, &vbOffset, &vbStride);
+		d->GetTexture(0, &tex[0]);
+		if (source2) d->GetTexture(1, &tex[1]);
+		if (source3) d->GetTexture(2, &tex[2]);
+		if (source4) d->GetTexture(3, &tex[3]);
+
 		static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHATESTENABLE, D3DRS_CULLMODE, D3DRS_STENCILENABLE,
 			D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_COLORWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
-			D3DRS_BLENDOP, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_FOGENABLE };
-		const DWORD want[] = { D3DZB_FALSE, FALSE, FALSE, D3DCULL_NONE, FALSE, FALSE, FALSE, 0xF, (DWORD)(blendOn ? TRUE : FALSE),
-			blendOn ? srcBlend : D3DBLEND_ONE, blendOn ? destBlend : D3DBLEND_ZERO, D3DBLENDOP_ADD, FALSE, FALSE };
+			D3DRS_BLENDOP, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_FOGENABLE, D3DRS_FILLMODE, D3DRS_CLIPPLANEENABLE };
+		const DWORD want[] = { D3DZB_FALSE, FALSE, FALSE, D3DCULL_NONE, FALSE, FALSE, FALSE, 0xFu, (DWORD)(blendOn ? TRUE : FALSE),
+			blendOn ? srcBlend : D3DBLEND_ONE, blendOn ? destBlend : D3DBLEND_ZERO, D3DBLENDOP_ADD, FALSE, FALSE, D3DFILL_SOLID, 0u };
 		DWORD saved[sizeof(kRS) / sizeof(kRS[0])];
-		for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) { if (FAILED(d->GetRenderState(kRS[i], &saved[i]))) saved[i] = want[i]; if (saved[i] != want[i]) d->SetRenderState(kRS[i], want[i]); }
 		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
 		const DWORD wantS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
-		const DWORD stages = source3 ? 3 : source2 ? 2 : 1;
-		DWORD savedS[3][sizeof(kSS) / sizeof(kSS[0])];
-		for (DWORD s = 0; s < stages; s++)
-			for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) { if (FAILED(d->GetSamplerState(s, kSS[i], &savedS[s][i]))) savedS[s][i] = wantS[i]; if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], wantS[i]); }
-		d->SetVertexShader(nullptr);
-		d->SetPixelShader(psNew);
-		d->SetTexture(0, source);
-		if (source2) d->SetTexture(1, source2);
-		if (source3) d->SetTexture(2, source3);
+		const DWORD stages = source4 ? 4 : source3 ? 3 : source2 ? 2 : 1;
+		DWORD savedS[4][sizeof(kSS) / sizeof(kSS[0])];
+
+		if (useSB) {
+			PassApplySB->Apply();
+			if (blendOn) {
+				d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+				if (srcBlend != D3DBLEND_ONE) d->SetRenderState(D3DRS_SRCBLEND, srcBlend);
+				if (destBlend != D3DBLEND_ZERO) d->SetRenderState(D3DRS_DESTBLEND, destBlend);
+			}
+		}
+		else {
+			for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) { if (FAILED(d->GetRenderState(kRS[i], &saved[i]))) saved[i] = want[i]; if (saved[i] != want[i]) d->SetRenderState(kRS[i], want[i]); }
+			for (DWORD s = 0; s < stages; s++)
+				for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) { if (FAILED(d->GetSamplerState(s, kSS[i], &savedS[s][i]))) savedS[s][i] = wantS[i]; if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], wantS[i]); }
+		}
+
+		if (vs) d->SetVertexShader(nullptr);
+		if (ps != psNew) d->SetPixelShader(psNew);
+		if (tex[0] != source) d->SetTexture(0, source);
+		if (source2 && tex[1] != source2) d->SetTexture(1, source2);
+		if (source3 && tex[2] != source3) d->SetTexture(2, source3);
+		if (source4 && tex[3] != source4) d->SetTexture(3, source4);
 		d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-		const float x1 = (float)t.Width - 0.5f, y1 = (float)t.Height - 0.5f;
-		const float quad[4][6] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { x1, -0.5f, 0, 1, 1, 0 }, { -0.5f, y1, 0, 1, 0, 1 }, { x1, y1, 0, 1, 1, 1 } };
+		const float x1 = (float)drawW - 0.5f, y1 = (float)drawH - 0.5f;
+		const float u1 = subRect ? (float)drawW / (float)t.Width : 1.0f;
+		const float v1 = subRect ? (float)drawH / (float)t.Height : 1.0f;
+		const float quad[4][6] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { x1, -0.5f, 0, 1, u1, 0 }, { -0.5f, y1, 0, 1, 0, v1 }, { x1, y1, 0, 1, u1, v1 } };
 		d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
-		for (DWORD s = 0; s < stages; s++)
-			for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], savedS[s][i]);
-		for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) if (saved[i] != want[i]) d->SetRenderState(kRS[i], saved[i]);
-		d->SetRenderTarget(0, rt[0]);
-		for (DWORD i = 1; i < 4; i++) if (rt[i]) d->SetRenderTarget(i, rt[i]);
-		for (DWORD i = 0; i < 4; i++) if (rt[i]) rt[i]->Release();
-		d->SetViewport(&vp);
-		d->SetTexture(0, tex0); if (tex0) tex0->Release();
-		if (source2) { d->SetTexture(1, tex1); if (tex1) tex1->Release(); }
-		if (source3) { d->SetTexture(2, tex2); if (tex2) tex2->Release(); }
-		if (decl) { d->SetVertexDeclaration(decl); decl->Release(); } else d->SetFVF(fvf);
-		d->SetStreamSource(0, vb, vbOffset, vbStride); if (vb) vb->Release();
-		d->SetVertexShader(vs); if (vs) vs->Release();
-		d->SetPixelShader(ps); if (ps) ps->Release();
+
+		if (rt0 && rt0 != target) d->SetRenderTarget(0, rt0);
+		for (DWORD i = 1; i < 4; i++) if (extraRt[i]) { d->SetRenderTarget(i, extraRt[i]); extraRt[i]->Release(); }
+		if (rt0) rt0->Release();
+
+		if (useSB) {
+			PassSavedSB->Apply();
+		}
+		else {
+			for (DWORD s = 0; s < stages; s++)
+				for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], savedS[s][i]);
+			for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) if (saved[i] != want[i]) d->SetRenderState(kRS[i], saved[i]);
+			d->SetViewport(&vp);
+		}
+
+		if (tex[0] != source) d->SetTexture(0, tex[0]);
+		if (tex[0]) tex[0]->Release();
+		if (source2) { if (tex[1] != source2) d->SetTexture(1, tex[1]); if (tex[1]) tex[1]->Release(); }
+		if (source3) { if (tex[2] != source3) d->SetTexture(2, tex[2]); if (tex[2]) tex[2]->Release(); }
+		if (source4) { if (tex[3] != source4) d->SetTexture(3, tex[3]); if (tex[3]) tex[3]->Release(); }
+		if (decl) { d->SetVertexDeclaration(decl); decl->Release(); } else if (fvf) d->SetFVF(fvf);
+		if (vb) { d->SetStreamSource(0, vb, vbOffset, vbStride); vb->Release(); }
+		if (vs) { d->SetVertexShader(vs); vs->Release(); }
+		if (ps != psNew) d->SetPixelShader(ps);
+		if (ps) ps->Release();
+
+		SharedDrawState::T = savedT;
+		SharedDrawState::Valid = savedValid;
 	}
 	inline void SkinFill(IDirect3DDevice9* d) {
 		if (SkinFillFailed || !MaterialSurface || !Texture) return;
@@ -507,6 +640,16 @@ namespace CapturedNormals {
 
 	inline bool IsCheckFrame(UInt32 f) { return f == 60 || f == 300 || f == 1200 || (f > 1200 && f % 18000 == 0) || (RecheckAt && f == RecheckAt); }
 
+	inline const RECT* ActiveCheckRect(IDirect3DSurface9* src, RECT& out) {
+		if (!src || !RenderRect::Active()) return nullptr;
+		D3DSURFACE_DESC d = {};
+		if (FAILED(src->GetDesc(&d)) || d.MultiSampleType != D3DMULTISAMPLE_NONE || d.Width != TheRenderManager->width || d.Height != TheRenderManager->height) return nullptr;
+		const UINT rw = RenderRect::Width(d.Width), rh = RenderRect::Height(d.Height);
+		if (!rw || !rh) return nullptr;
+		out = { 0, 0, (LONG)rw, (LONG)rh };
+		return &out;
+	}
+
 	// Texels written by a record (alpha 1 .. 2: the world's and the actors' / gear's codes) in a 64 x 64 point-sampled copy of the target;
 	// -1 if it could not be read.
 	inline int CountWritten(IDirect3DDevice9* d) {
@@ -515,7 +658,8 @@ namespace CapturedNormals {
 			if (CheckTarget) { CheckTarget->Release(); CheckTarget = nullptr; }
 			return -1;
 		}
-		if (FAILED(d->StretchRect(TextureSurface, NULL, CheckTarget, NULL, D3DTEXF_POINT)) || FAILED(d->GetRenderTargetData(CheckTarget, CheckCopy))) return -1;
+		RECT sub = {};
+		if (FAILED(d->StretchRect(TextureSurface, ActiveCheckRect(TextureSurface, sub), CheckTarget, NULL, D3DTEXF_POINT)) || FAILED(d->GetRenderTargetData(CheckTarget, CheckCopy))) return -1;
 		D3DLOCKED_RECT r = {};
 		if (FAILED(CheckCopy->LockRect(&r, NULL, D3DLOCK_READONLY))) return -1;
 		int written = 0;
@@ -563,7 +707,8 @@ namespace CapturedNormals {
 	// 64 x 64 point copy of a target as floats (4096 x 4); false if it could not be read (CheckTarget is CountWritten's).
 	inline bool Read64(IDirect3DDevice9* d, IDirect3DSurface9* source, std::vector<float>& out) {
 		if (!CheckTarget || !CheckCopy || !source) return false;
-		if (FAILED(d->StretchRect(source, NULL, CheckTarget, NULL, D3DTEXF_POINT)) || FAILED(d->GetRenderTargetData(CheckTarget, CheckCopy))) return false;
+		RECT sub = {};
+		if (FAILED(d->StretchRect(source, ActiveCheckRect(source, sub), CheckTarget, NULL, D3DTEXF_POINT)) || FAILED(d->GetRenderTargetData(CheckTarget, CheckCopy))) return false;
 		D3DLOCKED_RECT r = {};
 		if (FAILED(CheckCopy->LockRect(&r, NULL, D3DLOCK_READONLY))) return false;
 		out.resize(4096 * 4);
@@ -702,37 +847,12 @@ namespace CapturedNormals {
 			if (MergeFailed) return false;
 		}
 		D3DSURFACE_DESC t = {};
-		normals->GetDesc(&t);
-
-		// Save what the chain relies on (as LinearScene::Convert does).
-		IDirect3DVertexShader9* vs = nullptr; IDirect3DPixelShader9* ps = nullptr; IDirect3DVertexDeclaration9* decl = nullptr;
-		IDirect3DVertexBuffer9* vb = nullptr; UINT vbOffset = 0, vbStride = 0; IDirect3DBaseTexture9* tex[3] = {};
-		IDirect3DSurface9* rt0 = nullptr; D3DVIEWPORT9 vp = {};
-		DWORD fvf = 0; float saved[7][4] = {};
+		if (FAILED(normals->GetDesc(&t))) return false;
 		// UNOFFICIAL 2026-11-12 CapturedGrass: the grass's own normal on its marked pixels (stage 2: the MaterialBuffer), only in a frame
 		// whose grass records are written and that holds the material buffer; otherwise two stages and c2.w 0, as before
 		const bool grass = GrassMergeNow && MaterialTexture && MaterialData.x > 0.5f;
-		const DWORD stages = grass ? 3 : 2;
-		d->GetVertexShader(&vs); d->GetPixelShader(&ps); d->GetVertexDeclaration(&decl); d->GetFVF(&fvf);
-		d->GetStreamSource(0, &vb, &vbOffset, &vbStride); d->GetTexture(0, &tex[0]); d->GetTexture(1, &tex[1]); if (grass) d->GetTexture(2, &tex[2]);
-		d->GetRenderTarget(0, &rt0); d->GetViewport(&vp); d->GetPixelShaderConstantF(0, &saved[0][0], 7);
-		static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE,
-			D3DRS_SCISSORTESTENABLE, D3DRS_CULLMODE, D3DRS_COLORWRITEENABLE, D3DRS_FILLMODE, D3DRS_SRGBWRITEENABLE, D3DRS_FOGENABLE, D3DRS_CLIPPLANEENABLE };
-		const DWORD want[] = { FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, D3DCULL_NONE, 0xFu, D3DFILL_SOLID, FALSE, FALSE, 0 };
-		static_assert(sizeof(kRS) / sizeof(kRS[0]) == sizeof(want) / sizeof(want[0]), "one value per state");
-		DWORD savedRS[sizeof(kRS) / sizeof(kRS[0])];
-		for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) { if (FAILED(d->GetRenderState(kRS[i], &savedRS[i]))) savedRS[i] = want[i]; if (savedRS[i] != want[i]) d->SetRenderState(kRS[i], want[i]); }
-		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
-		const DWORD wantS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
-		DWORD savedS[3][sizeof(kSS) / sizeof(kSS[0])];
-		for (DWORD s = 0; s < stages; s++)
-			for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) { if (FAILED(d->GetSamplerState(s, kSS[i], &savedS[s][i]))) savedS[s][i] = wantS[i]; if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], wantS[i]); }
-
-		d->SetRenderTarget(0, normals);
-		D3DVIEWPORT9 full = { 0, 0, t.Width, t.Height, 0.0f, 1.0f };
-		d->SetViewport(&full);
-		d->SetVertexShader(nullptr);
-		d->SetPixelShader(MergePS);
+		float saved[7][4] = {};
+		d->GetPixelShaderConstantF(0, &saved[0][0], 7);
 		const float c[7][4] = {
 			{ 1.0f / proj->_11, 1.0f / proj->_22, camera->y, 0.0f },
 			{ scale ? scale->x : 1.0f, scale ? scale->y : 1.0f, scale ? scale->z : 1.0f, scale ? scale->w : 1.0f },
@@ -740,26 +860,8 @@ namespace CapturedNormals {
 			{ view->_11, view->_12, view->_13, view->_14 }, { view->_21, view->_22, view->_23, view->_24 },
 			{ view->_31, view->_32, view->_33, view->_34 }, { view->_41, view->_42, view->_43, view->_44 } };
 		d->SetPixelShaderConstantF(0, &c[0][0], 7);
-		d->SetTexture(0, Texture);
-		d->SetTexture(1, depth);
-		if (grass) d->SetTexture(2, MaterialTexture);
-		d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
-		const float x1 = (float)t.Width - 0.5f, y1 = (float)t.Height - 0.5f;
-		const float quad[4][6] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { x1, -0.5f, 0, 1, 1, 0 }, { -0.5f, y1, 0, 1, 0, 1 }, { x1, y1, 0, 1, 1, 1 } };
-		d->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
-
-		// Put it all back.
-		for (DWORD s = 0; s < stages; s++)
-			for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) if (savedS[s][i] != wantS[i]) d->SetSamplerState(s, kSS[i], savedS[s][i]);
-		for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) if (savedRS[i] != want[i]) d->SetRenderState(kRS[i], savedRS[i]);
-		if (rt0) { d->SetRenderTarget(0, rt0); rt0->Release(); }
-		d->SetViewport(&vp);
-		for (DWORD s = 0; s < stages; s++) { d->SetTexture(s, tex[s]); if (tex[s]) tex[s]->Release(); }
+		FullScreenPass(d, normals, MergePS, Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO, depth, grass ? MaterialTexture : nullptr);
 		d->SetPixelShaderConstantF(0, &saved[0][0], 7);
-		if (decl) { d->SetVertexDeclaration(decl); decl->Release(); } else d->SetFVF(fvf);
-		d->SetStreamSource(0, vb, vbOffset, vbStride); if (vb) vb->Release();
-		d->SetVertexShader(vs); if (vs) vs->Release();
-		d->SetPixelShader(ps); if (ps) ps->Release();
 		if (!MergeLogged) { MergeLogged = true; Logger::Log("CapturedNormals: merged into the normals buffer (%ux%u) for every effect that reads it", t.Width, t.Height); }
 		Merges++;
 		return true;
@@ -773,7 +875,13 @@ namespace CapturedNormals {
 	inline DIPFn NextDIP = nullptr;  inline DPFn NextDP = nullptr;  inline DPUPFn NextDPUP = nullptr;  inline DIPUPFn NextDIPUP = nullptr;
 	inline ClearFn NextClear = nullptr;
 
+	inline UINT LastClearedW = 0, LastClearedH = 0;
+	inline UINT VmClearedW = 0, VmClearedH = 0;
+
 	inline void Release() {
+		ReleasePassStateBlocks();
+		LastClearedW = LastClearedH = 0;
+		VmClearedW = VmClearedH = 0;
 		if (MsaaSurface) { MsaaSurface->Release(); MsaaSurface = nullptr; }
 		if (TextureSurface) { TextureSurface->Release(); TextureSurface = nullptr; }
 		if (Texture) { Texture->Release(); Texture = nullptr; }
@@ -1345,6 +1453,7 @@ namespace CapturedNormals {
 				ContrastFailed = true;
 				return;
 			}
+			d->ColorFill(ContrastCopy, NULL, D3DCOLOR_ARGB(0, 0, 0, 0));
 			ContrastMade = t;
 		}
 		if (!ContrastPS) {
@@ -1368,7 +1477,9 @@ namespace CapturedNormals {
 		}
 		static GpuTimer contrastTimer("ShadowContrast step");	// UNOFFICIAL: the copy + the full-screen step, in the F10 GPU profile
 		GpuProfileScope gpu(contrastTimer, d);
-		if (FAILED(d->StretchRect(target, NULL, ContrastCopy, NULL, D3DTEXF_NONE))) { ContrastFailed = true; Logger::Log("[ERROR] ShadowContrast: frame copy failed"); return; }
+		RECT contrastSub = {};
+		const RECT* contrastRect = ActiveCheckRect(target, contrastSub);
+		if (FAILED(d->StretchRect(target, contrastRect, ContrastCopy, contrastRect, D3DTEXF_NONE))) { ContrastFailed = true; Logger::Log("[ERROR] ShadowContrast: frame copy failed"); return; }
 
 		D3DVIEWPORT9 vp = {}; d->GetViewport(&vp);
 		IDirect3DSurface9* rt0 = nullptr; d->GetRenderTarget(0, &rt0);
@@ -1551,14 +1662,19 @@ namespace CapturedNormals {
 			bool msaaOwn = false;
 			if (traced && AlbedoMsaa) { SettingManager::Configuration::ConfigNode ck; msaaOwn = !TheSettingManager->Config.FillNode(&ck, "Main.Main.RayTracing", "PTAlbedoCoverage") || ck.BoolValue; }
 			GrassNow = ((traced && !msaaOwn) || forGI) && GrassKey && !GrassWriters.empty();
-			GrassLateWanted = GrassNow;	// (2026-11-14 DeferredFoliage: the late grass's records for these readers only)
+			// (2026-11-17 fast-restart) for SunFar's shadows: the tuft's normal (see SunFarDrew). Not under path tracing (its own rules above), nor
+			// while the grass lights itself by the deferred flashlight's beam (as forGI), nor with CapturedGrassNormals off (nothing would merge it).
+			SunFarRecent = SunFarDrew; SunFarDrew = false;
+			GrassForSunFar = SunFarRecent && !traced && !GrassOwnBeam && GrassKey && AlbedoCompiledIn() && !GrassWriters.empty() && QualityKeyOn("CapturedGrassNormals");
+			if (GrassForSunFar) GrassNow = true;
+			GrassLateWanted = GrassNow;	// (2026-11-14 DeferredFoliage: the late grass's records for these readers only; 2026-11-17: and SunFar)
 			if (FoliageDeferred && !GrassWriters.empty()) GrassNow = true;	// UNOFFICIAL 2026-11-14 DeferredFoliage (never while traced: DeferredFoliage::BeginFrame)
 			GrassOwnOn = traced && WaterMask::GrassOn && !WaterMask::Failed;	// UNOFFICIAL 2026-11-12 PTGrassOwnPixel (the key: RtPathTrace.cpp's settings read)
 			GrassForGI = GrassNow && !traced;
 			GrassMergeNow = GrassNow && QualityKeyOn("CapturedGrassNormals");
 			LeafNow = (traced && LeafKey && !LeafWriters.empty()) || (FoliageDeferred && !LeafWriters.empty());	// (2026-11-14 DeferredFoliage)
 			{	// one line when the grass records' state changes (at most 24 a session: the flashlight can switch it often)
-				const int state = !GrassKey ? 0 : GrassWriters.empty() || !AlbedoCompiledIn() ? 1 : msaaOwn ? 6 : traced ? 2 : forGI ? 3 : beam ? 4 : 5;
+				const int state = !GrassKey ? 0 : GrassWriters.empty() || !AlbedoCompiledIn() ? 1 : msaaOwn ? 6 : traced ? 2 : forGI ? 3 : beam ? 4 : GrassForSunFar ? 7 : 5;
 				if (state != GrassState && (state != 0 || GrassState > 0) && GrassStateLogs < 24) {
 					GrassStateLogs++;
 					static const char* const text[] = { "off (the key)",
@@ -1566,8 +1682,9 @@ namespace CapturedNormals {
 						"WRITTEN for the path tracer", "WRITTEN for the RT GI (no path tracing: the bounce's colour and the rays' normal on grass)",
 						"on, but not written now: the deferred flashlight lights the grass itself (its light pass would light the records too)",
 						"on, but not written now: nothing reads them (no path tracing, no RT GI / SunGI)",
-						"on, but NOT written under path tracing with the game's MSAA (PTAlbedoCoverage): a grass card covers a share of a pixel's samples far round the tuft, and a record averaged with the land's is neither. The grass is the game's own anti-aliased pixel there" };
-					Logger::Log("CapturedGrass: grass records %s%s", text[state], state == 2 || state == 3 ? (GrassMergeNow ? "; the grass's own normal goes into the normals buffer (CapturedGrassNormals on)" : "; CapturedGrassNormals is OFF: grass pixels keep the normal rebuilt from depth (noisy)") : "");
+						"on, but NOT written under path tracing with the game's MSAA (PTAlbedoCoverage): a grass card covers a share of a pixel's samples far round the tuft, and a record averaged with the land's is neither. The grass is the game's own anti-aliased pixel there",
+						"WRITTEN for SunFar's shadows (2026-11-17: the tuft's own normal in the normals buffer, so a cloud's or a mountain's shadow shades the grass as the ground)" };
+					Logger::Log("CapturedGrass: grass records %s%s", text[state], state == 2 || state == 3 || state == 7 ? (GrassMergeNow ? "; the grass's own normal goes into the normals buffer (CapturedGrassNormals on)" : "; CapturedGrassNormals is OFF: grass pixels keep the normal rebuilt from depth (noisy)") : "");
 				}
 				GrassState = state;
 			}
@@ -1650,10 +1767,15 @@ namespace CapturedNormals {
 		else if (BodyWanted && !DxvkCompute::Available()) { InstallBodyTracking(d); if (BodyLean()) Resync(d); else Tracked = false; }
 		else Tracked = false;
 		SpanTarget = rt0;	// (holds the reference until EndSpan)
-		d->ColorFill(DrawSurface(), NULL, D3DCOLOR_ARGB(0, 0, 0, 0));	// "nothing here": readers keep the depth-rebuilt normal
-		if (MaterialTexture && MaterialCompiled) d->ColorFill(MaterialDrawSurface(), NULL, D3DCOLOR_ARGB(0, 0, 0, 0));	// UNOFFICIAL MaterialBuffer: class 0
+		const UINT activeW = RenderRect::Active() ? RenderRect::Width(t.Width) : t.Width;
+		const UINT activeH = RenderRect::Active() ? RenderRect::Height(t.Height) : t.Height;
+		const bool forceFullClear = LastClearedW == 0 || activeW < LastClearedW || activeH < LastClearedH;
+		LastClearedW = activeW;
+		LastClearedH = activeH;
+		ClearSurface(d, DrawSurface(), t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), forceFullClear);	// "nothing here": readers keep the depth-rebuilt normal
+		if (MaterialTexture && MaterialCompiled) ClearSurface(d, MaterialDrawSurface(), t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), forceFullClear);	// UNOFFICIAL MaterialBuffer: class 0
 		MaterialDrawn = MaterialBound = false;
-		if (AlbedoTexture && AlbedoCompiled) d->ColorFill(AlbedoDrawSurface(), NULL, D3DCOLOR_ARGB(0, 0, 0, 0));	// UNOFFICIAL 2026-10-31 AlbedoBuffer: unwritten
+		if (AlbedoTexture && AlbedoCompiled) ClearSurface(d, AlbedoDrawSurface(), t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), forceFullClear);	// UNOFFICIAL 2026-10-31 AlbedoBuffer: unwritten
 		AlbedoDrawn = AlbedoBound = false;
 		SkinAlbedoTex = nullptr; SkinAlbedoMsaa = nullptr; SkinAlbedoSurface = nullptr;	// (noted again by the skin draws of this span)
 		{	// (2026-11-11) [Main.Main.Quality] CapturedBlendedAlpha, live (a missing key: on); a log line of its work now and then
@@ -1709,7 +1831,8 @@ namespace CapturedNormals {
 			// UNOFFICIAL 2026-10-29 MaterialBuffer: what it holds on these frames too (64 x 64 point copy): written texels by class, and the
 			// thickness / roughness ranges seen (a log line only; nothing is switched off by it)
 			D3DLOCKED_RECT r = {};
-			if (MaterialDrawn && MaterialSurface && CheckTarget && SUCCEEDED(d->StretchRect(MaterialSurface, NULL, CheckTarget, NULL, D3DTEXF_POINT)) &&
+			RECT matSub = {};
+			if (MaterialDrawn && MaterialSurface && CheckTarget && SUCCEEDED(d->StretchRect(MaterialSurface, ActiveCheckRect(MaterialSurface, matSub), CheckTarget, NULL, D3DTEXF_POINT)) &&
 				SUCCEEDED(d->GetRenderTargetData(CheckTarget, CheckCopy)) && SUCCEEDED(CheckCopy->LockRect(&r, NULL, D3DLOCK_READONLY))) {
 				int byClass[8] = {}, metalTexels = 0; float thickMax = 0.0f, roughMin = 2.0f, roughMax = -2.0f, metalMax = 0.0f;	// (7: 2026-11-12 CapturedGrass, grass)
 				int v2Specular = 0, v2Normals = 0, v2NoNormal = 0, v2ByModel[8] = {};	// UNOFFICIAL 2026-11-14 GBufferV2 (8 hair, 9 eye, 10 unlit, the rest)
@@ -1782,14 +1905,21 @@ namespace CapturedNormals {
 		}
 		if (VmSkinTex) {	// (the screen's size changed)
 			D3DSURFACE_DESC s = {};
-			if (FAILED(VmSkinTex->GetLevelDesc(0, &s)) || s.Width != t.Width || s.Height != t.Height) { VmSkinSurface->Release(); VmSkinSurface = nullptr; VmSkinTex->Release(); VmSkinTex = nullptr; }
+			if (FAILED(VmSkinTex->GetLevelDesc(0, &s)) || s.Width != t.Width || s.Height != t.Height) { VmSkinSurface->Release(); VmSkinSurface = nullptr; VmSkinTex->Release(); VmSkinTex = nullptr; VmClearedW = VmClearedH = 0; }
 		}
 		if (!VmSkinTex && (FAILED(d->CreateTexture(t.Width, t.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &VmSkinTex, NULL)) || !VmSkinTex ||
 			FAILED(VmSkinTex->GetSurfaceLevel(0, &VmSkinSurface)))) {
 			if (VmSkinTex) { VmSkinTex->Release(); VmSkinTex = nullptr; }
 			VmSkinSurface = nullptr;	// (the hands then keep the world's colour under them: VmSkinFill needs it; the gun is still captured)
+			VmClearedW = VmClearedH = 0;
 		}
-		if (VmSkinSurface) d->ColorFill(VmSkinSurface, NULL, D3DCOLOR_ARGB(0, 0, 0, 0));
+		if (VmSkinSurface) {
+			const UINT vmW = RenderRect::Active() ? RenderRect::Width(t.Width) : t.Width;
+			const UINT vmH = RenderRect::Active() ? RenderRect::Height(t.Height) : t.Height;
+			const bool vmForceFull = VmClearedW == 0 || vmW < VmClearedW || vmH < VmClearedH;
+			VmClearedW = vmW; VmClearedH = vmH;
+			ClearSurface(d, VmSkinSurface, t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), vmForceFull);
+		}
 		EnsureHooked(d);
 		if (LeanWanted && DxvkCompute::Available()) { HookTracking(d); Resync(d); }
 		else if (BodyLean()) Resync(d);

@@ -19,17 +19,20 @@ layout(location = 1) out vec4 o_moments;
 layout(location = 2) out vec4 o_average;
 layout(location = 3) out vec4 o_guide;
 
-// Last frame's result, moments and the summed weight at uv, from the 2 x 2 texels that hold the same kind of surface
+// Last frame's result, moments and the summed weight at rectUv, from the 2 x 2 texels that hold the same kind of surface
 struct History { vec4 value; vec4 moments; float weight; };
-History Gather(vec2 uv, Surface s, float expectedZ, float zTolerance, float hit, bool virtualTest) {
+History Gather(vec2 rectUv, bool inFrustum, Surface s, float expectedZ, float zTolerance, float hit, bool virtualTest) {
     History h; h.value = vec4(0.0); h.moments = vec4(0.0); h.weight = 0.0;
-    vec2 f = pc.size.xy * uv - 0.5;
+    if (!inFrustum) return h;
+    ivec2 lastGrid = max(ivec2(round(pc.size.xy * pc.rect.zw)), ivec2(1));
+    lastGrid = min(lastGrid, ACTIVE_GRID);
+    vec2 f = pc.size.xy * rectUv - 0.5;
     ivec2 t = ivec2(floor(f));
     vec2 b = f - vec2(t);
     for (int k = 0; k < 4; k++) {
         ivec2 o = ivec2(k & 1, k >> 1);
         ivec2 q = t + o;
-        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, GRID))) continue;
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, lastGrid))) continue;
         vec4 g = Fetch(t_in2, q);
         if (g.x <= 0.0) continue;
         float w = (o.x == 1 ? b.x : 1.0 - b.x) * (o.y == 1 ? b.y : 1.0 - b.y);
@@ -46,41 +49,54 @@ History Gather(vec2 uv, Surface s, float expectedZ, float zTolerance, float hit,
 }
 
 void main() {
-    ivec2 p = ivec2(gl_FragCoord.xy);
-    vec2 uv = (vec2(p) + 0.5) * pc.size.zw;
-    Surface s = SurfaceAt(p);
-    vec4 signal = Fetch(t_signal, p);
+    ivec2 px = ivec2(gl_FragCoord.xy);
+    if (any(greaterThanEqual(px, ACTIVE_GRID))) {
+        o_guide = vec4(0.0); o_accum = vec4(0.0); o_average = vec4(0.0); o_moments = vec4(0.0);
+        return;
+    }
+    vec2 rectUv = (vec2(px) + 0.5) * pc.size.zw;
+    Surface s = SurfaceAt(px);
+    vec4 signal = Fetch(t_signal, px);
     if (!Finite(signal)) signal = vec4(0.0);
     // the hit distance for tracking: the nearest hit of the 3 x 3 neighbourhood (one ray a pixel mixes the reflected object with sky
     // misses at its edges; their mean would point the virtual reprojection between the two)
     float hit = 1.0e9;
     for (int y = -1; y <= 1; y++)
         for (int x = -1; x <= 1; x++) {
-            ivec2 q = p + ivec2(x, y);
+            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), max(ACTIVE_GRID - 1, ivec2(0)));
             float hq = Fetch(t_hitDist, q).y;
             if (Fetch(t_ray, q).x > 0.0 && hq > 0.0) hit = min(hit, hq);
         }
     if (hit > 1.0e8) hit = 0.0;
     o_guide = vec4(s.z, s.roughness, OctEncodeN(s.n));
     o_accum = signal; o_average = signal;
-    float rawHit = max(Fetch(t_hitDist, p).y, 0.0);
+    float rawHit = max(Fetch(t_hitDist, px).y, 0.0);
     o_moments = vec4(rawHit, 1.0, max(hit, 0.0), 0.0);
     if (s.z <= 0.0) { o_guide = vec4(0.0); o_accum = vec4(0.0); o_average = vec4(0.0); o_moments = vec4(0.0); return; }
     if (IsMirror(s.roughness) || !HistoryValid) return;
 
-    // surface reprojection
-    vec3 point = PointAt(uv, s.z);
-    vec3 last = ToLast(point - ObjectMotionAt(uv));
-    if (s.weapon) last = vec3(uv, s.z);
-    History hs = Gather(last.xy, s, last.z, 0.03 * last.z + 2.0, 0.0, false);
-    // virtual (hit-point) reprojection
+    // surface reprojection (with ObjectMotion; weapon pixels stay screen-locked without world parallax because they use weapon FOV)
+    vec3 uvSurf;
+    bool inSurf = true;
+    if (s.weapon) {
+        uvSurf = vec3(rectUv, s.z);
+    } else {
+        vec3 pSurf = PointAt(rectUv, s.z);
+        uvSurf = ToLastWithMotion(pSurf, rectUv, inSurf);
+    }
+    History hs = Gather(uvSurf.xy, inSurf, s, uvSurf.z, 0.03 * uvSurf.z + 2.0, 0.0, false);
+
+    // virtual (hit-point) reprojection: camera-only ToLast(pVirt) (never subtract reflector ObjectMotion!), including RtMirrorJitter sub-texel ray shift
     float hitUsed = hit;
-    History hv; hv.weight = 0.0;
+    History hv; hv.value = vec4(0.0); hv.moments = vec4(0.0); hv.weight = 0.0;
     if (hitUsed > 0.0 && !s.weapon) {
-        float d = length(point);
-        vec3 lastV = ToLast(point / d * (d + hitUsed));
+        vec2 mj = (pc.activeSize.z > 0.5 && s.roughness < pc.up.w) ? RtMirrorJitter(pc.activeSize.z, s.roughness) * pc.size.zw : vec2(0.0);
+        vec3 pSurfVirt = PointAt(rectUv + mj, s.z);
+        float d = max(length(pSurfVirt), 1.0e-4);
+        bool inVirt = false;
+        vec3 lastV = ToLast(pSurfVirt * ((d + hitUsed) / d), inVirt);
         // last frame's surface under the virtual point: not known before the lookup; a floor of this frame's depth +- 15 %
-        hv = Gather(lastV.xy, s, s.z, 0.15 * s.z + 4.0, hitUsed, true);
+        hv = Gather(lastV.xy, inVirt, s, s.z, 0.15 * s.z + 4.0, hitUsed, true);
     }
     float sOk = hs.weight > 0.25 ? 1.0 : 0.0, vOk = hv.weight > 0.25 ? 1.0 : 0.0;
     // virtual share: all of it on smooth surfaces, none past roughness 0.5 (a wide lobe's image moves more with the surface)
@@ -96,13 +112,13 @@ void main() {
     float c = 0.0;
     for (int y = -1; y <= 1; y++)
         for (int x = -1; x <= 1; x++) {
-            ivec2 q = p + ivec2(x, y);
+            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), max(ACTIVE_GRID - 1, ivec2(0)));
             if (Fetch(t_ray, q).x <= 0.0) continue;
             vec4 v = Fetch(t_signal, q);
             if (!Finite(v)) continue;
             m1 += v; m2 += v * v; c += 1.0;
         }
-    m1 /= c; m2 /= c;
+    m1 /= max(c, 1.0); m2 /= max(c, 1.0);
     vec4 sigma = sqrt(max(m2 - m1 * m1, vec4(0.0)));
     // UNOFFICIAL 2026-11-08 (perf-reflfix4) MirrorJitter: a mirror pixel's history (only reached with MirrorJitter: MirrorRoughness 0) is
     // clipped into this frame's 3 x 3 neighbourhood, mean +- 1.25 sigma (TAA's variance clip): the jittered samples' area average stays,

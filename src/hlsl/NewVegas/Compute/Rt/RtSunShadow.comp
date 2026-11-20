@@ -192,7 +192,7 @@ void main() {
 			float through = 0.0;
 			if (testAlpha && (p.origin.w > 0.0 || p.cloudCentre.w > 0.5)) {
 				through = rtSunFoliageTrace(start, toSun, p.bias.w, uint(p.range.z) & 0xFFu, rtHiddenNear(start, p.origin.xyz), p.origin.w,
-					p.cloudCentre.w > 0.5, p.alpha.y, hitT);
+					p.cloudCentre.w > 0.5, nearest, p.alpha.y, hitT);
 				// the coin toss (cloudLight.w): the pixel is lit or blocked, lit for `through` of the frames (its own noise, not the disc's)
 				if (p.cloudLight.w > 0.5 && through > 0.0 && through < 1.0)
 					through = fract(52.9829189 * fract(0.06711056 * float(pixel.x + 17) + 0.00583715 * float(pixel.y + 59)) + 0.754877666 * p.alpha.y) < through ? 1.0 : 0.0;
@@ -246,7 +246,8 @@ void main() {
 		imageStore(visibilityImage, pixel, vec4(linear01 > 0.0 && linear01 < 0.9999 ? cloudTransmittance(position) : 1.0, 0.0, 0.0, 0.0));
 		return;
 	}
-	if (p.cloud.x > 0.0 && debug == 0 && linear01 > 0.0 && linear01 < 0.9999) {
+	// UNOFFICIAL 2026-11-19: skip normal reload & 4 cloud texture fetches when pixel is already in full RT shadow (result <= 0)
+	if (p.cloud.x > 0.0 && debug == 0 && result > 0.0 && linear01 > 0.0 && linear01 < 0.9999) {
 		const vec3 position = p.origin.xyz + (p.forward.xyz + p.right.xyz * (2.0 * uv.x - 1.0) - p.up.xyz * (2.0 * uv.y - 1.0)) * viewZ;
 		const vec3 n = imageLoad(normalImage, source).xyz * 2.0 - 1.0;
 		const vec3 normal = normalize(normalize(p.right.xyz) * n.x + normalize(p.up.xyz) * n.y + normalize(p.forward.xyz) * n.z);

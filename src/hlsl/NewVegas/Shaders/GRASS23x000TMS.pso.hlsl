@@ -7,6 +7,12 @@
 // Pip-Boy light on every tuft, and normal maps with the sun's highlight. PBR NVR's c146/c147/c160-c176 are the sun cross-fade's
 // here: c80-c98 instead (nothing else in the grass PS is below c100).
 
+// UNOFFICIAL 2026-11-16 fast-restart (testers: grass and leaves glowing under a cloud's shadow; docs/next/FAST-RESTART.md): the clouds' shadow
+// on the sun term with ForwardShadows on, as every object (Includes/Shadow.hlsl SHADOW_CLOUD_IN; strength 0 with PlantShadows off). Not in
+// the deferred record (FOLIAGE_DEFERRED): DeferredSun shades its sun.
+#if !(defined(FOLIAGE_DEFERRED) && FOLIAGE_DEFERRED)
+    #define SHADOW_CLOUD_IN 1
+#endif
 #include "includes/Shadow.hlsl"
 #include "includes/PBRScale.hlsl"
 // UNOFFICIAL 2026-11-12 grass records (docs/next/PT-COMPAT-AUDIT-2026-11-12.md item 1; Includes/CapturedNormals.hlsl CAPTURED_FOLIAGE;

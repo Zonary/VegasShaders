@@ -482,7 +482,7 @@
 #if defined(PS) && !defined(NVR_SLOT_TIGHT) && !(defined(LIGHTS) && LIGHTS > 3)
     #define SHADOW_CHARACTER_MAP_IN 1
 #endif
-// UNOFFICIAL 2026-11-04 ForwardCloudShadows (Includes/Shadow.hlsl): the clouds' shadow on the sun term (compiled in only when on at startup).
+// UNOFFICIAL 2026-11-04 ForwardCloudShadows (Includes/Shadow.hlsl): the clouds' shadow on the sun term (always compiled in; its strength switches it live).
 // Every object pixel shader, the four- and nine-lamp ones too (one lookup and a few ALU, against the character map's second cascade
 // read): without it the objects drawn with the many-lamp shaders kept the sun under a cloud, so the cloud's edge seemed to glide over
 // them as it crossed the land round them.
