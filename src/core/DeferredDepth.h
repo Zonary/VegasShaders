@@ -226,6 +226,11 @@ namespace DeferredDepth {
 			draw.pBindings = &resource;
 			draw.pPushData = push;
 			draw.PushDataSize = sizeof(push);
+			// UNOFFICIAL 2026-11-19: limit Vulkan depth linearize to the active RenderRect (saves ~55% pixel work at RenderScale = 0.67).
+			if (RenderRect::Active()) {
+				draw.ViewportWidth = (UINT)RenderRect::Width(Width);
+				draw.ViewportHeight = (UINT)RenderRect::Height(Height);
+			}
 			const HRESULT result = DxvkCompute::Extension()->Draw(&draw);
 			if (SUCCEEDED(result)) { LinearPath = "fork Vulkan pass"; return true; }
 			LinearExtFailed = true;

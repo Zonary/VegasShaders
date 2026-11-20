@@ -22,6 +22,7 @@
 #include "PtApplies.h"	// UNOFFICIAL 2026-11-12: what each effect does while the path traced picture replaces the scene (the notes)
 #include "../effects/Reflections/Reflections.h"
 #include "../effects/AmbientOcclusion/AmbientOcclusion.h"
+#include "../effects/AmbientLight/AmbientLight.h"
 #include <sstream>
 #include <array>
 #include <iomanip>
@@ -31,7 +32,7 @@
 #include <share.h>	// _SH_DENYNO (Copy bug report reads the open log)
 #include "ShaderFallback.h"	// UNOFFICIAL 2026-11-12 ShaderFallback: its notices, shown with the install check's
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the SunSmoothing notes)
-#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: BloodFlow and DustMotes have no page, row or search entry in a release build
+#include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: shelved effects have no page, row or search entry in a release build
 #include "SettingForce.h"	// UNOFFICIAL 2026-11-16: keys the deferred renderer sets (on or off) show greyed, at the value in effect
 
 // The settings overlay (ImGui on the game's D3D9 device). Layout, top to bottom: a menu bar (File / View / Tools and the
@@ -301,7 +302,7 @@ static void ApplySavedTextSize(ImGuiIO& io) {
 }
 
 void ImGuiManager::Initialize() {
-	if (gOverlay.ready) return;
+	if (gOverlay.ready || !TheRenderManager) return;
 	IDirect3DDevice9* d3d = TheRenderManager->device;
 	const HWND window = TheRenderManager->m_kWndFocus;
 	if (!d3d || !window) {
@@ -693,6 +694,40 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Main.Main.RayTracing",                 "PTRestirGI",         RestartRule::TurnOn },
 	{ "Main.Main.RayTracing",                 "PTDenoiseSplit",     RestartRule::TurnOn },
 	{ "Main.Main.RayTracing",                 "PTCacheEntriesLog2", RestartRule::Changed },
+	// Renderer, pipelines, hooks and scene setup read at start
+	{ "Main.Main.Quality",                    "DeferredRenderer",   RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredSkin",       RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredHair",       RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredTransparents", RestartRule::Changed },
+	{ "Main.Main.Quality",                    "CapturedBumpNormals", RestartRule::Changed },
+	{ "Main.Main.Misc",                       "ForceMSAA",          RestartRule::Changed },
+	{ "Main.Main.Misc",                       "PresetOldDefaults",  RestartRule::Changed },
+	{ "Main.Main.Misc",                       "ReplaceIntro",       RestartRule::Changed },
+	{ "Shaders.WetnessEffects.Status",        "Enabled",            RestartRule::Changed },
+	{ "Shaders.TAA.Cutouts",                  "Enabled",            RestartRule::TurnOn },
+	{ "Shaders.TAA.Cutouts",                  "FarCoverage",        RestartRule::Changed },
+	{ "Shaders.Flashlight.Deferred",          "ShadowMapSize",      RestartRule::Changed },
+	{ "Shaders.PipboyFit.Main",               "Enabled",            RestartRule::Changed },
+	{ "Shaders.ShadowsExteriors.ShadowMaps",  "CharacterShadowMap", RestartRule::Changed },
+	{ "Shaders.ShadowsExteriors.Main",        "CharacterObjectReach", RestartRule::Changed },
+	{ "Shaders.ShadowsInteriors.RT",          "Exteriors",          RestartRule::Changed },
+	{ "Shaders.ShadowsInteriors.RT",          "ManyLights",         RestartRule::TurnOn },
+	{ "Shaders.ShadowsInteriors.RT",          "ShadowDenoiser",     RestartRule::TurnOn },
+	{ "Shaders.ShadowsInteriors.RT",          "DenoiseLamps",       RestartRule::TurnOn },
+	{ "Shaders.ShadowsInteriors.RT",          "Denoise",            RestartRule::TurnOn },
+	{ "Shaders.ShadowsInteriors.RT",          "ExteriorForward",    RestartRule::Changed },
+	{ "Shaders.ShadowsInteriors.RT",          "ExteriorManyLights", RestartRule::TurnOn },
+	{ "Shaders.ShadowsInteriors.RT",          "Flashlight",         RestartRule::Changed },
+	{ "Shaders.SnowAccumulation.Main",        "CapturedNormals",    RestartRule::Changed },
+	{ "Shaders.PBR.EnvMaps",                  "FromGameData",       RestartRule::Changed },
+	{ "Shaders.VolumetricFog.Interiors",      "LampHazeShadowCell", RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "Actors",             RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "AlphaTested",        RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "HitTextures",        RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "AlphaDetail",        RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "AlbedoDetail",       RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "RealNormalMaps",     RestartRule::Changed },
+	{ "Main.Main.RayTracing",                 "Grass",              RestartRule::Changed },
 };
 
 static std::unordered_map<std::string, float> s_startupValues;	// "Section.Key" -> its value when the game started
@@ -892,6 +927,86 @@ static const char* InactiveReason(const char* section, const char* key) {
 		NumericSetting("Shaders.Cloth.Interiors", "Enabled") == 0.0f)
 		return "Not used now: UseGameWind takes the direction from the weather. Used with UseGameWind off, and indoors "
 			"with Cloth > Interiors on (no weather there).";
+
+	// DXVK fork required (native D3D9 / stock DXVK ignores these)
+	if (!DxvkCompute::Available()) {
+		if ((sec == "Shaders.AmbientLight.Main" && is({ "ComputeGI", "ComputeGIStrength", "ComputeGIThickness", "ComputeGIThinOcclusion", "ComputeGIQuality" })) ||
+			(sec == "Main.Main.Performance" && is({ "NvrDxvkPasses", "NvrDxvkClouds", "NvrDxvkDisplacement", "NvrDxvkAmbientLight" })) ||
+			sec == "Shaders.Terrain.Displacement" || sec == "Shaders.POM.Displacement")
+			return "Needs the DXVK fork's d3d9.dll: not active on standard D3D9 or stock DXVK.";
+	}
+
+	// ForceMSAA disables deferred rendering and upscalers (FSR / DLSS)
+	if (NumericSetting("Main.Main.Misc", "ForceMSAA") != 0.0f) {
+		if ((sec == "Main.Main.Quality" && is({ "DeferredRenderer" })) ||
+			((sec == "Shaders.TAA.FSR" || sec == "Shaders.TAA.DLSS") && is({ "Enabled", "RenderScale" })))
+			return "Not used while ForceMSAA (Main > Misc) is on: MSAA disables deferred rendering and upscalers.";
+	}
+
+	// Skin: ScreenSpace blur takes over from per-pixel Scattering; Main/Scattering apply outdoors, Interiors applies indoors
+	const bool isExt = TheShaderManager && TheShaderManager->GameState.isExterior;
+	if (sec == "Shaders.Skin.Main" && is({ "Scattering" }) && NumericSetting("Shaders.Skin.Scattering", "ScreenSpace") != 0.0f)
+		return "Overridden while ScreenSpace (Skin > Scattering) is on: the screen-space blur replaces per-pixel Scattering.";
+	if (sec == "Shaders.Skin.Interiors" && is({ "Scattering" }) && NumericSetting("Shaders.Skin.Interiors", "ScreenSpace") != 0.0f)
+		return "Overridden while ScreenSpace (Skin > Interiors) is on: the screen-space blur replaces per-pixel Scattering indoors.";
+	if ((sec == "Shaders.Skin.Main" || sec == "Shaders.Skin.Scattering") && !is({ "OverrideVanillaPlusSkin", "MuteGameHighlights", "RainWetness" }) && !isExt)
+		return "Applies outdoors only (you are indoors right now - adjust Skin > Interiors to see live changes here).";
+	if (sec == "Shaders.Skin.Interiors" && isExt)
+		return "Applies indoors only (you are outdoors right now - adjust Skin > Main / Scattering to see live changes here).";
+	if (sec == "Shaders.Skin.SSS" && !is({ "Kernel" }) && NumericSetting(section, "Kernel") == 0.0f)
+		return "Only used when Skin > SSS Kernel is non-zero (experimental SSS kernel).";
+
+	// AmbientLight replaces standalone AmbientOcclusion and BounceLight (Skylighting still runs!)
+	if (TheSettingManager->GetMenuShaderEnabled("AmbientLight")) {
+		if (sec == "Shaders.AmbientOcclusion.Exteriors" || sec == "Shaders.AmbientOcclusion.Interiors" || sec == "Shaders.AmbientOcclusion.GTAO")
+			return "Replaced while Ambient Light is on: Ambient Light does corner shading itself. Switch modes on Lighting > Ambient occlusion & bounce light.";
+		if (sec == "Shaders.BounceLight.Main")
+			return "Replaced while Ambient Light is on: Ambient Light handles bounce light. Switch modes on Lighting > Ambient occlusion & bounce light.";
+	}
+
+	// Shadow Darkness / Contrast rules
+	if (sec == "Shaders.ShadowsExteriors.Main" && is({ "Darkness" }) && NumericSetting(section, "ForwardShadows") != 0.0f)
+		return "Not used while ForwardShadows is on: shadows block the sun's light directly instead of darkening the screen.";
+	if (sec == "Shaders.ShadowsInteriors.Main" && is({ "Darkness" }) &&
+		NumericSetting("Shaders.ShadowsInteriors.Forward", "Enabled") != 0.0f && NumericSetting("Shaders.ShadowsInteriors.Forward", "KeepDarkening") == 0.0f)
+		return "Not used while Forward lamp shadows are on with KeepDarkening off: lamps shadow their own light directly.";
+	if (sec == "Shaders.ShadowsInteriors.Forward" && is({ "ShadowContrast" }) &&
+		(NumericSetting("Main.Main.Quality", "DeferredRenderer") >= 1.0f || NumericSetting("Main.Main.Quality", "GBufferV2") != 0.0f))
+		return "Not used while the deferred renderer is active (deferred lighting computes physical lamp shadows directly).";
+
+	// PBR SmithCorrelated is not read by DeferredRenderer mode 2
+	if (sec == "Shaders.PBR.Main" && is({ "SmithCorrelated" }) && NumericSetting("Main.Main.Quality", "DeferredRenderer") >= 2.0f)
+		return "Not used in DeferredRenderer mode 2 (the deferred pass uses its own specular term).";
+
+	// Exposure Mode 0 vs Mode 1 (Eye adaptation)
+	if (sec == "Shaders.Exposure.Main" || sec == "Shaders.Exposure.Interiors" || sec == "Shaders.Exposure.Night") {
+		const bool eyeAdapt = NumericSetting("Shaders.Exposure.Main", "Mode") == 1.0f;
+		if (!eyeAdapt && is({ "AdaptExposure", "AdaptWhiteBalance", "AdaptWeatherLight" }))
+			return "Only used with Eye adaptation on (Exposure Mode 1).";
+		if (eyeAdapt && is({ "MinBrightness", "MaxBrightness", "DarkAdaptSpeed", "LightAdaptSpeed", "Histogram", "HistogramLowPercent", "HistogramHighPercent" }))
+			return "Not used while Eye adaptation (Mode 1) is on: Mode 1 uses AdaptExposure / AdaptWhiteBalance instead.";
+	}
+
+	// VolumetricLight Froxels replaces raymarch Steps / BlurRadius / Temporal
+	if (sec == "Shaders.VolumetricLight.Main" && is({ "Steps", "BlurRadius", "Temporal" }) && NumericSetting(section, "Froxels") != 0.0f)
+		return "Not used while Froxels is on (the froxel grid replaces the screen-space raymarch).";
+
+	// Reflections CloudSky requires NvrDxvkClouds
+	if (sec == "Shaders.Reflections.Main" && is({ "CloudSky" }) &&
+		(!DxvkCompute::Available() || NumericSetting("Main.Main.Performance", "NvrDxvkClouds") == 0.0f))
+		return "Only used when the DXVK fork is loaded and NvrDxvkClouds (Main > Performance > DXVK) is on.";
+
+	// WetWorld vs WetnessEffects & Puddles
+	if (sec == "Shaders.WetWorld.Main" && TheSettingManager->GetMenuShaderEnabled("WetnessEffects"))
+		return "Replaced while WetnessEffects is on (turn WetnessEffects off to use the legacy WetWorld effect).";
+	if (sec == "Shaders.Puddles.Main" && !TheSettingManager->GetMenuShaderEnabled("WetnessEffects"))
+		return "Requires WetnessEffects to be enabled (Weather and water > WetnessEffects).";
+
+	// CloudShadows replaced when VolumetricClouds casts shadows
+	if (sec == "Shaders.CloudShadows.Main" && TheSettingManager->GetMenuShaderEnabled("VolumetricClouds") &&
+		NumericSetting("Shaders.VolumetricClouds.Main", "Shadows") > 0.0f)
+		return "Replaced while VolumetricClouds is on with Shadows above 0: volumetric clouds cast their own shadows.";
+
 	return nullptr;
 }
 
@@ -1228,6 +1343,7 @@ static const char* const kSmaaEdges[] = { "0 - Luma", "1 - Color", "2 - Depth", 
 static const char* const kOffOnRestart[] = { "0 - Off", "1 - On (needs a restart)" };	// fixes-a #11
 static const char* const kFsrVersions[] = { "0 - FSR 2.2.1", "1 - FSR 3.1" };	// UNOFFICIAL 2026-10-28 (core/UpscalerFsr31.cpp)
 static const char* const kPtLevels[] = { "0 - Quality", "1 - Balanced", "2 - Performance" };	// UNOFFICIAL 2026-11-11 PTRealtimeLevel
+static const char* const kDeferredModes[] = { "0 - Off (vanilla forward)", "1 - Indoors only", "2 - Full (outdoors + indoors)" };
 static const char* const kSmokeTests[] = {
 	"0 - Normal", "1 - Smoke in green", "2 - No muzzle flash light", "3 - Smoke not drawn", "4 - Nothing drawn at all",
 };
@@ -1253,6 +1369,7 @@ static const Choices* ChoicesFor(const char* section, const char* key) {
 		{ "Shaders.PBR.Main.SmithCorrelated", NAMES(kOffOnRestart) },
 		{ "Shaders.TAA.FSR.Version", NAMES(kFsrVersions) },
 		{ "Main.Main.RayTracing.PTRealtimeLevel", NAMES(kPtLevels) },	// UNOFFICIAL 2026-11-11 (the Advanced view's row; the simple view: "Path tracing preset")
+		{ "Main.Main.Quality.DeferredRenderer", NAMES(kDeferredModes) },
 	};
 	#undef NAMES
 	const auto found = kBySetting.find(std::string(section) + "." + key);
@@ -1434,7 +1551,6 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.ShadowsExteriors.RT", "Strength", "Shadow strength", nullptr, "How dark the traced sun shadows are." },
 	// Lamp shadows
 	{ "Shaders.ShadowsInteriors.RT", "Enabled", "Ray-traced lamp shadows", nullptr, "Lamp shadows traced with rays instead of the old shadow maps: sharper and no leaks. Takes effect after a restart." },
-	{ "Shaders.ShadowsInteriors.RT", "Live", "Use them now (off: the old shadows, to compare)", nullptr, "Switch between traced and old lamp shadows at once, to compare." },
 	{ "Shaders.ShadowsInteriors.RT", nullptr, "Shadow edges",
 		"Sharp: LampRadius=0.0 Rays=1 | Soft: LampRadius=4.0 Rays=1 | Soft, less grainy: LampRadius=4.0 Rays=4",
 		"Sharp: hard edges, the cheapest. Soft: lamps have a size, so edges blur with distance (a little grain that the anti-aliasing smooths). "
@@ -1449,18 +1565,12 @@ static const SimpleRow kSimpleRows[] = {
 		"Low: one bounce of light. Medium: less grain. High: light also bounces more than once indoors. Ultra: more than once outdoors too "
 		"(expensive)." },
 	{ "Shaders.AmbientOcclusion.RT", "GIStrength", "Bounce light strength", nullptr, "How much bounced light is added. Higher looks more vivid, less realistic." },
-	{ "Shaders.AmbientOcclusion.RT", "GIAmbient", "Bounce light from the sky (shows on cloudy days)", nullptr, "Lets sky light bounce too, so bounce light still shows on cloudy days and in shade." },
 	{ "Shaders.AmbientOcclusion.RT", "GIStrengthNight", "Bounce light strength at night", nullptr, "Outdoors at night, this replaces Bounce light strength. It blends in over dusk and dawn. -1 uses the daytime value." },
-	{ "Shaders.AmbientOcclusion.RT", "GISkyNight", "Bounce light on open ground at night", nullptr, "Outdoors at night, this replaces Bounce light on open ground. It blends in over dusk and dawn. -1 uses the daytime value." },
 	{ "Shaders.AmbientOcclusion.RT", "GIStrengthInterior", "Bounce light strength indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
-	{ "Shaders.AmbientOcclusion.RT", "GIAmbientInterior", "Bounce light from the sky indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
 	{ "Shaders.AmbientOcclusion.RT", "GIClampInterior", "Brightest single bounce indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
 	{ "Shaders.AmbientOcclusion.RT", "GIDistanceInterior", "Bounce light reach indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
 	{ "Shaders.AmbientOcclusion.RT", "GlowGIInterior", "Light from glowing surfaces indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
 	{ "Shaders.AmbientOcclusion.RT", "GlowDirectInterior", "Direct light from glowing objects indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
-	{ "Shaders.AmbientOcclusion.RT", "LegacyTiltInterior", "Darker shading (the old look) indoors", nullptr, "Indoors, this replaces the setting of the same name without Interior. -1 uses that setting indoors too." },
-	{ "Shaders.AmbientOcclusion.RT", "GISky", "Bounce light on open ground", nullptr, "Rays that reach the open sky bring sky light back, so open ground and roofs get bounce light and Bounce light strength changes them. Small values: 0.1 is plenty." },
-	{ "Shaders.AmbientOcclusion.RT", "LegacyTilt", "Darker ground shading (the old look)", nullptr, "Brings back the darker shading on the ground from older versions, without the dark triangle. 0.5 is a clear darkening; 1 is the old look exactly." },
 	// Reflections
 	{ "Shaders.Reflections.RT", "Enabled", "Ray-traced reflections", nullptr, "Rays fill in what normal reflections miss: things off screen or hidden behind something. Needs Reflections on." },
 	{ "Shaders.Reflections.RT", nullptr, "Surfaces that get rays",
@@ -1753,7 +1863,6 @@ static const SimpleRow kSimpleRows[] = {
 		"How sharp each lamp shadow is. Higher costs more video memory and frame rate." },
 	{ "Shaders.ShadowsInteriors.Main", "DrawDistance", "Lamp shadow distance", nullptr, "How far from you lamps still cast shadows." },
 	{ "Shaders.ShadowsInteriors.Main", "ContactShadows", "Lamp contact shadows (where props meet floors)", nullptr, "Adds small dark lines where props meet the floor or tables meet a wall. Off at zero." },
-	{ "Shaders.ShadowsInteriors.Main", "PlayerShadowFirstPerson", "Your own shadow in first person", nullptr, "Your body casts a lamp shadow even in first person." },
 	// Lamp shadows (Per-object shadows)
 	{ "Shaders.ShadowsInteriors.Forward", "Enabled", "Lamp shadows on each object", nullptr, "Each lamp shadows only its own light, so rooms keep their colours. Off gives the older flat darkening." },
 	{ "Shaders.ShadowsInteriors.Forward", "Strength", "Lamp shadow strength", nullptr, "How dark a lamp shadow is. At full strength it blocks all of that lamp's light." },
@@ -1779,25 +1888,26 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.CloudShadows.Main", "Speed", "Cloud shadow speed", nullptr, "How fast the shadows drift with the wind." },
 	{ "Shaders.CloudShadows.Main", "TileSize", "Cloud shadow size", nullptr, "Smaller gives smaller, more frequent cloud shadows. Larger gives big, slow ones." },
 	{ "Shaders.CloudShadows.Main", "WaterShadows", "Also on water", nullptr, "Cloud and mountain shadows also darken water. Shallow water darkens most." },
-	// Skin (Main)
-	{ "Shaders.Skin.Main", "SpecularStrength", "Skin shine", nullptr, "How strongly skin catches the light. Zero is flat and dry, high looks oily." },
-	{ "Shaders.Skin.Main", "Roughness", "Skin roughness (lower is oilier)", nullptr, "Lower gives tight, bright highlights. Higher gives a matte look." },
-	{ "Shaders.Skin.Main", "Scattering", "Skin softness (light under the skin)", nullptr, "Light spreads under the skin, softening the line between light and shadow, with a warm red edge." },
-	{ "Shaders.Skin.Main", "Translucency", "Light through ears and fingers", nullptr, "Thin parts such as ears and fingers glow red when the light is behind them." },
-	{ "Shaders.Skin.Main", "SkyReflection", "Sky reflection on skin", nullptr, "Skin reflects the sky at glancing angles. Outdoors only." },
+	// Skin (Main - outdoors)
+	{ "Shaders.Skin.Main", "SpecularStrength", "Skin shine (outdoors)", nullptr, "How strongly skin catches sunlight outdoors. Zero is flat and dry, high looks oily." },
+	{ "Shaders.Skin.Main", "Roughness", "Skin roughness (outdoors)", nullptr, "Outdoors: lower gives tight, oily highlights; higher gives a matte look." },
+	{ "Shaders.Skin.Main", "Scattering", "Skin softness (outdoors, per-pixel)", nullptr, "Outdoors: per-pixel skin softness. Replaced while Soft skin glow (ScreenSpace) is on." },
+	{ "Shaders.Skin.Main", "Translucency", "Backlit glow on ears/fingers (outdoors)", nullptr, "Outdoors: thin parts such as ears and fingers glow warm red when backlit." },
+	{ "Shaders.Skin.Main", "SkyReflection", "Sky reflection on skin (outdoors)", nullptr, "Skin reflects the sky at glancing angles. Outdoors only." },
 	{ "Shaders.Skin.Main", "RainWetness", "Wet skin in rain", nullptr, "How wet and shiny skin gets in the rain." },
 	{ "Shaders.Skin.Main", "VanillaMatchedHighlights", "Vanilla-strength skin highlights", nullptr, "One makes skin highlights as strong as the game's own; zero keeps the physically based strength." },
-	// Skin (Interiors)
-	{ "Shaders.Skin.Interiors", "SpecularStrength", "Skin shine", nullptr, "How strongly skin catches lamp light indoors. Zero is flat and dry, high looks oily." },
-	{ "Shaders.Skin.Interiors", "Roughness", "Skin roughness (lower is oilier)", nullptr, "Lower gives tight, bright highlights indoors. Higher gives a matte look." },
-	{ "Shaders.Skin.Interiors", "Scattering", "Skin softness (light under the skin)", nullptr, "Light spreads under the skin indoors, softening the edge of shadows." },
-	{ "Shaders.Skin.Interiors", "Translucency", "Light through ears and fingers", nullptr, "Ears and fingers glow red when a lamp is behind them." },
-	{ "Shaders.Skin.Interiors", "ScreenSpace", "Soft, waxy skin glow", nullptr, "Spreads light across the skin on screen for a softer, waxier look indoors." },
-	{ "Shaders.Skin.Interiors", "Width", "Skin glow spread", nullptr, "How far that soft glow spreads. Higher is softer and waxier." },
-	// Skin (Scattering)
-	{ "Shaders.Skin.Scattering", "ScreenSpace", "Soft, waxy skin glow", nullptr, "Spreads light across the skin on screen for a softer, waxier look outdoors." },
-	{ "Shaders.Skin.Scattering", "Width", "Skin glow spread", nullptr, "How far that soft glow spreads. Higher is softer and waxier." },
-	{ "Shaders.Skin.Scattering", "AlbedoDetail", "Skin texture detail kept", nullptr, "Keeps freckles, pores and stubble sharp. Lower blurs them into a waxy look." },
+	// Skin (Interiors - indoors)
+	{ "Shaders.Skin.Interiors", "SpecularStrength", "Skin shine (indoors)", nullptr, "How strongly skin catches lamp light indoors. Zero is flat and dry, high looks oily." },
+	{ "Shaders.Skin.Interiors", "Roughness", "Skin roughness (indoors)", nullptr, "Indoors: lower gives tight, oily highlights; higher gives a matte look." },
+	{ "Shaders.Skin.Interiors", "Scattering", "Skin softness (indoors, per-pixel)", nullptr, "Indoors: per-pixel skin softness. Replaced while Soft skin glow (ScreenSpace) is on." },
+	{ "Shaders.Skin.Interiors", "Translucency", "Backlit glow on ears/fingers (indoors)", nullptr, "Indoors: ears and fingers glow warm red when a lamp is behind them." },
+	{ "Shaders.Skin.Interiors", "ScreenSpace", "Soft skin glow (indoors)", nullptr, "Spreads light across skin on screen for a softer look indoors." },
+	{ "Shaders.Skin.Interiors", "Width", "Skin glow spread (indoors)", nullptr, "Indoors: how far the soft skin glow spreads. Higher is softer and waxier." },
+	{ "Shaders.Skin.Interiors", "AlbedoDetail", "Skin texture detail kept (indoors)", nullptr, "Indoors: keeps freckles, pores and stubble sharp. Lower blurs them into a waxy look." },
+	// Skin (Scattering - outdoors)
+	{ "Shaders.Skin.Scattering", "ScreenSpace", "Soft skin glow (outdoors)", nullptr, "Spreads light across skin on screen for a softer look outdoors." },
+	{ "Shaders.Skin.Scattering", "Width", "Skin glow spread (outdoors)", nullptr, "Outdoors: how far the soft skin glow spreads. Higher is softer and waxier." },
+	{ "Shaders.Skin.Scattering", "AlbedoDetail", "Skin texture detail kept (outdoors)", nullptr, "Outdoors: keeps freckles, pores and stubble sharp. Lower blurs them into a waxy look." },
 	// Cloth (Main)
 	{ "Shaders.Cloth.Main", "Enabled", "Moving cloth", nullptr, "Capes, coats, flags, banners and curtains sway. Needs a restart." },
 	{ "Shaders.Cloth.Main", "UseGameWind", "Follow the wind of the weather", nullptr, "Cloth moves with the weather's wind direction and strength outdoors." },
@@ -1814,28 +1924,6 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.PipboyFit.Main", "Enabled", "Sleeves fit under the Pip-Boy", nullptr, "In first person, armour sleeves are pulled in so they do not poke through the Pip-Boy. Needs a restart." },
 	{ "Shaders.PipboyFit.Main", "Strength", "Fit strength", nullptr, "How much the sleeves are pulled in. Zero leaves them as they were." },
 	{ "Shaders.PipboyFit.Main", "ThirdPerson", "Also in third person", nullptr, "Your own sleeves are fitted in third person too. Other characters are not changed." },
-	// Blood (Main)
-	{ "Shaders.BloodFlow.Main", "Splats", "Blood runs down walls", nullptr, "Blood splats grow streams that run down walls and slopes." },
-	{ "Shaders.BloodFlow.Main", "Pools", "Blood pools under bodies", nullptr, "A pool of blood spreads under a body after death and slides downhill on slopes." },
-	{ "Shaders.BloodFlow.Main", "BloodAmount", "Amount of blood", nullptr, "How much blood shows. Lower breaks it up into beads and thin streaks." },
-	{ "Shaders.BloodFlow.Main", "DripLength", "Blood stream length", nullptr, "How long blood streams run. Zero means no streams." },
-	{ "Shaders.BloodFlow.Main", "Gloss", "Blood shine", nullptr, "How much fresh blood glints in sun and lamp light. Dry blood stays dull." },
-	{ "Shaders.BloodFlow.Main", "FreshColorR", "Fresh blood colour", nullptr, "The colour of fresh blood." },
-	{ "Shaders.BloodFlow.Main", "DryColorR", "Dried blood colour", nullptr, "The colour blood dries to." },
-	{ "Shaders.BloodFlow.Main", "MaxDistance", "Blood distance", nullptr, "How far from you blood streams and pools are drawn. They fade out over the last stretch." },
-	// Blood (Fluid)
-	{ "Shaders.BloodFlow.Fluid", "Enabled", "Fluid blood (simulated, heavy)", nullptr, "Fresh blood is simulated as a real liquid that runs, gathers and drips. Costs a lot of frame rate." },
-	{ "Shaders.BloodFlow.Fluid", "Amount", "Amount of blood", nullptr, "How much liquid blood each splat and pool makes." },
-	{ "Shaders.BloodFlow.Fluid", "Viscosity", "Blood thickness", nullptr, "Higher gives thicker, slower blood that moves as one blob." },
-	{ "Shaders.BloodFlow.Fluid", "Drops", "Dripping drops", nullptr, "How much of the blood in the air shows as drops, such as dripping off ledges." },
-	{ "Shaders.BloodFlow.Fluid", nullptr, "Fluid blood detail",
-		"Low: MaxParticles=8192 | Medium: MaxParticles=16384 | High: MaxParticles=65536",
-		"How much liquid blood can exist at once. More looks fuller and costs more frame rate and memory." },
-	// Blood (Surface), UNOFFICIAL 2026-11-12
-	{ "Shaders.BloodFlow.Surface", "Enabled", "Blood lies on the ground (simulated)", nullptr, "Blood is simulated as a thin liquid on the ground it lies on: it runs into cracks and round stones, pools in hollows, and takes the light that is there. Replaces the drawn pools and streams." },
-	{ "Shaders.BloodFlow.Surface", "PoolAmount", "Amount of blood (bodies)", nullptr, "How much blood a body loses." },
-	{ "Shaders.BloodFlow.Surface", "SplatAmount", "Amount of blood (splats)", nullptr, "How much blood a fresh splat lays down." },
-	{ "Shaders.BloodFlow.Surface", "Viscosity", "Blood thickness", nullptr, "Higher gives thicker blood that creeps. Lower gives thin blood that runs fast and far." },
 	// Blood on weapon and hands (Main)
 	{ "Shaders.HandBlood.Main", "PerHit", "Blood on weapon and hands", nullptr, "Fresh blood nearby splashes onto your weapon and gloves. Higher gets you bloodier faster." },
 	{ "Shaders.HandBlood.Main", "Reach", "Distance blood reaches you", nullptr, "How close fresh blood must be to get on you. Small means point blank only." },
@@ -1951,7 +2039,6 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Precipitations.Main", "Refraction", "Drop distortion", nullptr, "How much raindrops bend and distort the view behind them." },
 	{ "Shaders.Precipitations.Main", "Coloring", "Rain brightness", nullptr, "Makes the rain brighter and more visible." },
 	// Snow (Main)
-	{ "Shaders.Snow.Main", "Flakes", "Snowfall amount", nullptr, "How many snowflakes fall." },
 	{ "Shaders.Snow.Main", "Speed", "Snowfall speed", nullptr, "How fast the snow falls." },
 	{ "Shaders.Snow.Main", "WorldSpace", "World-space snow", nullptr, "Flakes have a place in the world: the snow stays put when you turn. Off is the old snow." },
 	{ "Shaders.Snow.Main", "WorldFlakeSize", "Flake size", nullptr, "How big each flake is." },
@@ -2491,9 +2578,20 @@ static void DrawSimpleChoice(const SimpleRow& r) {
 		for (const auto& kv : options[i].Values) all = all && SimpleValueIs(r.Section, kv.first, kv.second);
 		if (all) current = i;
 	}
+	// Check member keys for any restart requirement or inactive state
+	RestartNote restart;
+	const char* why = nullptr;
+	if (!options.empty()) {
+		for (const auto& kv : options[0].Values) {
+			RestartNote n;
+			if (FindRestartNote(r.Section, kv.first.c_str(), n) && (!restart.text || n.pending)) restart = n;
+			if (!why) why = InactiveReason(r.Section, kv.first.c_str());
+		}
+	}
 	ImGui::PushID(r.Label);
-	MenuWidgets::RowBegin(r.Label, MenuWidgets::ResetSlotWidth());
-	ImGui::SetNextItemWidth(-FLT_MIN);
+	if (why) ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+	const float ctrlW = MenuWidgets::RowBegin(r.Label, MenuWidgets::ResetSlotWidth() + RestartNoteWidth(restart));
+	ImGui::SetNextItemWidth(ctrlW);
 	if (ImGui::BeginCombo("##choice", current >= 0 ? options[current].Name.c_str() : "Custom (set in Advanced)")) {
 		for (int i = 0; i < (int)options.size(); i++) {
 			if (!ImGui::Selectable(options[i].Name.c_str(), i == current)) continue;
@@ -2505,7 +2603,20 @@ static void DrawSimpleChoice(const SimpleRow& r) {
 		}
 		ImGui::EndCombo();
 	}
-	if (r.Tip && (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())) WrappedTooltip(r.Tip);
+	const bool hovered = ImGui::IsItemHovered();
+	if (why) ImGui::PopStyleColor();
+	if (restart.text) {
+		ImGui::SameLine();
+		DrawRestartNote(restart);
+	}
+	if (hovered || MenuWidgets::RowLabelHovered()) {
+		std::string tip = r.Tip ? r.Tip : "";
+		if (why) {
+			if (!tip.empty()) tip += "\n\nNot active now: ";
+			tip += why;
+		}
+		if (!tip.empty()) WrappedTooltip(tip.c_str());
+	}
 	ImGui::PopID();
 }
 
@@ -2599,6 +2710,22 @@ static const std::unordered_map<std::string, FloatRange> kFloatSliders = {
 	// UNOFFICIAL 2026-11-06 Bend contact shadows: where they start (0 = where the shadow maps end) and how long they fade in
 	{ "Shaders.ShadowsExteriors.ScreenSpace.StartDistance", { 0.0f, 40000.0f, "%.0f" } },
 	{ "Shaders.ShadowsExteriors.ScreenSpace.FadeLength", { 100.0f, 10000.0f, "%.0f" } },
+	// Skin sliders (Width = 28.6 default was nearly immobile at 0.001 drag speed)
+	{ "Shaders.Skin.Main.SpecularStrength", { 0.0f, 2.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.Roughness", { 0.1f, 1.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.Scattering", { 0.0f, 4.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.Translucency", { 0.0f, 2.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.SkyReflection", { 0.0f, 2.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.RainWetness", { 0.0f, 1.0f, "%.2f" } },
+	{ "Shaders.Skin.Main.VanillaMatchedHighlights", { 0.0f, 1.0f, "%.2f" } },
+	{ "Shaders.Skin.Interiors.SpecularStrength", { 0.0f, 2.0f, "%.2f" } },
+	{ "Shaders.Skin.Interiors.Roughness", { 0.1f, 1.0f, "%.2f" } },
+	{ "Shaders.Skin.Interiors.Scattering", { 0.0f, 4.0f, "%.2f" } },
+	{ "Shaders.Skin.Interiors.Translucency", { 0.0f, 2.0f, "%.2f" } },
+	{ "Shaders.Skin.Interiors.Width", { 0.0f, 80.0f, "%.1f" } },
+	{ "Shaders.Skin.Interiors.AlbedoDetail", { 0.0f, 1.0f, "%.2f" } },
+	{ "Shaders.Skin.Scattering.Width", { 0.0f, 80.0f, "%.1f" } },
+	{ "Shaders.Skin.Scattering.AlbedoDetail", { 0.0f, 1.0f, "%.2f" } },
 };
 
 // ---- Setting rows ------------------------------------------------------------------------------------------------------------
@@ -2710,8 +2837,18 @@ static bool DrawFloatSetting(SettingRow& row, bool isShader) {
 	bool edited;
 	if (modes) edited = RenderScaleCombo(node.Section, value);
 	else if (range != kFloatSliders.end()) edited = ImGui::SliderFloat("##v", &value, lo, hi, range->second.Format, ImGuiSliderFlags_AlwaysClamp);
-	else if (limited) edited = ImGui::DragFloat("##v", &value, 0.001f, lo, hi, "%.4f", ImGuiSliderFlags_AlwaysClamp);
-	else edited = ImGui::DragFloat("##v", &value, 0.001f, 0.0f, 0.0f, "%.4f");
+	else if (limited) {
+		const float span = hi - lo;
+		const float speed = ImClamp(span * 0.002f, 0.001f, 5.0f);
+		const char* fmt = span >= 100.0f ? "%.1f" : span >= 10.0f ? "%.2f" : span >= 1.0f ? "%.3f" : "%.4f";
+		edited = ImGui::DragFloat("##v", &value, speed, lo, hi, fmt, ImGuiSliderFlags_AlwaysClamp);
+	}
+	else {
+		const float mag = fabsf(value);
+		const float speed = ImClamp(mag * 0.005f, 0.002f, 2.0f);
+		const char* fmt = mag >= 100.0f ? "%.1f" : mag >= 10.0f ? "%.2f" : "%.3f";
+		edited = ImGui::DragFloat("##v", &value, speed, 0.0f, 0.0f, fmt);
+	}
 	if (edited) Store(node, value);
 
 	const bool hovered = ImGui::IsItemHovered();
@@ -3082,7 +3219,9 @@ static void NewWalk(const tomlValue& table, const std::string& path, NewWalkCont
 		entry.Section = path;
 		entry.Key = name;
 		entry.Date = date;
-		entry.Diagnostic = NewIsDiagnostic(name, description, ctx.Diagnostics, path);
+		const bool isSimple = SimpleLabel(path.c_str(), name.c_str()) != nullptr;
+		entry.Diagnostic = !isSimple && (IsDeadSetting(path.c_str(), name.c_str()) ||
+			IsDevOnlySetting(path, name) || NewIsDiagnostic(name, description, ctx.Diagnostics, path));
 		if (status) {
 			entry.Status = true;
 			const size_t dot = path.find('.', 8);
@@ -3302,20 +3441,33 @@ static std::string SearchQueryText() {
 static bool SearchActive() { return !SearchQueryText().empty(); }
 
 // The same tree as the sidebar (FillMenuSections / FillMenuSettings, the same hidden sections and keys), leaves only.
+static std::string MenuEntryLabel(const std::string& name);
+static std::string MenuSectionLabel(const std::string& path, const std::string& name);
+static std::string ShownText(const std::string& label);
+
 static void SearchIndexSection(const std::string& path, const std::string& name, bool parentIsShaders) {
 	if (ShouldHideSection(name)) return;
 	StringList children;
 	TheSettingManager->FillMenuSections(&children, path.c_str());
 	if (children.empty()) {
+		std::string secExtra = ShownText(MenuSectionLabel(path, name));
+		if (path.compare(0, 8, "Shaders.") == 0) {
+			const size_t dot = path.find('.', 8);
+			const std::string shader = path.substr(8, dot == std::string::npos ? std::string::npos : dot - 8);
+			secExtra += " " + ShownText(MenuEntryLabel(shader));
+		}
 		SettingManager::Configuration::SettingList page;
 		TheSettingManager->FillMenuSettings(&page, path.c_str());
-		for (const auto& setting : page)
-			if (!ShouldHideKey(setting.Key))
-				s_searchIndex.push_back({ path, setting.Key, SearchLower(path + "." + setting.Key), false, std::string() });
+		for (const auto& setting : page) {
+			if (ShouldHideKey(setting.Key)) continue;
+			std::string hay = path + "." + setting.Key + " " + secExtra;
+			if (const char* plain = SimpleLabel(path.c_str(), setting.Key)) { hay += ' '; hay += plain; }
+			s_searchIndex.push_back({ path, setting.Key, SearchLower(hay), false, std::string() });
+		}
 		return;
 	}
 	if (parentIsShaders && TheSettingManager->GetMenuShaderSwitch(name.c_str()) != SettingManager::MenuSwitch::None)
-		s_searchIndex.push_back({ path + ".Status", "Enabled", SearchLower(path + ".Enabled on off"), true, name });	// the sidebar's checkbox
+		s_searchIndex.push_back({ path + ".Status", "Enabled", SearchLower(path + ".Enabled on off " + ShownText(MenuEntryLabel(name))), true, name });	// the sidebar's checkbox
 	for (const std::string& child : children)
 		SearchIndexSection(path + "." + child, child, path == "Shaders");
 }
@@ -3754,40 +3906,6 @@ static const MenuGroup kMenuGroups[] = {
 	{ "Shaders.Bodycam.Interiors", "Camera movement", "MotionBlur, RollingShutter, Bounce, GunJolt",
 		FogType::None, false, "Indoors: bob, smear, wobble and shot kick.", nullptr },
 
-	// Shaders.BloodFlow.Main
-	{ "Shaders.BloodFlow.Main", "Streams", "DripLength, FlowSpeed, Viscosity, MaxFall, StreamWidth, DryTime",
-		FogType::None, true, "How far and how fast blood runs down walls and slopes from a splat, and how soon it dries.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Pools", "PoolSize, PoolSpreadTime, PoolDryTime, GibPools, GibHold",
-		FogType::None, false, "The pools that spread under bodies and cut-off limbs.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Splat shape", "Splat, SplatReach, SplatSpray, SplatDrips",
-		FogType::None, false, "Each splat gets its own impact shape, with arms, spray lines and drips.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Colour",
-		"FreshColorR, FreshColorG, FreshColorB, DryColorR, DryColorG, DryColorB, MatchGameColor, MatchShade, MatchBrightness, MatchFloor",
-		FogType::None, false, "The colour of fresh and dried blood, or the game's own splat colour.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Wet look", "Gloss, Sheen, SheenTint, Beads, BeadSize, OldLook",
-		FogType::None, false, "How fresh blood shines and mirrors its surroundings, and its glossy drops.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Limits and speed",
-		"CheapGather, SplatFast, SplatMask, Merge, MergeCount, MaxDistance, MaxSplats, MaxPools",
-		FogType::None, false, "How many splats and pools are drawn and how far away, and cheaper ways to draw them.", nullptr },
-	{ "Shaders.BloodFlow.Main", "Test tools", "GroundTestUnseen, TestSplats, DebugView",
-		FogType::None, false, nullptr, nullptr },
-
-	// Shaders.BloodFlow.Fluid
-	{ "Shaders.BloodFlow.Fluid", "How the blood flows", "SettleTime, BleedTime, Viscosity, Cling, Friction, Lifetime",
-		FogType::None, true, "How long the blood keeps moving, how thick it is and how it clings to walls.", nullptr },
-	{ "Shaders.BloodFlow.Fluid", "Fluid look", "StainSize, Threshold, Bump, Drops, DropSize, TextureRelief, SteadyContact, SteadyFloor, RestSpeed, SteadyTiles, TileCap",
-		FogType::None, false, "How the fluid's stains, edges and drops look.", nullptr },
-	{ "Shaders.BloodFlow.Fluid", "Test tools", "OldThrow, OldColour, DebugView, TestThrow, TestPour, StatsEvery",
-		FogType::None, false, nullptr, nullptr },
-
-	// Shaders.BloodFlow.Surface (UNOFFICIAL 2026-11-12)
-	{ "Shaders.BloodFlow.Surface", "How the blood flows", "SplatAmount, PoolAmount, BleedTime, FlowTime, Viscosity, Roughness",
-		FogType::None, true, "How much blood there is, how long it keeps moving and how thick it is.", nullptr },
-	{ "Shaders.BloodFlow.Surface", "Limits and light", "Lifetime, MaxPatches, UseAlbedo",
-		FogType::None, false, "How long blood stays, how many pools are kept, and where its light comes from.", nullptr },
-	{ "Shaders.BloodFlow.Surface", "Test tools", "DebugView, TestPour",
-		FogType::None, false, nullptr, nullptr },
-
 	// Shaders.AmbientOcclusion.RT
 	{ "Shaders.AmbientOcclusion.RT", "Sky visibility", "Sky, SkyRays, SkyDistance",
 		FogType::None, false, "How much of the sky each spot sees, from rays instead of a top-down map.", nullptr },
@@ -4025,10 +4143,10 @@ static void RenderShaderHeaderSwitch(const std::string& shaderName) {
 	bool on = TheSettingManager->GetMenuShaderEnabled(shader);
 	const bool forced = TheSettingManager->IsShaderForced(shader);
 
-	// Cloth and the like are read at start: the same note as on their Main page, left of the switch
+	// Effects read at start (Main.Enabled or Status.Enabled): show the restart note left of the switch
 	RestartNote note;
-	const bool noted = kind == SettingManager::MenuSwitch::MainEnabled &&
-		FindRestartNote(("Shaders." + shaderName + ".Main").c_str(), "Enabled", note);
+	const std::string switchSec = "Shaders." + shaderName + (kind == SettingManager::MenuSwitch::MainEnabled ? ".Main" : ".Status");
+	const bool noted = FindRestartNote(switchSec.c_str(), "Enabled", note);
 	const float gap = ImGui::GetStyle().ItemSpacing.x;
 	const float wanted = MenuWidgets::ToggleWidth() + (noted ? ImGui::CalcTextSize(note.text).x + gap : 0.0f);
 	ImGui::SameLine();
@@ -4243,6 +4361,7 @@ struct PageEntry {
 // the fog-type switches are not drawn and the simple view's multi-key choices are left to the
 // section's own page.
 static bool s_keySubset = false;
+static bool s_inCategoryPage = false;
 
 static void RenderSimpleList(SettingManager::Configuration::SettingList& settings, bool isShader) {
 	int shown = 0, rows = 0;
@@ -4255,7 +4374,7 @@ static void RenderSimpleList(SettingManager::Configuration::SettingList& setting
 		}
 		for (size_t i = 0; i < settings.size(); i++) {
 			if (strcmp(settings[i].Key, r.Key)) continue;
-			if (InternalHidden(settings[i].Section, settings[i].Key)) continue;	// UNOFFICIAL 2026-11-12: not in a simple view either
+			if (InternalHidden(settings[i].Section, settings[i].Key) || IsDeadSetting(settings[i].Section, settings[i].Key)) continue;	// UNOFFICIAL 2026-11-12: not in a simple view either
 			// A colour (its R key listed): the page's colour wheel for R, G and B, under the plain name
 			const std::string key(r.Key), prefix = key.substr(0, key.size() - 1);
 			SettingManager::Configuration::ConfigNode *g = nullptr, *b = nullptr;
@@ -4274,9 +4393,11 @@ static void RenderSimpleList(SettingManager::Configuration::SettingList& setting
 			}
 		}
 	}
-	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
-	if (rows > shown)
-		ImGui::TextDisabled("%d more setting%s here with Advanced on (top row)", rows - shown, rows - shown == 1 ? "" : "s");
+	if (!s_inCategoryPage) {
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
+		if (rows > shown)
+			ImGui::TextDisabled("%d more setting%s here with Advanced on (top row)", rows - shown, rows - shown == 1 ? "" : "s");
+	}
 }
 
 static void RenderSettingsList(SettingManager::Configuration::SettingList& settings) {
@@ -4373,6 +4494,7 @@ static void RenderSettingsList(SettingManager::Configuration::SettingList& setti
 struct MenuMove { const char* name; const char* under; const char* label; };
 static const MenuMove kMenuMoves[] = {
 	{ "CloudShadows", "ShadowsExteriors", "Cloud Shadows (flat clouds)" },
+	{ "ContactHardening", "ShadowsExteriors", "Contact hardening (soft sun edges)" },
 	{ "Foliage", "Plants", "Foliage glow" },
 	{ "DustMotes", "VolumetricFog", "Dust motes" },	// 2026-11-04 (user: "make motes live under vol fog")
 	{ "LocalExposure", "Exposure", "Local exposure" },	// 2026-11-04 (it works with the exposure)
@@ -4494,8 +4616,12 @@ static RtStatusLine RtLampLine() {
 	return { RtState::Running, "running", detail };
 }
 
-// Ambient light uses the RT occlusion and bounce light unless its own ComputeGI is on (then it keeps its screen search).
-static bool RtComputeGIInWay() { return TheSettingManager->GetMenuShaderEnabled("AmbientLight") && RtOn("Shaders.AmbientLight.Main", "ComputeGI"); }
+// Ambient light uses the RT occlusion and bounce light unless its own ComputeGI is actually active (needs DXVK fork).
+static bool RtComputeGIInWay() {
+	if (!TheSettingManager->GetMenuShaderEnabled("AmbientLight")) return false;
+	AmbientLightEffect* al = TheShaderManager->Effects.AmbientLight;
+	return al ? al->GIActive() : (DxvkCompute::Available() && RtOn("Shaders.AmbientLight.Main", "ComputeGI"));
+}
 
 static RtStatusLine RtAOLine() {
 	const char* s = "Shaders.AmbientOcclusion.RT";
@@ -4530,10 +4656,6 @@ static RtStatusLine RtGILine() {
 	if (RtComputeGIInWay()) return { RtState::Blocked, "on, but Ambient light's ComputeGI is on: it replaces the RT bounce light", detail };
 	if (RtPathTrace::Replacing())	// UNOFFICIAL 2026-11-13
 		return { RtState::Blocked, "not shown while path tracing is on: the path tracer has its own bounce light. Switch path tracing off to see it", detail };
-	const ShaderConstants& sc = TheShaderManager->ShaderConst;
-	const bool weakSun = TheShaderManager->GameState.isExterior && (sc.SunDir.z <= 0.0f || sc.SunAmount.x < 0.3f);
-	if (weakSun && TheSettingManager->GetSettingF(s, "GIAmbient") <= 0.0f)
-		return { RtState::Blocked, "running, but the sun is weak now (cloud, dusk or night) and GIAmbient is 0: only lamps give bounce light", detail };
 	return { RtState::Running, RtOn(s, "RadianceCache") ? "running (more than one bounce: RadianceCache)" : "running (one bounce)", detail };
 }
 
@@ -4732,7 +4854,7 @@ static void RenderRayTracingPage() {
 	DrawPtOverview();	// UNOFFICIAL 2026-11-12: "What still applies with path tracing" (only while path tracing is on)
 
 	DrawRtMasterSwitch();
-	DrawRtDebugPicker();
+	if (DevOptionsShown()) DrawRtDebugPicker();
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y));
 
 	// The five sections' own rows, each under its header, drawn as their pages draw them (the groups read the page shown)
@@ -4967,8 +5089,22 @@ static const RtSharedBlock kRtSharedBlocks[] = {
 	{ "Shaders.VolumetricLight.RT", &kShaftsSharedFolder },
 };
 
+static bool VisualFolderHasVisibleItems(const VisualFolder& f) {
+	for (const VisualItem& item : f.Items) {
+		if (!strcmp(item.Section, "@effect")) return true;
+		if (ShelvedEffects::Section(item.Section)) continue;
+		SettingManager::Configuration::SettingList rows;
+		TheSettingManager->FillMenuSettings(&rows, item.Section);
+		for (const auto& r : rows)
+			if (VisualKeyWanted(item.Keys, item.Section, r.Key) && !ShouldHideKey(r.Key) && !InternalHidden(r.Section, r.Key))
+				return true;
+	}
+	return false;
+}
+
 static void DrawRtSharedBlock(const RtSharedBlock& b) {
 	const VisualFolder& f = *b.Source;
+	if (!VisualFolderHasVisibleItems(f)) return;
 	const std::string header = std::string("Also used here: ") + f.Title + "###rtshared/page/" + b.Rt + "/" + f.Title;
 	if (!MenuWidgets::SubHeader(header.c_str(), false)) return;
 	ImGui::PushID(f.Title);
@@ -5078,9 +5214,6 @@ static const DebugViewKey kDebugViews[] = {
 	{ "Shaders.VolumetricClouds.Main", "ShadowDebug", "Cloud shadow" },
 	{ "Shaders.VolumetricClouds.Main", "ReflectionDebug", "Cloud reflections" },
 	{ "Shaders.HandBlood.Main", "DebugView", "Hand blood" },
-	{ "Shaders.BloodFlow.Main", "DebugView", "Blood flow" },
-	{ "Shaders.BloodFlow.Fluid", "DebugView", "Blood fluid" },
-	{ "Shaders.BloodFlow.Surface", "DebugView", "Blood surface" },
 	{ "Shaders.Skin.Debug", "DebugView", "Skin" },
 	{ "Shaders.SnowAccumulation.Main", "CapturedNormalsDebugView", "Snow normals" },
 	{ "Shaders.Terrain.Blending", "DebugView", "Terrain blending" },
@@ -5184,14 +5317,18 @@ static void RenderHidingNotes() {
 		lines.push_back({ "A debug view is on (" + views + "): it replaces or tints the normal picture.", "Turn debug views off", reset });
 	for (const ConflictRule& r : kConflictRules) {
 		if (!r.Applies || !r.Applies()) continue;	// (the always-on ones are warnings for the moment of switching, not hiders)
+		// When AmbientLight and AmbientOcclusion/BounceLight are both on, the AmbientOcclusion/BounceLight rules already offer to turn the unused one off; don't emit a second contradictory button for AmbientLight
+		if (!strcmp(r.Section, "Shaders.AmbientLight.Status") && !strcmp(r.Key, "Enabled")) continue;
 		const bool boolean = !strcmp(r.Value, "true");
 		const bool at = boolean ? SettingOn(r.Section, r.Key) : TheSettingManager->GetSettingI(r.Section, r.Key) == atoi(r.Value);
 		if (!at) continue;
 		const std::string section(r.Section);
 		const bool status = boolean && !strcmp(r.Key, "Enabled") && section.size() > 15 && section.rfind("Shaders.", 0) == 0 &&
 			section.compare(section.size() - 7, 7, ".Status") == 0;
-		lines.push_back({ r.Text, boolean ? "Turn it off" : "",
-			status ? "!effectoff:" + section.substr(8, section.size() - 15) : boolean ? section + "/" + r.Key + "=false" : std::string() });
+		const std::string fxName = status ? section.substr(8, section.size() - 15) : std::string();
+		const std::string btn = status ? ("Turn " + fxName + " off") : boolean ? "Turn it off" : "";
+		lines.push_back({ r.Text, btn,
+			status ? "!effectoff:" + fxName : boolean ? section + "/" + r.Key + "=false" : std::string() });
 	}
 	if (lines.empty()) return;
 
@@ -5216,12 +5353,1039 @@ static void RenderHidingNotes() {
 	}
 }
 
+// ---- Unified Ambient Occlusion & Bounce Light page -----------------------------------------------------------------------
+// One clean place to pick your AO, Sky Occlusion, and Bounce Light (GI) modes without colliding effects. Writes canonical
+// TOML keys underneath so existing presets and user configs remain 100% compatible.
+static const char* const kAoTabId = "@IndirectLighting";
+static const char* const kQuickTabId = "@QuickSettings";
+
+static void SetShaderEnabled(const char* shader, bool wantOn) {
+	if (TheSettingManager->GetMenuShaderEnabled(shader) != wantOn)
+		TheShaderManager->SwitchShaderStatus(shader);
+}
+
+static int DetectAoMode() {
+	const bool al = EffectOn("AmbientLight");
+	const bool ao = EffectOn("AmbientOcclusion");
+	if (!al && !ao) return 0;
+	const bool rtOn = RtOn("Shaders.AmbientOcclusion.RT", "Enabled");
+	const bool rtAoActive = rtOn && (!al || RtOn("Shaders.AmbientOcclusion.RT", "OcclusionOnD3D9") ||
+		TheSettingManager->SettingsMain.Main.NvrDxvkAmbientLight) && !(al && RtComputeGIInWay());
+	if (rtAoActive) return 4;
+	if (al) return 1;
+	if (RtOn("Shaders.AmbientOcclusion.GTAO", "Enabled")) return 2;
+	return 3;
+}
+
+static int DetectSkyOcclusionMode() {
+	if (!RtOn("Shaders.AmbientOcclusion.Skylighting", "Enabled")) return 0;
+	if (RtOn("Shaders.AmbientOcclusion.RT", "Enabled") && RtOn("Shaders.AmbientOcclusion.RT", "Sky")) return 2;
+	return 1;
+}
+
+static int DetectBounceLightMode() {
+	const bool al = EffectOn("AmbientLight");
+	if (al && RtOn("Shaders.AmbientLight.Main", "ComputeGI")) return 1;
+	if (al && RtOn("Shaders.AmbientOcclusion.RT", "Enabled") && RtOn("Shaders.AmbientOcclusion.RT", "GI")) return 2;
+	if (al && (SettingF("Shaders.AmbientLight.Main", "GridBounce") > 0.0f || SettingF("Shaders.AmbientLight.Main", "GridLamps") > 0.0f)) return 3;
+	if (!al && EffectOn("BounceLight")) return 4;
+	return 0;
+}
+
+static const char* const kAoModeNames[] = {
+	"Off",
+	"Ambient Light (all-in-one, recommended)",
+	"Standalone GTAO (screen-space)",
+	"Standalone Legacy AO (HBAO)",
+	"Ray-traced AO (RTX + DXVK)"
+};
+static const char* const kSkyModeNames[] = {
+	"Off",
+	"Top-down sky map (fast)",
+	"Ray-traced sky occlusion (RTX + DXVK)"
+};
+static const char* const kBounceModeNames[] = {
+	"Off",
+	"Screen-space GI (ComputeGI, needs DXVK fork)",
+	"Ray-traced GI (RTX + DXVK)",
+	"3D Light Grid (sun + lamp grid)",
+	"Standalone BounceLight (legacy)"
+};
+
+static void DrawIndirectLightingPickers() {
+	const int aoMode = DetectAoMode();
+	const int skyMode = DetectSkyOcclusionMode();
+	const int giMode = DetectBounceLightMode();
+
+	// 1. Ambient Occlusion mode
+	ImGui::PushID("ao_mode");
+	const float w1 = MenuWidgets::RowBegin("Ambient occlusion", MenuWidgets::ResetSlotWidth());
+	ImGui::SetNextItemWidth(w1);
+	const int pickedAo = NamePicker("##aomode", kAoModeNames[aoMode], kAoModeNames, 5, aoMode);
+	if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+		WrappedTooltip("Controls corner and crevice shading.\n\n"
+			"Ambient Light: fast all-in-one GTAO pass that also hosts ComputeGI, Light Grid, and RT GI.\n"
+			"Standalone GTAO / Legacy AO: separate AmbientOcclusion effect (disables AmbientLight).\n"
+			"Ray-traced AO: traced occlusion with zero screen-edge halos (requires RTX + DXVK fork).");
+	ImGui::PopID();
+	if (pickedAo >= 0 && pickedAo != aoMode) {
+		if (pickedAo == 0) {
+			SetShaderEnabled("AmbientLight", false);
+			SetShaderEnabled("AmbientOcclusion", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+		}
+		else if (pickedAo == 1) {
+			SetShaderEnabled("AmbientLight", true);
+			SetShaderEnabled("AmbientOcclusion", false);
+			if (!RtOn("Shaders.AmbientOcclusion.RT", "GI") && !RtOn("Shaders.AmbientOcclusion.RT", "Sky"))
+				TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "OcclusionOnD3D9", false);
+		}
+		else if (pickedAo == 2 || pickedAo == 3) {
+			SetShaderEnabled("AmbientLight", false);
+			SetShaderEnabled("AmbientOcclusion", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Exteriors", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Interiors", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.GTAO", "Enabled", pickedAo == 2);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+		}
+		else if (pickedAo == 4) {
+			SetShaderEnabled("AmbientLight", true);
+			SetShaderEnabled("AmbientOcclusion", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "OcclusionOnD3D9", true);
+		}
+		TheSettingManager->LoadSettings();
+	}
+
+	// 2. Sky Occlusion mode
+	ImGui::PushID("sky_mode");
+	const float w2 = MenuWidgets::RowBegin("Sky occlusion", MenuWidgets::ResetSlotWidth());
+	ImGui::SetNextItemWidth(w2);
+	const int pickedSky = NamePicker("##skymode", kSkyModeNames[skyMode], kSkyModeNames, 3, skyMode);
+	if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+		WrappedTooltip("Outdoors, darkens ambient sky light under porches, roofs, bridges and overhangs.\n"
+			"Top-down sky map is fast and works on every GPU. Ray-traced sky occlusion uses rays for exact multi-story cover.");
+	ImGui::PopID();
+	if (pickedSky >= 0 && pickedSky != skyMode) {
+		if (pickedSky == 0) {
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Skylighting", "Enabled", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Sky", false);
+		}
+		else if (pickedSky == 1) {
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Skylighting", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Sky", false);
+			if (!EffectOn("AmbientLight") && !EffectOn("AmbientOcclusion")) SetShaderEnabled("AmbientLight", true);
+		}
+		else if (pickedSky == 2) {
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Skylighting", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Sky", true);
+			if (!EffectOn("AmbientLight") && !EffectOn("AmbientOcclusion")) SetShaderEnabled("AmbientLight", true);
+		}
+		TheSettingManager->LoadSettings();
+	}
+
+	// 3. Bounce Light (GI) mode
+	ImGui::PushID("gi_mode");
+	const float w3 = MenuWidgets::RowBegin("Bounce light (GI)", MenuWidgets::ResetSlotWidth());
+	ImGui::SetNextItemWidth(w3);
+	const int pickedGi = NamePicker("##gimode", kBounceModeNames[giMode], kBounceModeNames, 5, giMode);
+	if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+		WrappedTooltip("Indirect light bouncing off lit surfaces onto nearby ones.\n\n"
+			"Screen-space GI (ComputeGI): fast screen-space bounce light on the DXVK fork.\n"
+			"Ray-traced GI: off-screen accurate bounce light and glowing signs (RTX + DXVK fork).\n"
+			"3D Light Grid: soft sun and lamp bounce spread through a 3D grid around you.\n"
+			"Standalone BounceLight: legacy separate effect (disables AmbientLight).");
+	ImGui::PopID();
+	if (pickedGi >= 0 && pickedGi != giMode) {
+		if (pickedGi == 0) {
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "GridBounce", 0.0f);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "GridLamps", 0.0f);
+			SetShaderEnabled("BounceLight", false);
+		}
+		else if (pickedGi == 1) {
+			SetShaderEnabled("AmbientLight", true);
+			SetShaderEnabled("BounceLight", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+		}
+		else if (pickedGi == 2) {
+			SetShaderEnabled("AmbientLight", true);
+			SetShaderEnabled("BounceLight", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", true);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", true);
+		}
+		else if (pickedGi == 3) {
+			SetShaderEnabled("AmbientLight", true);
+			SetShaderEnabled("BounceLight", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+			if (SettingF("Shaders.AmbientLight.Main", "GridBounce") <= 0.0f)
+				TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "GridBounce", 0.7f);
+			if (SettingF("Shaders.AmbientLight.Main", "GridLamps") <= 0.0f)
+				TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "GridLamps", 0.5f);
+		}
+		else if (pickedGi == 4) {
+			SetShaderEnabled("AmbientLight", false);
+			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
+			SetShaderEnabled("BounceLight", true);
+		}
+		TheSettingManager->LoadSettings();
+	}
+}
+
+static void RenderIndirectLightingPage() {
+	PageTitle("Ambient occlusion & bounce light",
+		"Choose one mode for corner shading (AO), sky occlusion under roofs, and bounce light (GI). All modes write standard settings underneath.");
+
+	if (RtPathTrace::Replacing()) {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+			"Path tracing is active: the path tracer computes its own occlusion and bounce light. Turn path tracing off to see these modes.");
+		ImGui::PopTextWrapPos();
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	DrawIndirectLightingPickers();
+
+	const int aoMode = DetectAoMode();
+	const int skyMode = DetectSkyOcclusionMode();
+	const int giMode = DetectBounceLightMode();
+
+	// Live status hints when requirements are missing
+	if (giMode == 1 && !DxvkCompute::Available()) {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(kRestartOrange, "Screen-space GI (ComputeGI) needs the DXVK fork's d3d9.dll (not loaded in this session).");
+		ImGui::PopTextWrapPos();
+	}
+	if ((aoMode == 4 || skyMode == 2 || giMode == 2) && !RtCore::Running()) {
+		DrawRtStatusLine("Ray tracing", RtCoreLine());
+	}
+	if (giMode == 2) DrawRtStatusLine("RT Bounce", RtGILine());
+	if (aoMode == 4) DrawRtStatusLine("RT AO", RtAOLine());
+
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	ImGui::Separator();
+
+	// Active tuning blocks in 2 columns when wide enough (zero dead space)
+	const int cols = ImGui::GetContentRegionAvail().x > ImGui::GetFontSize() * 55.0f ? 2 : 1;
+	if (ImGui::BeginTable("##il_tuning", cols, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_PadOuterX)) {
+		ImGui::TableNextColumn();
+		if (aoMode == 1 && MenuWidgets::SubHeader("Ambient occlusion tuning (Ambient Light)###il_ao_al", true)) {
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance, DarkestOcclusion", nullptr }, false);
+		}
+		else if ((aoMode == 2 || aoMode == 3) && MenuWidgets::SubHeader("Ambient occlusion tuning (Standalone)###il_ao_sa", true)) {
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Exteriors", "Enabled, StrengthMultiplier, Range, ClampStrength", "Outdoors" }, true);
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Interiors", "Enabled, StrengthMultiplier, Range, ClampStrength", "Indoors" }, true);
+			if (aoMode == 2) DrawVisualItem({ "Shaders.AmbientOcclusion.GTAO", "Enabled, MaxRadius", "GTAO" }, true);
+		}
+		else if (aoMode == 4 && MenuWidgets::SubHeader("Ambient occlusion tuning (Ray-traced)###il_ao_rt", true)) {
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "RayCount, Distance, OcclusionOnD3D9", nullptr }, false);
+			if (EffectOn("AmbientLight"))
+				DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius", "Strength" }, true);
+		}
+
+		if (skyMode > 0 && MenuWidgets::SubHeader("Sky occlusion tuning###il_sky", true)) {
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Skylighting", "Strength, Distance, Reflections", nullptr }, false);
+			if (skyMode == 2) DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "SkyRays, SkyDistance", "Ray-traced sky" }, true);
+		}
+
+		ImGui::TableNextColumn();
+		if (giMode == 1 && MenuWidgets::SubHeader("Bounce light tuning (ComputeGI)###il_gi_ssgi", true)) {
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "ComputeGIStrength, ComputeGIQuality, ComputeGIThickness, ComputeGIThinOcclusion", nullptr }, false);
+		}
+		else if (giMode == 2 && MenuWidgets::SubHeader("Bounce light tuning (Ray-traced GI)###il_gi_rt", true)) {
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, RadianceCache, CacheExteriors, GIStrengthNight, GIStrengthInterior, GlowGI, GlowDirect", nullptr }, false);
+		}
+		else if (giMode == 3 && MenuWidgets::SubHeader("Bounce light tuning (3D Light Grid)###il_gi_grid", true)) {
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "GridBounce, GridLamps, GridSpread, GridColour", nullptr }, false);
+		}
+		else if (giMode == 4 && MenuWidgets::SubHeader("Bounce light tuning (Standalone)###il_gi_sa", true)) {
+			DrawVisualItem({ "Shaders.BounceLight.Main", "Strength, Radius, BlurRadius, QuarterResolution, Temporal", nullptr }, false);
+		}
+		else if (giMode == 0) {
+			ImGui::TextDisabled("Bounce light is currently off. Pick a Bounce light (GI) mode above to tune it.");
+		}
+		ImGui::EndTable();
+	}
+
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	ImGui::TextDisabled("Tip: Turn on Advanced (top right) to access every fine-tuning parameter in AmbientLight / AmbientOcclusion / BounceLight.");
+}
+
+// ---- Quick Settings & Status landing page --------------------------------------------------------------------------------
+static int DetectAaUpscalerMode() {
+	if (EffectOn("TAA")) {
+		if (RtOn("Shaders.TAA.DLSS", "Enabled")) return 5;
+		if (RtOn("Shaders.TAA.FSR", "Enabled")) return 4;
+		return 3;
+	}
+	if (EffectOn("SMAA")) return 2;
+	if (RtOn("Main.Main.ReducedQuality", "FXAA")) return 1;
+	return 0;
+}
+
+static void RenderQuickSettingsPage() {
+	PageTitle("Quick settings", "Runtime status and main graphics switches in one place. Pick any folder on the left for full effect controls.");
+
+	const ImVec4 green(0.45f, 0.85f, 0.45f, 1.0f);
+	const ImVec4 amber(1.0f, 0.75f, 0.2f, 1.0f);
+	const float statusCol = ImGui::GetFontSize() * 9.0f;	// matches DrawRtStatusLine exactly
+
+	auto statusLine = [&](const char* label, const ImVec4* col, const char* text) {
+		ImGui::TextUnformatted(label);
+		ImGui::SameLine(statusCol);
+		ImGui::PushTextWrapPos(0.0f);
+		if (col) ImGui::TextColored(*col, "%s", text);
+		else ImGui::TextDisabled("%s", text);
+		ImGui::PopTextWrapPos();
+	};
+
+	// Two balanced columns when wide enough (same threshold as RenderSimpleEffectPage) so there is no dead space
+	const int cols = ImGui::GetContentRegionAvail().x > ImGui::GetFontSize() * 55.0f ? 2 : 1;
+	if (!ImGui::BeginTable("##quickcards", cols, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_PadOuterX)) return;
+
+	// ---- Left column: Runtime status, Core graphics, Screenshot mode ----
+	ImGui::TableNextColumn();
+	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+	MenuWidgets::Title("Runtime status", 1.1f);
+	ImGui::PopStyleColor();
+	ImGui::Separator();
+	statusLine("DXVK fork", DxvkCompute::Available() ? &green : &kRestartOrange,
+		DxvkCompute::Available() ? "Loaded (Vulkan compute, tessellation & RT)" : "Not loaded (D3D9 / stock DXVK - no Vulkan or RT)");
+	const int defMode = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredRenderer");
+	const bool msaa = RtOn("Main.Main.Misc", "ForceMSAA");
+	if (msaa) statusLine("Renderer", &amber, "Forward + MSAA (ForceMSAA overrides Deferred)");
+	else if (defMode >= 2) statusLine("Renderer", &green, "Deferred (Full: outdoors + indoors)");
+	else if (defMode == 1) statusLine("Renderer", &green, "Deferred (Indoors only)");
+	else statusLine("Renderer", nullptr, "Forward (Deferred off)");
+	statusLine("Location", nullptr, TheShaderManager->GameState.isExterior ? "Outdoors (uses outdoor settings)" : "Indoors (uses indoor settings)");
+	if (DxvkCompute::Available()) {
+		DrawRtStatusLine("Ray tracing", RtCoreLine());
+		if (RtPathTrace::Replacing()) DrawRtStatusLine("Path tracing", RtPathTraceLine());
+	}
+
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 1.25f));
+	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+	MenuWidgets::Title("Core graphics", 1.1f);
+	ImGui::PopStyleColor();
+	ImGui::Separator();
+	{
+		bool effects = TheSettingManager->SettingsMain.Main.RenderEffects;
+		MenuWidgets::RowBegin("All effects", MenuWidgets::ResetSlotWidth());
+		if (MenuWidgets::Toggle("##qs_fx", &effects)) {
+			TheSettingManager->SetSetting("Main.Main.Misc", "RenderEffects", effects);
+			TheSettingManager->LoadSettings();
+		}
+		if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+			WrappedTooltip("Master switch: turns all Vegas Shaders effects on or off at once (hotkey: modifier + menu key).");
+
+		DrawVisualItem({ "Main.Main.Quality", "DeferredRenderer", nullptr }, false);
+
+		static const char* const kAaNames[] = {
+			"Off",
+			"FXAA (fast)",
+			"SMAA (sharp, low cost)",
+			"TAA (temporal anti-aliasing)",
+			"FSR (AMD upscaler / AA)",
+			"DLSS (NVIDIA upscaler / AA)"
+		};
+		const int aaMode = DetectAaUpscalerMode();
+		ImGui::PushID("qs_aa");
+		const float aaW = MenuWidgets::RowBegin("Anti-aliasing", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(aaW);
+		const int pickedAa = NamePicker("##aa", kAaNames[aaMode], kAaNames, 6, aaMode);
+		if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+			WrappedTooltip("Picks one anti-aliasing or upscaling method and turns conflicting ones off cleanly.");
+		ImGui::PopID();
+		if (pickedAa >= 0 && pickedAa != aaMode) {
+			TheSettingManager->SetSetting("Main.Main.ReducedQuality", "FXAA", pickedAa == 1);
+			SetShaderEnabled("SMAA", pickedAa == 2);
+			SetShaderEnabled("TAA", pickedAa >= 3);
+			TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", pickedAa == 4);
+			TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", pickedAa == 5);
+			TheSettingManager->LoadSettings();
+		}
+		if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
+		else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+	}
+
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 1.25f));
+	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+	MenuWidgets::Title("Screenshot mode", 1.1f);
+	ImGui::PopStyleColor();
+	ImGui::Separator();
+	{
+		const bool asked = TheSettingManager->GetSettingI("Main.Main.Quality", "MaxQuality") != 0;
+		bool maxQuality = asked;
+		if (asked) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
+		MenuWidgets::RowBegin("Max Quality", MenuWidgets::ResetSlotWidth());
+		const bool flipped = MenuWidgets::Toggle("##qs_maxquality", &maxQuality);
+		if (asked) ImGui::PopStyleColor();
+		if (flipped) {
+			TheSettingManager->SetSetting("Main.Main.Quality", "MaxQuality", maxQuality);
+			TheSettingManager->LoadSettings();
+		}
+		if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+			WrappedTooltip("For screenshots, not for normal play: forces full resolution and highest quality across effects (often half frame rate or less). "
+				"Your own settings are preserved. Press Save and restart the game to apply.");
+		ImGui::SameLine();
+		if (asked != MaxQuality::Active) ImGui::TextColored(kRestartOrange, "restart to apply");
+		else ImGui::TextDisabled("(screenshots, restart)");
+	}
+
+	// ---- Right column: Ambient occlusion & bounce light, Ray tracing ----
+	ImGui::TableNextColumn();
+	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+	MenuWidgets::Title("Ambient occlusion & bounce light", 1.1f);
+	ImGui::PopStyleColor();
+	ImGui::Separator();
+	DrawIndirectLightingPickers();
+	if (ImGui::Button("Tune AO & Bounce Light...##qs_jump_ao")) gMenu.page = kAoTabId;
+
+	if (DxvkCompute::Available()) {
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 1.25f));
+		ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+		MenuWidgets::Title("Ray tracing", 1.1f);
+		ImGui::PopStyleColor();
+		ImGui::Separator();
+		DrawRtSpaceSwitches();
+		for (const SimpleRow& r : kSimpleRows) {
+			if (!r.Key && !strcmp(r.Section, "Main.Main.RayTracing") && !strcmp(r.Label, "Path tracing preset")) {
+				DrawSimpleChoice(r);
+				break;
+			}
+		}
+		if (ImGui::Button("Open Ray Tracing page...##qs_jump_rt")) gMenu.page = kRtTabId;
+	}
+
+	ImGui::EndTable();
+}
+
+// ---- Simple Category pages (merged per-category view when Advanced is off) ------------------------------------------------
+// In Simple mode, each graphics category in the sidebar opens one unified page combining its mode pickers (where effects compete)
+// and per-effect cards with inline on/off toggles and plain-English settings in a 2-column layout. Flipping Advanced on brings
+// back the full per-shader folder tree in the sidebar (and expands every card's raw settings if kept open).
+static const char* const kCatPrefix = "@Cat.";
+
+static bool DrawCategoryEffectHeader(const char* shader, const char* title, bool& enabledOut) {
+	const SettingManager::MenuSwitch kind = TheSettingManager->GetMenuShaderSwitch(shader);
+	const bool hasSwitch = kind != SettingManager::MenuSwitch::None;
+	bool on = hasSwitch ? TheSettingManager->GetMenuShaderEnabled(shader) : true;
+	const bool forced = hasSwitch && TheSettingManager->IsShaderForced(shader);
+
+	ImGui::PushID(shader);
+	ImGui::PushStyleColor(ImGuiCol_Text, on ? MenuSkin::Heading(0.25f) : MenuWidgets::MutedText(0.45f));
+	MenuWidgets::Title(title, 1.08f);
+	ImGui::PopStyleColor();
+	if (hasSwitch) {
+		RestartNote note;
+		const std::string switchSec = std::string("Shaders.") + shader + (kind == SettingManager::MenuSwitch::MainEnabled ? ".Main" : ".Status");
+		const bool noted = FindRestartNote(switchSec.c_str(), "Enabled", note);
+		const float gap = ImGui::GetStyle().ItemSpacing.x;
+		const float wanted = MenuWidgets::ToggleWidth() + (noted ? ImGui::CalcTextSize(note.text).x + gap : 0.0f);
+		ImGui::SameLine();
+		const float right = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - wanted;
+		if (right > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(right);
+		if (noted) { DrawRestartNote(note); ImGui::SameLine(); }
+		ImGui::BeginDisabled(forced);
+		if (MenuWidgets::Toggle("##catfx", &on) && (!on || ConfirmEffectOn(shader))) {
+			TheShaderManager->SwitchShaderStatus(shader);
+			TheSettingManager->LoadSettings();
+		}
+		ImGui::EndDisabled();
+		if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+			ImGui::SetTooltip(forced ? "Locked by a preset." : "Turn %s on or off.", title);
+	}
+	ImGui::Separator();
+	ImGui::PopID();
+	enabledOut = on;
+	return on;
+}
+
+static void DrawSimpleEffectCard(const char* shader, const char* title, std::initializer_list<const char*> subSections,
+	const char* noteWhenOff = nullptr, bool embedLut = false)
+{
+	if (ShelvedEffects::Section(std::string("Shaders.") + shader)) return;
+	ImGui::PushID(shader);
+	bool on = false;
+	DrawCategoryEffectHeader(shader, title, on);
+	if (on) {
+		DrawPtNote(shader);
+		if (embedLut) RenderLutPage();
+		const bool multi = subSections.size() > 1;
+		s_inCategoryPage = true;
+		for (const char* sub : subSections) {
+			const std::string sec = std::string("Shaders.") + shader + "." + sub;
+			if (ShelvedEffects::Section(sec)) continue;
+			if (multi) {
+				const std::string subTitle = SimplePageTitle(sub) + "###cat_" + shader + "_" + sub;
+				const bool defOpen = !strcmp(sub, "Main") || !strcmp(sub, "Default") || !strcmp(sub, "Exterior") || !strcmp(sub, "Exteriors") ||
+					!strcmp(sub, "Interiors") || !strcmp(sub, "Scattering") || !strcmp(sub, "Forward") || !strcmp(sub, "GPUGrass") ||
+					!strcmp(sub, "Physical") || !strcmp(sub, "Blending") || !strcmp(sub, "FirstPersonView") || !strcmp(sub, "HudRaindrops");
+				if (!MenuWidgets::SubHeader(subTitle.c_str(), defOpen)) continue;
+			}
+			if (sec == "Shaders.Terrain.Displacement" || sec == "Shaders.POM.Displacement") TessellationStatus();
+			DrawVisualItem({ sec.c_str(), nullptr, nullptr }, false);
+		}
+		s_inCategoryPage = false;
+	}
+	else if (noteWhenOff && noteWhenOff[0]) {
+		ImGui::TextDisabled("%s", noteWhenOff);
+	}
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+	ImGui::PopID();
+}
+
+static bool BeginCategoryColumns() {
+	const int cols = ImGui::GetContentRegionAvail().x > ImGui::GetFontSize() * 55.0f ? 2 : 1;
+	return ImGui::BeginTable("##catcards", cols, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_PadOuterX);
+}
+
+static void CategoryFooter() {
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	ImGui::TextDisabled("Tip: Switch Advanced on (top right) for individual shader folders and all raw settings.");
+}
+
+// 1. Lighting & AO
+static void RenderCatLighting() {
+	PageTitle("Lighting & AO", "Ambient occlusion, sky occlusion, bounce light (GI), reflections, PBR materials, specular highlights, and flashlight.");
+	DrawPtNote("AmbientLight");
+
+	// Competing mode pickers across the top
+	if (MenuWidgets::SubHeader("Ambient occlusion, sky occlusion & bounce light###cat_il_modes", true)) {
+		DrawIndirectLightingPickers();
+		const int aoMode = DetectAoMode(), giMode = DetectBounceLightMode();
+		if (giMode == 1 && !DxvkCompute::Available())
+			ImGui::TextColored(kRestartOrange, "Screen-space GI (ComputeGI) needs the DXVK fork's d3d9.dll (not loaded in this session).");
+		if (giMode == 2) DrawRtStatusLine("RT Bounce", RtGILine());
+		if (aoMode == 4) DrawRtStatusLine("RT AO", RtAOLine());
+		if (ImGui::Button("Open full AO & Bounce Light tuning...##cat_jump_ao")) gMenu.page = kAoTabId;
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		// Active AO & GI quick tuning
+		const int aoMode = DetectAoMode(), skyMode = DetectSkyOcclusionMode(), giMode = DetectBounceLightMode();
+		s_inCategoryPage = true;
+		if (aoMode == 1) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Ambient Light tuning", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance", nullptr }, false);
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		else if (aoMode == 2 || aoMode == 3) {
+			DrawSimpleEffectCard("AmbientOcclusion", "Ambient occlusion", { "Exteriors", "Interiors", "GTAO" });
+		}
+		if (skyMode > 0) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Sky occlusion (under roofs)", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Skylighting", "Strength, Distance, Reflections", nullptr }, false);
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		if (giMode == 1) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Screen-space bounce light (ComputeGI)", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "ComputeGIStrength, ComputeGIQuality", nullptr }, false);
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		else if (giMode == 2) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Ray-traced bounce light (GI)", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, RadianceCache, GIStrengthInterior, GlowGI", nullptr }, false);
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		else if (giMode == 3) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("3D Light Grid bounce", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "GridBounce, GridLamps", nullptr }, false);
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		else if (giMode == 4) {
+			DrawSimpleEffectCard("BounceLight", "Bounce light", { "Main" });
+		}
+		s_inCategoryPage = false;
+
+		DrawSimpleEffectCard("PBR", "PBR materials & highlights", { "Main", "Metal", "Rmaos", "Linear" }, "Physically based roughness, metalness and linear lighting.");
+		DrawSimpleEffectCard("Specular", "Specular highlights", { "Exterior", "Rain" }, "Sun glints and sky sheen on surfaces.");
+
+		ImGui::TableNextColumn();
+		// Reflections mode picker + card
+		{
+			static const char* const kReflModes[] = { "Off", "Screen-space reflections (SSR)", "Screen-space + Ray-traced (RTX + DXVK)" };
+			const int reflMode = !EffectOn("Reflections") ? 0 : RtOn("Shaders.Reflections.RT", "Enabled") ? 2 : 1;
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Reflections", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			ImGui::PushID("cat_refl_mode");
+			const float rw = MenuWidgets::RowBegin("Mode", MenuWidgets::ResetSlotWidth());
+			ImGui::SetNextItemWidth(rw);
+			const int picked = NamePicker("##refl", kReflModes[reflMode], kReflModes, 3, reflMode);
+			ImGui::PopID();
+			if (picked >= 0 && picked != reflMode) {
+				SetShaderEnabled("Reflections", picked > 0);
+				TheSettingManager->SetSetting("Shaders.Reflections.RT", "Enabled", picked == 2);
+				TheSettingManager->LoadSettings();
+			}
+			if (reflMode > 0) {
+				s_inCategoryPage = true;
+				DrawVisualItem({ "Shaders.Reflections.Main", nullptr, nullptr }, false);
+				if (reflMode == 2 && MenuWidgets::SubHeader("Ray-traced reflections###cat_refl_rt", true)) {
+					DrawRtStatusLine("Status", RtReflectionsLine());
+					DrawVisualItem({ "Shaders.Reflections.RT", nullptr, nullptr }, false);
+				}
+				s_inCategoryPage = false;
+			}
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		DrawSimpleEffectCard("Flashlight", "Flashlight / Pip-Boy light", { "Main", "Deferred" }, "Real shadow-casting flashlight beam.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 2. Shadows
+static void RenderCatShadows() {
+	PageTitle("Shadows", "Sun shadows, contact hardening, cloud shadows, and indoor/night lamp shadows.");
+
+	// Competing mode pickers across the top
+	if (MenuWidgets::SubHeader("Shadow modes###cat_sh_modes", true)) {
+		// Sun shadows mode
+		static const char* const kSunModes[] = { "Off", "Shadow maps", "Shadow maps + Ray-traced (RTX + DXVK)" };
+		const int sunMode = !EffectOn("ShadowsExteriors") ? 0 : RtOn("Shaders.ShadowsExteriors.RT", "Enabled") ? 2 : 1;
+		ImGui::PushID("cat_sun");
+		const float sw = MenuWidgets::RowBegin("Sun shadows", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(sw);
+		const int pSun = NamePicker("##sun", kSunModes[sunMode], kSunModes, 3, sunMode);
+		ImGui::PopID();
+		if (pSun >= 0 && pSun != sunMode) {
+			SetShaderEnabled("ShadowsExteriors", pSun > 0);
+			TheSettingManager->SetSetting("Shaders.ShadowsExteriors.RT", "Enabled", pSun == 2);
+			TheSettingManager->LoadSettings();
+		}
+
+		// Cloud shadows mode
+		static const char* const kCloudModes[] = { "Off", "Flat cloud shadows (cheap)", "Volumetric cloud shadows" };
+		const int cloudMode = CloudsCastShadows() ? 2 : SettingOn("Shaders.CloudShadows.Main", "Enabled") ? 1 : 0;
+		ImGui::PushID("cat_cloudsh");
+		const float cw = MenuWidgets::RowBegin("Cloud shadows", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(cw);
+		const int pCloud = NamePicker("##cloudsh", kCloudModes[cloudMode], kCloudModes, 3, cloudMode);
+		ImGui::PopID();
+		if (pCloud >= 0 && pCloud != cloudMode) {
+			if (pCloud == 0) {
+				TheSettingManager->SetSetting("Shaders.CloudShadows.Main", "Enabled", false);
+				TheSettingManager->SetSetting("Shaders.VolumetricClouds.Main", "Shadows", 0.0f);
+			}
+			else if (pCloud == 1) {
+				TheSettingManager->SetSetting("Shaders.CloudShadows.Main", "Enabled", true);
+				TheSettingManager->SetSetting("Shaders.VolumetricClouds.Main", "Shadows", 0.0f);
+			}
+			else {
+				SetShaderEnabled("VolumetricClouds", true);
+				if (SettingF("Shaders.VolumetricClouds.Main", "Shadows") <= 0.0f)
+					TheSettingManager->SetSetting("Shaders.VolumetricClouds.Main", "Shadows", 0.6f);
+				TheSettingManager->SetSetting("Shaders.CloudShadows.Main", "Enabled", false);
+			}
+			TheSettingManager->LoadSettings();
+		}
+
+		// Lamp shadows mode
+		static const char* const kLampModes[] = { "Off", "Shadow maps (cube maps)", "Ray-traced lamp shadows (RTX + DXVK, restart)" };
+		const int lampMode = !EffectOn("ShadowsInteriors") ? 0 : RtOn("Shaders.ShadowsInteriors.RT", "Enabled") ? 2 : 1;
+		ImGui::PushID("cat_lamp");
+		const float lw = MenuWidgets::RowBegin("Lamp shadows", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(lw);
+		const int pLamp = NamePicker("##lamp", kLampModes[lampMode], kLampModes, 3, lampMode);
+		ImGui::PopID();
+		if (pLamp >= 0 && pLamp != lampMode) {
+			SetShaderEnabled("ShadowsInteriors", pLamp > 0);
+			TheSettingManager->SetSetting("Shaders.ShadowsInteriors.RT", "Enabled", pLamp == 2);
+			TheSettingManager->LoadSettings();
+		}
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("ShadowsExteriors", "Sun shadows (outdoors)", { "Main", "ScreenSpace", "TerrainShadows" }, "Sun shadow maps, contact shadows and mountain shadows.");
+		if (RtOn("Shaders.ShadowsExteriors.RT", "Enabled")) {
+			s_inCategoryPage = true;
+			if (MenuWidgets::SubHeader("Ray-traced sun shadows###cat_sun_rt", true)) {
+				DrawRtStatusLine("Status", RtSunLine());
+				DrawVisualItem({ "Shaders.ShadowsExteriors.RT", nullptr, nullptr }, false);
+			}
+			s_inCategoryPage = false;
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		}
+		DrawSimpleEffectCard("ContactHardening", "Contact hardening (soft sun edges)", { "Main" }, "Softens sun shadow edges with distance from the caster (restart to turn on).");
+		if (SettingOn("Shaders.CloudShadows.Main", "Enabled") && !CloudsCastShadows())
+			DrawSimpleEffectCard("CloudShadows", "Flat cloud shadows", { "Main" });
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("ShadowsInteriors", "Lamp shadows (indoors & night)", { "Main", "Forward", "Atlas" }, "Real-time shadows cast by lamps, fires and lights.");
+		if (RtOn("Shaders.ShadowsInteriors.RT", "Enabled")) {
+			s_inCategoryPage = true;
+			if (MenuWidgets::SubHeader("Ray-traced lamp shadows###cat_lamp_rt", true)) {
+				DrawRtStatusLine("Status", RtLampLine());
+				DrawVisualItem({ "Shaders.ShadowsInteriors.RT", nullptr, nullptr }, false);
+			}
+			s_inCategoryPage = false;
+		}
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 3. Sky & atmosphere
+static void RenderCatSky() {
+	PageTitle("Sky & atmosphere", "Sky, volumetric clouds, fog, sunbeams, god rays, sandstorms, and heat haze.");
+
+	// Competing fog style picker
+	if (MenuWidgets::SubHeader("Fog mode###cat_fog_mode", true)) {
+		static const char* const kFogModes[] = { "Off", "Current fog (this build)", "Classic fog (original look)", "Legacy fog (older presets)" };
+		const FogType cur = ActiveFog();
+		const int idx = cur == FogType::None ? 0 : cur == FogType::Current ? 1 : cur == FogType::Classic ? 2 : 3;
+		ImGui::PushID("cat_fog");
+		const float fw = MenuWidgets::RowBegin("Volumetric fog style", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(fw);
+		const int picked = NamePicker("##fog", kFogModes[idx], kFogModes, 4, idx);
+		ImGui::PopID();
+		if (picked >= 0 && picked != idx) {
+			if (picked == 0) SetFogType(cur, false);
+			else SetFogType(picked == 1 ? FogType::Current : picked == 2 ? FogType::Classic : FogType::Legacy, true);
+		}
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Sky", "Sky & realistic atmosphere", { "Main", "Physical", "Clouds" }, "Sky tinting, stars, moon, and physically simulated sky.");
+		DrawSimpleEffectCard("VolumetricClouds", "Volumetric clouds", { "Main" }, "3D drifting volumetric clouds and cloud shadows.");
+		DrawSimpleEffectCard("VolumetricFog", "Volumetric fog", { "Main", "Night", "Interiors" }, "Atmospheric distance haze and indoor fog.");
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("VolumetricLight", "Light shafts (volumetric)", { "Main", "Night" }, "Sunbeams and moonlight shafts through trees and buildings.");
+		DrawSimpleEffectCard("GodRays", "God rays (screen-space)", { "Main", "Coloring" }, "Classic screen-space sun shafts.");
+		DrawSimpleEffectCard("SunGlare", "Sun glare", { "Main" }, "Soft halo and glare around the sun.");
+		DrawSimpleEffectCard("Sandstorm", "Sandstorms", { "Main" }, "Rolling dust clouds and blowing sand streaks.");
+		DrawSimpleEffectCard("HeatHaze", "Desert heat haze", { "Main" }, "Distant shimmering air during hot Mojave afternoons.");
+		DrawSimpleEffectCard("DustMotes", "Dust motes", { "Main" }, "Floating lit dust specks in the air.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 4. Weather & water
+static void RenderCatWeather() {
+	PageTitle("Weather & water", "Rain, snow, surface wetness, puddles, and water shaders.");
+
+	// Competing wetness picker
+	if (MenuWidgets::SubHeader("Wetness system###cat_wet_mode", true)) {
+		static const char* const kWetModes[] = { "Off", "WetnessEffects + Puddles (recommended)", "Legacy WetWorld" };
+		const int wetMode = EffectOn("WetnessEffects") ? 1 : EffectOn("WetWorld") ? 2 : 0;
+		ImGui::PushID("cat_wet");
+		const float ww = MenuWidgets::RowBegin("Rain wetness", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(ww);
+		const int picked = NamePicker("##wet", kWetModes[wetMode], kWetModes, 3, wetMode);
+		ImGui::PopID();
+		if (picked >= 0 && picked != wetMode) {
+			SetShaderEnabled("WetnessEffects", picked == 1);
+			SetShaderEnabled("WetWorld", picked == 2);
+			TheSettingManager->LoadSettings();
+		}
+		RestartBadge("Shaders.WetnessEffects.Status", "Enabled");
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Precipitations", "Rain", { "Main" }, "Rain streak visibility, speed and refraction.");
+		DrawSimpleEffectCard("Snow", "Snowfall", { "Main" }, "Falling snow (world-space and classic).");
+		DrawSimpleEffectCard("SnowAccumulation", "Snow on ground", { "Main" }, "Snow build-up, melting and footprints.");
+		if (EffectOn("WetnessEffects")) {
+			DrawSimpleEffectCard("WetnessEffects", "Wetness & raindrops", { "Main", "Raindrops", "HudRaindrops" });
+			DrawSimpleEffectCard("Puddles", "Puddles", { "Main" }, "Dynamic rain puddles with ripples (needs restart to toggle).");
+		}
+		else if (EffectOn("WetWorld")) {
+			DrawSimpleEffectCard("WetWorld", "Legacy WetWorld", { "Main" });
+		}
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Water", "Water", { "Default", "Interiors", "Placed" }, "Water clarity, waves, caustics and reflections.");
+		DrawSimpleEffectCard("Underwater", "Underwater", {}, "Underwater depth tint and distortion.");
+		DrawSimpleEffectCard("WaterLens", "Water drops on screen", { "Main" }, "Dripping water on the camera when leaving water.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 5. Ground & plants
+static void RenderCatGround() {
+	PageTitle("Ground & plants", "Terrain blending, tessellation, parallax occlusion, strand grass, and wind in plants.");
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Terrain", "Terrain", { "Blending", "Variation", "Macro", "Parallax", "Displacement" }, "Ground blending, anti-tiling and tessellation.");
+		DrawSimpleEffectCard("POM", "Parallax occlusion & rock tessellation", { "Main", "Displacement" }, "3D depth on stone, brick and cliff textures.");
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Grass", "Grass & strand grass", { "Main", "GPUGrass", "Wind", "Interaction" }, "3D GPU grass blades, wind sway and player bending.");
+		DrawSimpleEffectCard("Plants", "Plant wind", { "Wind" }, "Bushes and tree leaves swaying in the wind.");
+		DrawSimpleEffectCard("Foliage", "Foliage glow", { "Main" }, "Backlit sunlight glowing through leaves.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 6. Characters
+static void RenderCatCharacters() {
+	PageTitle("Characters", "Skin shading (outdoors and indoors), moving cloth, Pip-Boy sleeve fitting, and blood on hands/weapons.");
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Skin", "Skin shading & subsurface scattering", { "Main", "Scattering", "Interiors" }, "Realistic skin highlights, softness and backlit glow.");
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Cloth", "Moving cloth & coats", { "Main", "Interiors" }, "Swinging coats, capes, flags and banners (needs restart to enable).");
+		DrawSimpleEffectCard("PipboyFit", "Pip-Boy sleeve fit", { "Main" }, "Pulls armour sleeves under the Pip-Boy (needs restart).");
+		DrawSimpleEffectCard("HandBlood", "Blood on weapon & hands", { "Main" }, "Close-range blood spatter on your weapon and gloves (needs restart).");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 7. Camera & colour
+static void RenderCatCamera() {
+	PageTitle("Camera & colour", "Tonemapping, exposure, HDR, bloom, LUTs, colour grading, depth of field, motion blur, and camera looks.");
+
+	// Competing exposure picker
+	if (MenuWidgets::SubHeader("Exposure mode###cat_exp_mode", true)) {
+		static const char* const kExpModes[] = { "Off", "Classic (screen average)", "Eye adaptation (whole view + white balance)" };
+		const int expMode = !EffectOn("Exposure") ? 0 : TheSettingManager->GetSettingI("Shaders.Exposure.Main", "Mode") == 1 ? 2 : 1;
+		ImGui::PushID("cat_exp");
+		const float ew = MenuWidgets::RowBegin("Exposure", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(ew);
+		const int picked = NamePicker("##exp", kExpModes[expMode], kExpModes, 3, expMode);
+		ImGui::PopID();
+		if (picked >= 0 && picked != expMode) {
+			SetShaderEnabled("Exposure", picked > 0);
+			if (picked > 0) TheSettingManager->SetSetting("Shaders.Exposure.Main", "Mode", picked == 2 ? 1 : 0);
+			TheSettingManager->LoadSettings();
+		}
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Tonemapping", "Tone mapping", { "Main", "Interiors", "Night" }, "Filmic tone curve, contrast and night colour shift.");
+		DrawSimpleEffectCard("Exposure", "Exposure", { "Main", "Interiors", "Night" }, "Auto-exposure brightness adaptation.");
+		DrawSimpleEffectCard("LocalExposure", "Local exposure", { "Main" }, "Keeps bright skies and dark corners balanced together.");
+		DrawSimpleEffectCard("HDR", "HDR output", { "Main" }, "High dynamic range output settings.");
+		DrawSimpleEffectCard("Bloom", "Bloom", { "Main", "Night", "Interiors" }, "Soft glow around bright lights and skies.");
+		DrawSimpleEffectCard("BloomLegacy", "Legacy bloom", { "Exteriors", "Interiors" }, "Older bloom for legacy presets.");
+		DrawSimpleEffectCard("LUT", "Colour lookup table (LUT)", { "Main" }, "Custom colour grading LUT files.", true);
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Coloring", "Colour grading", { "Default" }, "Saturation, contrast, gamma and RGB tint.");
+		DrawSimpleEffectCard("ImageAdjust", "Image adjust", { "Main", "Night", "Interiors" }, "Fine brightness, contrast and colour adjustments.");
+		DrawSimpleEffectCard("Lens", "Lens flare & dirt", { "Main", "Night", "Interiors" }, "Anamorphic flare and lens dust.");
+		DrawSimpleEffectCard("DepthOfField", "Depth of field", { "FirstPersonView", "ThirdPersonView" }, "Background focus blur.");
+		DrawSimpleEffectCard("MotionBlur", "Motion blur", { "FirstPersonView", "ThirdPersonView" }, "Camera turning blur.");
+		DrawSimpleEffectCard("Cinema", "Cinema bars & grain", { "Main" }, "Letterbox bars, vignette and film grain.");
+		DrawSimpleEffectCard("Bodycam", "Bodycam look", { "Main", "Night", "Interiors" }, "Body-worn camera lens and video look.");
+		DrawSimpleEffectCard("LowHF", "Low health effect", { "Main" }, "Red vignette and desaturation at low health.");
+		DrawSimpleEffectCard("Dream", "Dream look (extra)", { "Main" }, "Stylized soft dream filter.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 8. Anti-aliasing & sharpening
+static void RenderCatAA() {
+	PageTitle("Anti-aliasing & sharpening", "Pick one anti-aliasing or upscaling method (FSR / DLSS / TAA / SMAA / FXAA), plus sharpening and de-banding.");
+
+	if (MenuWidgets::SubHeader("Anti-aliasing / Upscaler###cat_aa_mode", true)) {
+		static const char* const kAaNames[] = {
+			"Off", "FXAA (fast)", "SMAA (sharp, low cost)",
+			"TAA (temporal anti-aliasing)", "FSR (AMD upscaler / AA)", "DLSS (NVIDIA upscaler / AA)"
+		};
+		const int aaMode = DetectAaUpscalerMode();
+		ImGui::PushID("cat_aa");
+		const float aw = MenuWidgets::RowBegin("Method", MenuWidgets::ResetSlotWidth());
+		ImGui::SetNextItemWidth(aw);
+		const int picked = NamePicker("##aa", kAaNames[aaMode], kAaNames, 6, aaMode);
+		ImGui::PopID();
+		if (picked >= 0 && picked != aaMode) {
+			TheSettingManager->SetSetting("Main.Main.ReducedQuality", "FXAA", picked == 1);
+			SetShaderEnabled("SMAA", picked == 2);
+			SetShaderEnabled("TAA", picked >= 3);
+			TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", picked == 4);
+			TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", picked == 5);
+			TheSettingManager->LoadSettings();
+		}
+		s_inCategoryPage = true;
+		if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
+		else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+		s_inCategoryPage = false;
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
+
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		const int aaMode = DetectAaUpscalerMode();
+		s_inCategoryPage = true;
+		if (aaMode >= 3) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title(aaMode == 5 ? "DLSS & TAA" : aaMode == 4 ? "FSR & TAA" : "TAA", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "-Enabled, RenderScale", nullptr }, false);
+			else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "-Enabled, RenderScale", nullptr }, false);
+			DrawVisualItem({ "Shaders.TAA.Main", nullptr, nullptr }, false);
+			if (MenuWidgets::SubHeader("Smooth foliage & fence cutouts###cat_aa_cut", false))
+				DrawVisualItem({ "Shaders.TAA.Cutouts", nullptr, nullptr }, false);
+		}
+		else if (aaMode == 2) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("SMAA", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.SMAA.Main", nullptr, nullptr }, false);
+		}
+		else {
+			ImGui::TextDisabled(aaMode == 1 ? "FXAA is active (no extra settings)." : "No anti-aliasing is active. Pick a method above.");
+		}
+		s_inCategoryPage = false;
+
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Sharpening", "Sharpening", { "Main", "Interiors" }, "Post-process image sharpening.");
+		DrawSimpleEffectCard("DitherBuster", "Dither buster", { "Main" }, "Smooths dithered transparency patterns.");
+		DrawSimpleEffectCard("SkyDither", "Sky de-banding", { "Main" }, "Removes colour banding in smooth sky gradients.");
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+// 9. Particles & gun effects
+static void RenderCatParticles() {
+	PageTitle("Particles & gun effects", "Particle lighting, GPU particles, and built-in GunFX muzzle smoke, barrel glow and heat shimmer.");
+	if (BeginCategoryColumns()) {
+		ImGui::TableNextColumn();
+		DrawSimpleEffectCard("Particles", "Particles", { "Main" }, "Soft blending and sun/lamp lighting on smoke and fire.");
+		DrawSimpleEffectCard("GPUParticles", "GPU particles", { "Main" }, "GPU-accelerated particle effects.");
+
+		ImGui::TableNextColumn();
+		ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+		MenuWidgets::Title("Gun effects (GunFX)", 1.08f);
+		ImGui::PopStyleColor(); ImGui::Separator();
+		s_inCategoryPage = true;
+		DrawVisualItem({ "Main.GunFX.Main", "EnergyWeapons", nullptr }, false);
+		for (const GunFolder& f : kGunFolders) {
+			if (f.AdvancedOnly && !AdvancedShown()) continue;
+			const std::string header = std::string(f.Title) + "###catgun/" + f.Id;
+			if (!MenuWidgets::SubHeader(header.c_str(), false)) continue;
+			ImGui::PushID(f.Id);
+			ImGui::Indent(ImGui::GetFontSize() * 0.75f);
+			for (const VisualItem& item : f.Items) DrawVisualItem(item, item.Title != nullptr);
+			ImGui::Unindent(ImGui::GetFontSize() * 0.75f);
+			ImGui::PopID();
+		}
+		s_inCategoryPage = false;
+		ImGui::EndTable();
+	}
+	CategoryFooter();
+}
+
+struct SimpleCategory {
+	const char* Id;
+	const char* Label;
+	const char* Tip;
+	void (*Render)();
+	const char* CountEffects;	// comma-separated shader names for the "X of Y on" badge (nullptr = special)
+};
+static const SimpleCategory kSimpleCategories[] = {
+	{ "@Cat.Lighting",   "Lighting & AO",              "AO, sky occlusion, bounce light (GI), PBR, specular, reflections, flashlight.", RenderCatLighting,  "AmbientLight, Specular, PBR, Reflections, Flashlight" },
+	{ "@Cat.Shadows",    "Shadows",                    "Sun shadows, contact hardening, cloud shadows, and lamp shadows.",              RenderCatShadows,   "ShadowsExteriors, ShadowsInteriors, ContactHardening" },
+	{ kRtTabId,          "Ray tracing",                "Every ray-traced effect and path tracing in one place.",                        nullptr,            nullptr },
+	{ "@Cat.Sky",        "Sky & atmosphere",           "Sky, volumetric clouds, fog, light shafts, god rays, sandstorms, heat haze.",   RenderCatSky,       "Sky, VolumetricClouds, VolumetricFog, VolumetricLight, GodRays, SunGlare, Sandstorm, HeatHaze" },
+	{ "@Cat.Weather",    "Weather & water",            "Rain, snow, wetness, puddles, and water.",                                      RenderCatWeather,   "Precipitations, Snow, SnowAccumulation, WetnessEffects, Puddles, Water, Underwater, WaterLens" },
+	{ "@Cat.Ground",     "Ground & plants",            "Terrain blending, tessellation, POM, strand grass, plants.",                    RenderCatGround,    "Terrain, POM, Grass, Plants" },
+	{ "@Cat.Characters", "Characters",                 "Skin shading, moving cloth, Pip-Boy sleeve fit, hand blood.",                   RenderCatCharacters,"Skin, Cloth, PipboyFit, HandBlood" },
+	{ "@Cat.Camera",     "Camera & colour",            "Tonemapping, exposure, HDR, bloom, LUTs, grading, DoF, motion blur, looks.",    RenderCatCamera,    "Tonemapping, Exposure, HDR, Bloom, Lens, LUT, Coloring, ImageAdjust, Cinema, Bodycam, DepthOfField, MotionBlur, LowHF" },
+	{ "@Cat.AA",         "Anti-aliasing & sharpening", "FSR, DLSS, TAA, SMAA, FXAA, sharpening, de-banding.",                           RenderCatAA,        "TAA, SMAA, Sharpening, DitherBuster, SkyDither" },
+	{ "@Cat.Particles",  "Particles & gun effects",    "Particle lighting, GPU particles, and GunFX smoke/barrel glow.",                RenderCatParticles, "Particles, GPUParticles" },
+};
+
+static bool RenderSimpleCategoryPage() {
+	for (const SimpleCategory& c : kSimpleCategories) {
+		if (c.Render && gMenu.page == c.Id) {
+			c.Render();
+			return true;
+		}
+	}
+	return false;
+}
+
+static void RtSwitchCount(int& on, int& switches);
+
+static void DrawSimpleCategoriesSidebar() {
+	MenuWidgets::GroupLabel("Graphics", true);
+	for (const SimpleCategory& c : kSimpleCategories) {
+		const bool shown = gMenu.page == c.Id;
+		ImGui::PushID(c.Id);
+		ImGui::PushStyleColor(ImGuiCol_Text, shown ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : MenuWidgets::MutedText(0.35f));
+		if (ImGui::Selectable(c.Label, shown)) gMenu.page = c.Id;
+		ImGui::PopStyleColor();
+		if (ImGui::IsItemHovered() && c.Tip) WrappedTooltip(c.Tip);
+		int on = 0, total = 0;
+		if (!c.CountEffects) RtSwitchCount(on, total);
+		else {
+			for (const char* p = c.CountEffects; *p; ) {
+				while (*p == ' ' || *p == ',') p++;
+				const char* end = p;
+				while (*end && *end != ',') end++;
+				if (end > p) {
+					const std::string name(p, end);
+					if (!ShelvedEffects::Section("Shaders." + name) && TheSettingManager->GetMenuShaderSwitch(name.c_str()) != SettingManager::MenuSwitch::None) {
+						total++;
+						if (TheSettingManager->GetMenuShaderEnabled(name.c_str())) on++;
+					}
+				}
+				p = end;
+			}
+		}
+		if (total > 0) {
+			ImGui::SameLine();
+			ImGui::TextDisabled("%d/%d", on, total);
+		}
+		ImGui::PopID();
+	}
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	ImGui::PushTextWrapPos(0.0f);
+	ImGui::TextDisabled("Turn on Advanced (top right) for individual shader folders and all settings.");
+	ImGui::PopTextWrapPos();
+}
+
 // ---- The page -----------------------------------------------------------------------------------------------------------
 // The search results, the New-in-patch page, or the selected section: title, help, the LUT pickers (LUT page) and the rows.
 static void RenderContent() {
 	if (SearchActive()) return RenderSearchResults();
+	if (gMenu.page == kQuickTabId) return RenderQuickSettingsPage();
 	if (gMenu.page == kNewTabId) return RenderNewInPatch();
+	if (gMenu.page == kAoTabId) return RenderIndirectLightingPage();
 	if (gMenu.page == kRtTabId) return RenderRayTracingPage();
+	if (RenderSimpleCategoryPage()) return;
 	if (gMenu.page.empty()) {
 		ImGui::TextDisabled("Select a section from the left panel.");
 		return;
@@ -5306,8 +6470,7 @@ static bool DrawShaderEntryRow(const std::string& path, const std::string& name)
 		ImGui::PushStyleColor(ImGuiCol_Text, on ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : MenuWidgets::MutedText(0.5f));
 		ImGui::TextUnformatted(label.c_str());
 		ImGui::PopStyleColor();
-		if (kind == SettingManager::MenuSwitch::MainEnabled)	// Cloth and the like: read at start, the same note as their Main page
-			RestartBadge(("Shaders." + name + ".Main").c_str(), "Enabled");
+		RestartBadge(("Shaders." + name + (kind == SettingManager::MenuSwitch::MainEnabled ? ".Main" : ".Status")).c_str(), "Enabled");
 	}
 	if (forced) {
 		ImGui::SameLine();
@@ -5362,9 +6525,11 @@ static void DrawChildren(const std::string& path) {
 static bool HiddenFromSidebar(const std::string& path, const std::string& name) {
 	if (ShouldHideSection(name)) return true;
 	if (IsRtSection(path)) return true;	// 2026-11-05: on the Ray tracing page instead
-	// 2026-11-05 (user: "remove blood lens, sleeping mode, move gun fx ... under a relevant category"): their settings stay in the
-	// file and keep working; GunFX's page is in the effects list's "Particles and gun effects" group
-	if (path == "Shaders.BloodLens" || path == "Main.SleepingMode" || path == "Main.GunFX") return true;
+	// 2026-11-05: SleepingMode hidden; GunFX lives in "Particles and gun effects"
+	if (path == "Main.SleepingMode" || path == "Main.GunFX") return true;
+	if (path == "Shaders.Debug" && !DevOptionsShown()) return true;
+	// While Ambient Light is on in Simple mode, standalone AmbientOcclusion and BounceLight are superseded; switch modes on AO & Bounce Light or toggle Advanced
+	if (!AdvancedShown() && EffectOn("AmbientLight") && (path == "Shaders.AmbientOcclusion" || path == "Shaders.BounceLight")) return true;
 	// (user: camera mode and fly camera under Main > Misc; frame rate options under Performance "if they do anything at all": they do
 	// not: FrameRateManager::PerformSync is never called and the Stuttering pair is read by nothing)
 	if (path == "Main.CameraMode" || path == "Main.FlyCam" || path == "Main.Transitions" || path == "Main.FrameRate") return true;
@@ -5396,13 +6561,13 @@ static void RenderSectionNode(const std::string& path, const std::string& name, 
 // (MenuLayout.h; right-click a row); with no arrangement of their own the list is exactly this table.
 struct EffectGroup { const char* Name; const char* Entries; const char* Page = nullptr; const char* PageLabel = nullptr; };	// Page: a settings page that is no effect entry
 static const EffectGroup kEffectGroups[] = {
-	{ "Lighting", "AmbientLight, AmbientOcclusion, BounceLight, Specular, PBR, Reflections, Flashlight" },
-	{ "Shadows", "ShadowsExteriors, ShadowsInteriors, ContactHardening" },
+	{ "Lighting", "@IndirectLighting, AmbientLight, AmbientOcclusion, BounceLight, Specular, PBR, Reflections, Flashlight" },
+	{ "Shadows", "ShadowsExteriors, ShadowsInteriors" },
 	{ "Ray tracing", nullptr },
 	{ "Sky and atmosphere", "Sky, VolumetricClouds, VolumetricFog, VolumetricLight, GodRays, SunGlare, Sandstorm, HeatHaze" },
-	{ "Weather and water", "Precipitations, Snow, SnowAccumulation, WetnessEffects, HudRaindrops, WetWorld, Water, Underwater, WaterLens" },
+	{ "Weather and water", "Precipitations, Snow, SnowAccumulation, WetnessEffects, Puddles, WetWorld, Water, Underwater, WaterLens" },
 	{ "Ground and plants", "Terrain, POM, Grass, Plants" },
-	{ "Characters", "Skin, Cloth, PipboyFit, BloodFlow, HandBlood, Blood" },
+	{ "Characters", "Skin, Cloth, PipboyFit, HandBlood" },
 	{ "Camera and colour", "Tonemapping, Exposure, HDR, Bloom, BloomLegacy, Lens, LUT, Coloring, ImageAdjust, Cinema, Bodycam, DepthOfField, MotionBlur, LowHF" },
 	{ "Anti-aliasing and sharpening", "TAA, SMAA, Sharpening, DitherBuster, SkyDither" },
 	{ "Particles and gun effects", "Particles, GPUParticles", "Main.GunFX.Main", "Gun effects (smoke, barrel glow)##GunFX" },
@@ -5421,6 +6586,7 @@ static const EffectGroup kEffectGroups[] = {
 // is changed once the sidebar is drawn (LayoutMenu), never while its rows are being walked.
 static const char* const kLayoutRt = "@RayTracing";
 static const char* const kLayoutGun = "@GunFX";
+static const char* const kLayoutAo = "@IndirectLighting";
 static bool s_layoutDirty = true;		// entries may be missing from the folders (first use, or after an edit)
 static size_t s_layoutChildren = 0;		// how many effects the list had when the folders were last checked
 static std::string s_layoutEntry, s_layoutFolder;	// what the open right-click menu is about (one of them)
@@ -5492,6 +6658,7 @@ static void LayoutEnsure(const StringList& children) {
 	bool placed = false;
 	for (const std::string& child : children)
 		if (!IsMovedShaderEntry(child)) placed = LayoutPlace(child) || placed;
+	placed = LayoutPlace(kLayoutAo) || placed;
 	placed = LayoutPlace(kLayoutRt) || placed;
 	placed = LayoutPlace(kLayoutGun) || placed;
 	if (placed && layout.custom) MenuLayout::Save();
@@ -5590,6 +6757,7 @@ static void DrawEffectGroups(const StringList& children) {
 		bool rayTracing = false, pages = false;
 		for (const std::string& e : folder.entries) {
 			if (e == kLayoutRt) rayTracing = pages = true;
+			else if (e == kLayoutAo) pages = true;
 			else if (e == kLayoutGun) pages = pages || gun;
 			else if (std::find(children.begin(), children.end(), e) != children.end() && shown(e)) effects.push_back(e);
 		}
@@ -5597,6 +6765,16 @@ static void DrawEffectGroups(const StringList& children) {
 		if (!DrawEffectGroupRow(folder, effects, rayTracing)) continue;
 		for (const std::string& e : folder.entries) {
 			if (e == kLayoutRt) DrawRayTracingRows();
+			else if (e == kLayoutAo) {
+				const bool isShown = gMenu.page == kAoTabId;
+				ImGui::PushID(kAoTabId);
+				ImGui::PushStyleColor(ImGuiCol_Text, isShown ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : MenuWidgets::MutedText(0.35f));
+				if (ImGui::Selectable("Ambient occlusion & bounce light", isShown)) gMenu.page = kAoTabId;
+				NoteRowRightClick(kAoTabId);
+				ImGui::PopStyleColor();
+				if (ImGui::IsItemHovered()) ImGui::SetTooltip("Unified picker for corner shading (AO), sky occlusion, and bounce light (GI).");
+				ImGui::PopID();
+			}
 			else if (e == kLayoutGun) {
 				if (!gun) continue;
 				ImGui::PushID(gun->Page);
@@ -5616,6 +6794,7 @@ static void DrawEffectGroups(const StringList& children) {
 // The folders' entry a right-clicked row belongs to ("" = none: a page outside the effects list).
 static std::string LayoutEntryOfPath(const std::string& path) {
 	if (path == kRtTabId || IsRtSection(path)) return kLayoutRt;
+	if (path == kAoTabId) return kLayoutAo;
 	const EffectGroup* gun = GunPageGroup();
 	if (gun && path == gun->Page) return kLayoutGun;
 	if (path.compare(0, 8, "Shaders.") != 0) return std::string();
@@ -5625,6 +6804,7 @@ static std::string LayoutEntryOfPath(const std::string& path) {
 
 static std::string LayoutEntryLabel(const std::string& entry) {
 	if (entry == kLayoutRt) return "Ray tracing pages";
+	if (entry == kLayoutAo) return "Ambient occlusion & bounce light";
 	if (entry == kLayoutGun) return "Gun effects";
 	return ShownText(MenuEntryLabel(entry));
 }
@@ -5637,7 +6817,7 @@ static void LayoutRowDragDrop(const std::string& path) {
 	const std::string entry = LayoutEntryOfPath(path);
 	if (entry.empty()) return;
 	const EffectGroup* gun = GunPageGroup();
-	const bool own = path == "Shaders." + entry || path == kRtTabId || (gun && path == gun->Page);
+	const bool own = path == "Shaders." + entry || path == kRtTabId || path == kAoTabId || (gun && path == gun->Page);
 	if (own && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoHoldToOpenOthers)) {
 		ImGui::SetDragDropPayload("VSENTRY", entry.c_str(), entry.size() + 1);
 		ImGui::TextUnformatted(LayoutEntryLabel(entry).c_str());
@@ -5742,19 +6922,32 @@ static void LayoutMenu() {
 	if (edited) LayoutEdited();
 }
 
-// "New in this patch (N)" at the top of the sidebar, in the heading colour; the page shown while nothing else is picked.
+// "Quick settings" at the top of the sidebar: the default landing page when the menu opens.
+static void DrawQuickSettingsEntry() {
+	if (gMenu.page.empty()) gMenu.page = kQuickTabId;
+	const bool shown = gMenu.page == kQuickTabId;
+	ImGui::PushID(kQuickTabId);
+	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(shown ? 0.25f : 0.0f));
+	if (ImGui::Selectable("Quick settings", shown)) gMenu.page = kQuickTabId;
+	ImGui::PopStyleColor();
+	if (ImGui::IsItemHovered())
+		ImGui::SetTooltip("Runtime status and the main graphics switches in one place.");
+	ImGui::PopID();
+}
+
+// "New in this patch (N)" right below Quick settings.
 static void DrawNewInPatchEntry() {
 	NewPatchEnsure();
-	if (!NewPatchCount()) return;
-	if (gMenu.page.empty()) gMenu.page = kNewTabId;
+	const size_t shownCount = DevOptionsShown() ? NewPatchCount() : s_newMain.size();
+	if (!shownCount) return;
 	const bool shown = gMenu.page == kNewTabId;
-	const std::string label = "New in this patch (" + std::to_string(NewPatchCount()) + ")";
+	const std::string label = "New in this patch (" + std::to_string(shownCount) + ")";
 	ImGui::PushID(kNewTabId);
-	ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(shown ? 0.25f : 0.0f));
+	ImGui::PushStyleColor(ImGuiCol_Text, shown ? MenuSkin::Heading(0.25f) : MenuWidgets::MutedText(0.35f));
 	if (ImGui::Selectable(label.c_str(), shown)) gMenu.page = kNewTabId;
 	ImGui::PopStyleColor();
 	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Every setting that is new in this patch, in one place, to test. They are the same settings as in their own menus.");
+		ImGui::SetTooltip("Settings added in this patch, in one place. They are the same settings as in their own menus.");
 	ImGui::PopID();
 }
 
@@ -5762,13 +6955,16 @@ static void RenderSidebar() {
 	RenderSearchBox();	// UNOFFICIAL 2026-10-25: menu search
 	if (SearchActive()) return RenderSearchSidebar();
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	DrawQuickSettingsEntry();
 	DrawNewInPatchEntry();
 
 	// The skin's IndentSpacing is 0 (the pages indent their own groups): the sidebar's folds get a small step per level
 	ImGui::PushStyleVar(ImGuiStyleVar_IndentSpacing, ImGui::GetFontSize());
+	if (!AdvancedShown()) DrawSimpleCategoriesSidebar();
 	StringList roots;
 	TheSettingManager->FillMenuSections(&roots, nullptr);
 	for (const std::string& root : roots) {
+		if (!AdvancedShown() && root == "Shaders") continue;	// Simple mode uses the merged Graphics categories above
 		if (HiddenFromSidebar(root, root)) continue;
 		StringList children;
 		TheSettingManager->FillMenuSections(&children, root.c_str());
@@ -6192,6 +7388,8 @@ static const ImVec4 kWarnAmber(1.0f, 0.75f, 0.2f, 1.0f);
 
 static void DrawFileMenu() {
 	if (!ImGui::BeginMenu("File")) return;
+	if (ImGui::MenuItem("Save")) SaveSettingsNow();
+	if (ImGui::IsItemHovered()) ImGui::SetTooltip("Save your changed settings to VegasShaders.toml");
 	if (ImGui::MenuItem("Save Copy")) SaveSettingsCopy();
 	if (ImGui::IsItemHovered()) ImGui::SetTooltip("Writes a dated copy of the settings next to the DLL, named after where you are.");
 	ImGui::Separator();
@@ -6311,7 +7509,7 @@ static bool LabelledToggle(const char* label, const char* id, bool* on) {
 	return MenuWidgets::Toggle(id, on);
 }
 
-// Effects (every effect on or off) and Max Quality (red while asked for: read once at start, so it needs Save and a restart).
+// Effects (every effect on or off) and Advanced (simple views vs all raw settings). Max Quality lives in Quick settings & Main > Quality.
 static void DrawGlobalSwitches() {
 	bool effects = TheSettingManager->SettingsMain.Main.RenderEffects;
 	if (LabelledToggle("Effects", "##effects", &effects)) {
@@ -6320,24 +7518,6 @@ static void DrawGlobalSwitches() {
 	}
 	if (ImGui::IsItemHovered())
 		ImGui::SetTooltip("Toggle all effects (hotkey: modifier + %s)", DikToName(TheSettingManager->SettingsMain.Menu.KeyEnable));
-
-	const bool asked = TheSettingManager->GetSettingI("Main.Main.Quality", "MaxQuality") != 0;
-	bool maxQuality = asked;
-	ImGui::SameLine(0.0f, ImGui::GetStyle().ItemSpacing.x * 2.0f);
-	if (asked) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
-	const bool flipped = LabelledToggle("Max Quality", "##maxquality", &maxQuality);
-	if (asked) ImGui::PopStyleColor();
-	if (flipped) {
-		TheSettingManager->SetSetting("Main.Main.Quality", "MaxQuality", maxQuality);
-		TheSettingManager->LoadSettings();
-	}
-	if (ImGui::IsItemHovered())
-		ImGui::SetTooltip("Max Quality: for screenshots, not for playing.\n"
-			"Runs every reduced-resolution effect at full resolution, turns off every reduced-quality shortcut and\n"
-			"pushes quality settings to their maximum. Expect a much lower frame rate (often half or less).\n"
-			"Your own settings are kept: turn it off and restart to get them back exactly.\n"
-			"Takes effect after Save and a game restart.%s",
-			MaxQuality::Active ? "\nIt is ON now: red values in the menu are its own. You can change them: those changes are saved to VegasShaders.maxquality.user.toml, not to your own settings." : "");
 
 	// 2026-11-05: Advanced (simple views off: every setting under its own name)
 	bool advanced = gMenu.advanced;
@@ -6354,8 +7534,8 @@ static void DrawGlobalSwitches() {
 
 static float GlobalSwitchesWidth() {
 	const ImGuiStyle& style = ImGui::GetStyle();
-	return ImGui::CalcTextSize("Effects").x + ImGui::CalcTextSize("Max Quality").x + ImGui::CalcTextSize("Advanced").x + MenuWidgets::ToggleWidth() * 3.0f +
-		style.ItemInnerSpacing.x * 3.0f + style.ItemSpacing.x * 4.0f;
+	return ImGui::CalcTextSize("Effects").x + ImGui::CalcTextSize("Advanced").x + MenuWidgets::ToggleWidth() * 2.0f +
+		style.ItemInnerSpacing.x * 2.0f + style.ItemSpacing.x * 2.0f;
 }
 
 static void DrawUnsavedMarker() {
@@ -6449,6 +7629,11 @@ static void DrawStatusBar() {
 	if (maxAsked != MaxQuality::Active) {
 		sprintf_s(text, "Save + restart to turn Max Quality %s", maxAsked ? "on" : "off");
 		StatusItem(&kWarnAmber, text);
+	}
+	else if (MaxQuality::Active) {
+		static const ImVec4 kMaxRed(1.0f, 0.45f, 0.45f, 1.0f);
+		StatusItem(&kMaxRed, "[Max Quality active]");
+		if (ImGui::IsItemHovered()) ImGui::SetTooltip("Max Quality screenshot mode is active (Quick settings > Screenshot mode or Main > Quality to turn off).");
 	}
 	if (!Paths::TwinDll.empty()) {	// 2026-11-03: an old NewVegasReloaded.dll next to this one (RenderTwinDllWarning)
 		static const ImVec4 kTwinRed(1.0f, 0.3f, 0.25f, 1.0f);

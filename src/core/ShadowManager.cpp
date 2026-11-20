@@ -3560,6 +3560,7 @@ void ShadowManager::RenderShadowMaps() {
 	dev->SetDepthStencilSurface(savedDepth);
 	dev->SetRenderTarget(0, savedTarget);
 	dev->SetViewport(&savedViewport);
+	rs->SetRenderState(D3DRS_ZFUNC, savedZFunc, RenderStateArgs);
 	dev->SetRenderState(D3DRS_ZFUNC, savedZFunc);
 	dev->SetRenderState(D3DRS_STENCILENABLE, savedStencilEnable);
 	dev->SetRenderState(D3DRS_STENCILREF, savedStencilRef);

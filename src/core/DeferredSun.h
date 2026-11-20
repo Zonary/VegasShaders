@@ -37,7 +37,7 @@ namespace DeferredSun {
 	// UNOFFICIAL 2026-11-16 fd-sunvis ([Shaders.ShadowsExteriors.Deferred], live; DeferredSun.hlsl DS_Vis, Includes/DeferredPixel.hlsl FDSunVisCode):
 	// the forward sun's terms the G-buffer now carries. The pass's own: the land's height self-shadow, the recorded highlight F0, SpecularFade's
 	// highlight fade rebuilt from the pixel's distance. (CanopyShadow, ParallaxShadow and MicroShadow are applied by the records: PBR.cpp.)
-	inline bool LandCrackShadow = true, AuthoredHighlight = true, HighlightFade = true;
+	inline bool LandCrackShadow = true, AuthoredHighlight = true, HighlightFade = true, MatchSunDisc = true;
 	inline int SpecFadeCompiled = -1;	// [Shaders.PBR.Main] SpecularFade at startup (the records' SPEC_FADE_ON; core/PbrPop.h SpecFade::Compiled), -1 not read yet
 	inline std::unordered_set<IDirect3DPixelShader9*> Handles;	// the lighting-free records' handles (from LightFreeRecords::Records)
 	inline size_t HandlesFrom = 0;
@@ -243,6 +243,7 @@ namespace DeferredSun {
 		Shadows = TheSettingManager->GetSettingI(kSection, "Shadows") != 0;
 		LandCrackShadow = TheSettingManager->GetSettingI(kSection, "LandCrackShadow") != 0;
 		AuthoredHighlight = TheSettingManager->GetSettingI(kSection, "AuthoredHighlight") != 0;
+		MatchSunDisc = TheSettingManager->GetSettingI(kSection, "MatchSunDisc") != 0;
 		if (SpecFadeCompiled < 0) SpecFadeCompiled = TheSettingManager->GetSettingI("Shaders.PBR.Main", "SpecularFade") != 0 ? 1 : 0;
 		HighlightFade = TheSettingManager->GetSettingI(kSection, "HighlightFade") != 0 && SpecFadeCompiled == 1 &&
 			TheSettingManager->GetSettingI("Shaders.PBR.Main", "SpecularFade") != 0;	// (as the records fade: compiled at startup, live while compiled)
@@ -422,9 +423,23 @@ namespace DeferredSun {
 		// the pass's own (c6-c9)
 		const NiPoint3& dir = sun->direction;
 		D3DXVECTOR3 toSun(-dir.x, -dir.y, -dir.z);
+		// UNOFFICIAL 2026-11-19 MatchSunDisc: outdoors by day, vanilla FNV clamps Tes->directionalLight (and land c18) to a
+		// 45-degree southern plane (only 24.9 deg high at 14:17 while the sun disc and shadow maps are at 70.6 deg). Align
+		// surface sun lighting to the true sun disc direction (ShaderConst.SunDir) while above the horizon so N.L matches
+		// the sky and shadow cascades. Interiors and nighttime (moon) keep Tes->directionalLight unchanged.
+		bool matchedSunDisc = false;
+		if (MatchSunDisc && TheShaderManager && TheShaderManager->GameState.isExterior && TheShaderManager->GameState.dayLight > 0.5f) {
+			const D3DXVECTOR4& disc = TheShaderManager->ShaderConst.SunDir;
+			D3DXVECTOR3 discV(disc.x, disc.y, disc.z);
+			const float discLen = D3DXVec3Length(&discV);
+			if (discLen > 1.0e-6f && discV.z > 0.0f) {
+				toSun = discV / discLen;
+				matchedSunDisc = true;
+			}
+		}
 		const float len = D3DXVec3Length(&toSun);
 		const bool has = len > 1.0e-6f;
-		if (has) toSun /= len;
+		if (has && !matchedSunDisc) toSun /= len;
 		const bool objectFresh = LandLight::ObjectReadFrame && (UInt32)TheFrameRateManager->FrameNumber - LandLight::ObjectReadFrame <= 4;
 		const D3DXMATRIX& proj = NiDX9Renderer::GetSingleton()->projMatrix;
 		const float own[4][4] = {
@@ -454,8 +469,10 @@ namespace DeferredSun {
 		// draw; c14 / c15, w 1 = valid (else the directional light, as before).
 		const UInt32 frameNow = (UInt32)TheFrameRateManager->FrameNumber;
 		const bool landFresh = LandLight::ReadFrame && frameNow - LandLight::ReadFrame <= 4;
+		const float* const landDir = matchedSunDisc ? &toSun.x : LandLight::DeferredDir;
+		const bool landDirValid = matchedSunDisc ? has : landFresh;
 		const float land[2][4] = {
-			{ LandLight::DeferredDir[0], LandLight::DeferredDir[1], LandLight::DeferredDir[2], landFresh ? 1.0f : 0.0f },
+			{ landDir[0], landDir[1], landDir[2], landDirValid ? 1.0f : 0.0f },
 			{ LandLight::Color[0], LandLight::Color[1], LandLight::Color[2], landFresh && LandLight::ColorGood ? 1.0f : 0.0f } };
 		d->SetPixelShaderConstantF(14, land[0], 2);
 		// (2026-11-16 fd-sunvis) c16 DS_Vis: x 1 = the land's height self-shadow, y 1 = the recorded highlight F0, z / w SpecularFade's band

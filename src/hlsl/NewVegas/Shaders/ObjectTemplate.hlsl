@@ -421,8 +421,16 @@
 // Nothing here assumes a UV layout. The output goes through LinearSceneOut as every lit shader's does, so no frame conversion is needed.
 #if defined(PS) && defined(NVR_EYE)
     #undef METAL
+    // UNOFFICIAL 2026-11-19: eyes now keep forward sun shadows (offset EYE_SHADOW_OFFSET units toward the sun to clear eyelids/brow
+    // sockets while still catching hats, roofs, walls, and clouds). Skip screen-space RT sun lookup (s15 stays free for FlashBeam and
+    // RT eyelids cannot be offset), dust, wetness, and HUD rain on eyeballs; FlashBeam moves from c108-c116 (now sun cascades) to
+    // c146-c154 (free because SUN_CROSSFADE = 0, OBJECT_WETNESS off, HUD_RAIN off on NVR_EYE).
+    #define RT_SUN_FORWARD_OFF 1
+    #undef DUST_ON
+    #define DUST_ON 0
     // Wrapped Lambert: the light reaches round the ball by EYE_WRAP of its quarter turn, as light scattering through the white would.
-    #define EYE_WRAP 0.5f
+    #define EYE_WRAP 0.3f
+    #define EYE_SHADOW_OFFSET 3.0f
     #define EYE_DEBUG 0	// (warm-slot diagnosis, 2026-11-09: 1 the light colour alone, 2 the wrap alone, 3 the plain N.L, 4 the albedo, 5 albedo x light x wrap)
     float3 EyeLight(float3 toLight, float3 radiance, float3 baseColor) {
         const float wrapped = saturate((normalize(toLight).z + EYE_WRAP) / (1.0f + EYE_WRAP));
@@ -445,12 +453,10 @@
     // the eyeball's records as a glossy object's (the full PBR lamp term with its highlight, which the eye above never gets from a lamp).
     // The eye takes the beam itself instead, by the same wrapped diffuse as its lamps, on the vertex normal in world space, with the beam's
     // cone, reach, falloff and shadow map (no lens pattern: no sampler stage is free in every variant), and records itself as far away
-    // (see the outputs) so the light pass leaves it alone. c108-c116: Includes/Shadow.hlsl's sun cascade matrices, which no eye record
-    // reads (they are built with FORWARD_SHADOWS 0) and nothing writes per draw; no nine registers in a row are free in EVERY object
-    // pixel shader (c94 is NVR_EnvData, c37-c63 / c76-c87 / c98-c107 the many-lamp table). s15: the sixth lamp-shadow stage, unused
-    // here (no lamp shadow code either). Not for the deferred-lamp records (see the LIGHTS >= 4 shader): they keep the light pass.
-    #define FLASH_BEAM_REG c108
-    #define FLASH_BEAM_MATRIX_REG c113
+    // (see the outputs) so the light pass leaves it alone. c146-c154: SUN_CROSSFADE / Wetness / HudRain range, all off on NVR_EYE, and
+    // restored by GameEyes::After() via own->SetCT(). s15: unused here (INTERIOR_SHADOWS = 0 and RT_SUN_FORWARD_OFF).
+    #define FLASH_BEAM_REG c146
+    #define FLASH_BEAM_MATRIX_REG c151
     #define FLASH_BEAM_SAMPLER s15
     #include "includes/FlashBeam.hlsl"
     float3 EyeBeam(float3 baseColor, float3 worldNormal, float3 worldPos, bool valid) {
@@ -479,7 +485,7 @@
 // shaders read the player's own sun shadow map too (hats, bandanas, face masks, armour: drawn with these shaders, not the skin's), except
 // the shaders with four or more lamps (the six-lamp OPT specular 4+ shader is at the driver's slot limit, NVR_SLOT_TIGHT above, and the
 // four-lamp ones were at ps_3_0's 32 temporaries with two cascade lookups): a hat lit by four lamps and the sun keeps the cascades.
-#if defined(PS) && !defined(NVR_SLOT_TIGHT) && !(defined(LIGHTS) && LIGHTS > 3)
+#if defined(PS) && !defined(NVR_SLOT_TIGHT) && (!(defined(LIGHTS) && LIGHTS > 3) || defined(NVR_EYE))
     #define SHADOW_CHARACTER_MAP_IN 1
 #endif
 // UNOFFICIAL 2026-11-04 ForwardCloudShadows (Includes/Shadow.hlsl): the clouds' shadow on the sun term (always compiled in; its strength switches it live).
@@ -494,7 +500,7 @@
 #if defined(NVR_LIVE_CUBE) && ((defined(LIGHTS) && LIGHTS > 3) || ((defined(SI) || defined(HAIR)) && !defined(ONLY_SPECULAR) && defined(ONLY_LIGHT)))
     #define NVR_CONTACT_NO_SAMPLER 1
 #endif
-#if defined(PS) && !defined(NVR_SLOT_TIGHT) && !defined(NVR_CONTACT_NO_SAMPLER)
+#if defined(PS) && !defined(NVR_SLOT_TIGHT) && !defined(NVR_CONTACT_NO_SAMPLER) && !defined(NVR_EYE)
     #define SHADOW_SUN_CONTACT_PERDRAW 1
     #define SHADOW_SUN_CONTACT_IN 1   // UNOFFICIAL 2026-11-06 forward contact shadows (Includes/Shadow.hlsl; compiled in only with Bend on at start): one lookup
 #endif
@@ -510,7 +516,7 @@
 // passes that light the material's own albedo with the sun get the water layer; lamp-only, highlight-only and lamp-first passes do not,
 // nor the interior records (no rain indoors). Its constants are the sun cross-fade's (c146-c159), so not with SUN_CROSSFADE; s12 is free
 // in every outdoor variant, for the rain cover map.
-#if defined(PS) && defined(WETNESS_EFFECTS) && !defined(WETNESS_OFF) && FORWARD_SHADOWS && !SUN_CROSSFADE && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS && !(defined(POINT_SHADOW_RT_ONLY) && POINT_SHADOW_RT_ONLY && WETNESS_EFFECTS >= 2)) && \
+#if defined(PS) && defined(WETNESS_EFFECTS) && !defined(WETNESS_OFF) && FORWARD_SHADOWS && !SUN_CROSSFADE && !defined(NVR_EYE) && !(defined(INTERIOR_SHADOWS) && INTERIOR_SHADOWS && !(defined(POINT_SHADOW_RT_ONLY) && POINT_SHADOW_RT_ONLY && WETNESS_EFFECTS >= 2)) && \
     !defined(DIFFUSE) && !defined(POINT) && !defined(ONLY_SPECULAR) && !defined(OBJ_LAMP_FIRST)
     #define OBJECT_WETNESS
     #if defined(POINT_SHADOW_RT_ONLY) && POINT_SHADOW_RT_ONLY
@@ -670,7 +676,7 @@ float ShadowContrastKeep(float3 lit, float3 lost) {
     #include "includes/HandBlood.hlsl"
     // UNOFFICIAL 2026-10-14, 2026-11-04: rain drops on the first-person weapon and (AllObjects) the world's objects (Wetness Effects'
     // HudRaindrops, includes/HudRain.hlsl, c221, c222, c170 set per draw; compiled in only when on at startup: HUD_RAIN_ON, ShaderRecord).
-    #if defined(HUD_RAIN_ON) && HUD_RAIN_ON
+    #if defined(HUD_RAIN_ON) && HUD_RAIN_ON && !defined(NVR_EYE)
         #define HUD_RAIN 1
     #endif
     #include "includes/HudRain.hlsl"
@@ -1710,7 +1716,13 @@ PS_OUTPUT main(PS_INPUT IN) {
         // Decline to projShade if a vanilla vertex shader ran: the interpolator is undefined.
         float sunVis = 1.0f;
         #if FORWARD_SHADOWS && !defined(NVR_LIGHT_DEFERRED)	// (the lighting-free record: no sun, no sun shadow)
-        #if UNLIT_SHADOW_SKIP
+        #ifdef NVR_EYE
+        // UNOFFICIAL 2026-11-19: sample sun shadow EYE_SHADOW_OFFSET units toward the sun (clears eyelids/brow socket while catching
+        // hats, roofs, walls, cliffs, and clouds; bypasses SunShadowWanted so wrapped diffuse is shadowed too).
+        sunVis = SHADOW_VS_PRESENT(IN.shadowWorldPos.w)
+                  ? GetSunShadow(IN.shadowWorldPos.xyz + TESR_SmoothedSunDir.xyz * EYE_SHADOW_OFFSET, TESR_SmoothedSunDir.xyz)
+                  : 1.0f;
+        #elif UNLIT_SHADOW_SKIP
         // UNOFFICIAL 2026-10-17 UnlitShadowSkip: no projShade-map lookups where the sun cannot light the pixel (SunShadowWanted).
         [branch] if (SHADOW_VS_PRESENT(IN.shadowWorldPos.w) && SunShadowWanted(normal.xyz, IN.lightDir.xyz))
             sunVis = GetSunShadow(IN.shadowWorldPos.xyz, faceNormal);
@@ -1721,9 +1733,6 @@ PS_OUTPUT main(PS_INPUT IN) {
         #endif
         #endif
         sunAndProj *= sunVis;
-    #endif
-    #ifdef NVR_EYE
-        sunAndProj = 1.0f;	// UNOFFICIAL 2026-11-09 the eye variant (see its block above): no sun or canopy shadow on the eyeball
     #endif
 
     #if INTERIOR_SHADOWS
@@ -2618,7 +2627,13 @@ PS_OUTPUT main(PS_INPUT IN) {
         // Decline to shadow if a vanilla vertex shader ran: the interpolator is undefined.
         float sunShadow = 1.0f;
         #if FORWARD_SHADOWS && !defined(NVR_LIGHT_DEFERRED)	// (the lighting-free record: no sun, no sun shadow)
-        #if UNLIT_SHADOW_SKIP
+        #ifdef NVR_EYE
+        // UNOFFICIAL 2026-11-19: sample sun shadow EYE_SHADOW_OFFSET units toward the sun (clears eyelids/brow socket while catching
+        // hats, roofs, walls, cliffs, and clouds; bypasses SunShadowWanted so wrapped diffuse is shadowed too).
+        sunShadow = SHADOW_WP_VALID(IN)
+                  ? GetSunShadow(sunWP + TESR_SmoothedSunDir.xyz * EYE_SHADOW_OFFSET, TESR_SmoothedSunDir.xyz)
+                  : 1.0f;
+        #elif UNLIT_SHADOW_SKIP
         // UNOFFICIAL 2026-10-17 UnlitShadowSkip (SunShadowWanted), as in the LIGHTS < 4 variant.
         [branch] if (SHADOW_WP_VALID(IN) && SunShadowWanted(normal.xyz, IN.lightDir.xyz))
             sunShadow = GetSunShadow(sunWP, sunFaceN);

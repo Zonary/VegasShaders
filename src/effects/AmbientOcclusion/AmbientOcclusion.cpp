@@ -466,6 +466,7 @@ namespace {
 	constexpr int GILightKeys = 5;	// (GIReuse) the lamps' total and brightest luminance, their count, the sun's luminance and height
 
 	bool RtWants() {
+		if (RtPathTrace::Replacing()) return false;	// UNOFFICIAL 2026-11-19: path tracing replaces AO/GI/sky; stop wasting GPU tracing them
 		AmbientOcclusionEffect* ao = TheShaderManager->Effects.AmbientOcclusion;
 		if (AmbientLightEffect* sunGiAl = TheShaderManager->Effects.AmbientLight) sunGiAl->SunGIFrame();	// UNOFFICIAL 2026-11-12 (sungi p4): SunGI follows the player in and out before Current.Enabled is read
 		// (2026-11-03) rect frames too (RenderScale < 1: RtRecord traces the rect; docs/next/RT-RENDERSCALE.md)
@@ -1441,7 +1442,7 @@ void AmbientOcclusionEffect::RenderSkyVisibility(IDirect3DDevice9* Device, IDire
 
 bool AmbientOcclusionEffect::ShouldRender() {
 	if (RtPathTrace::Replacing()) return false;	// UNOFFICIAL 2026-11-03 PTReplace: the path traced frame has its own occlusion
-	return Constants.Enabled && !bNVAOLoaded;
+	return Constants.Enabled;
 }
 
 void AmbientOcclusionEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTarget,

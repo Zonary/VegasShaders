@@ -44,7 +44,7 @@ void freeArray(Element*& array) {
 // The Definition of the last of the template's defines named Name (null when there is none, or the last has none).
 const char* lastDefinition(const ShaderTemplate& Template, const char* Name) {
 	const char* found = nullptr;
-	for (int d = 0; d < 63 && Template.Defines[d].Name; d++)
+	for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && Template.Defines[d].Name; d++)
 		if (!strcmp(Template.Defines[d].Name, Name)) found = Template.Defines[d].Definition;
 	return found;
 }
@@ -54,7 +54,7 @@ bool isOne(const char* definition) {
 }
 
 bool hasDefine(const ShaderTemplate& Template, const char* Name) {
-	for (int d = 0; d < 63 && Template.Defines[d].Name; d++)
+	for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && Template.Defines[d].Name; d++)
 		if (!strcmp(Template.Defines[d].Name, Name)) return true;
 	return false;
 }
@@ -230,7 +230,7 @@ static void FallbackInit() {
 		for (; text && *text; text++) hash = (hash ^ (unsigned char)*text) * 16777619u;
 		hash = (hash ^ 0xFFu) * 16777619u;
 	};
-	for (int d = 0; d < 63 && probe.Defines[d].Name; d++) { mix(probe.Defines[d].Name); mix(probe.Defines[d].Definition); }
+	for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && probe.Defines[d].Name; d++) { mix(probe.Defines[d].Name); mix(probe.Defines[d].Definition); }
 	mix(__DATE__ " " __TIME__);
 	ShaderFallback::Init(hash, std::string(ShadersPath) + "Cache\\");
 }
@@ -311,11 +311,12 @@ void ShaderRecord::BuildDefines(ShaderTemplate& Template, const D3DXMACRO* Overr
 	auto AppendDefine = [&Template](const char* DefineName, const char* Value) {
 		D3DXMACRO* list = Template.Defines;
 		int used = 0;
-		for (; used < 62 && list[used].Name; used++)
+		constexpr int kMaxEntries = ShaderTemplate::kMaxDefines - 2;	// room for entries + null terminator
+		for (; used < kMaxEntries && list[used].Name; used++)
 			if (!strcmp(list[used].Name, DefineName)) return;	// an override already set it
-		if (used >= 62) {  // out of room (Defines[64]: 62 entries and the terminator); skip rather than overrun
+		if (used >= kMaxEntries) {  // out of room; skip rather than overrun
 			static bool warned = false;	// fixes-a #12: say so once (a dropped define = the shader compiled without that option)
-			if (!warned) { warned = true; Logger::Log("[ERROR] ShaderRecord: more than 62 shader defines, '%s' and any after it are dropped", DefineName); }
+			if (!warned) { warned = true; Logger::Log("[ERROR] ShaderRecord: more than %d shader defines, '%s' and any after it are dropped", kMaxEntries, DefineName); }
 			return;
 		}
 		list[used] = { DefineName, Value };

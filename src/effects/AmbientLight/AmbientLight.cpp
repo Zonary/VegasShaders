@@ -897,9 +897,10 @@ namespace {
 
 bool AmbientLightEffect::ExtOn() const {
 	// UNOFFICIAL 2026-11-01 (tester: rapid flicker with AmbientLight + NvrDxvkPasses, steady with the passes off; not reproduced here):
-	// AmbientLight keeps its D3D9 passes unless [Main.Main.Performance] NvrDxvkAmbientLight is on. NvrDxvkKeepD3D9 "AmbientLight" now
-	// keeps every pass too (before, ExtDraw matched only the pass names, e.g. AmbientLightApply, so that workaround left most on Vulkan).
-	return !ExtFailed && DxvkCompute::PassesOn() && TheSettingManager->SettingsMain.Main.NvrDxvkAmbientLight && !DxvkCompute::KeptOnD3D9(Name);
+	// AmbientLight keeps its D3D9 passes unless [Main.Main.Performance] NvrDxvkAmbientLight is on — or ComputeGI (SSGI) is explicitly
+	// enabled, since ComputeGI only exists as Vulkan passes (2026-11-19: previously ComputeGI silently did nothing while NvrDxvkAmbientLight
+	// stayed at its hidden DevOnly default of false).
+	return !ExtFailed && DxvkCompute::PassesOn() && (TheSettingManager->SettingsMain.Main.NvrDxvkAmbientLight || computeGI) && !DxvkCompute::KeptOnD3D9(Name);
 }
 
 // UNOFFICIAL 2026-11-03 RT AO at RenderScale < 1 (docs/next/RT-RENDERSCALE.md, phase 1): ExtOn's rule in a rect frame, where PassesOn is

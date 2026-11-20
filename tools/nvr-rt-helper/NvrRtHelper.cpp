@@ -1050,7 +1050,7 @@ namespace {
 		const VkPipeline pipeline = BuildPipeline(h, index, failure);
 		if (!failure.empty()) {
 			Status("%s", failure.c_str());
-			InterlockedOr((volatile LONG*)&g_shared->shaderFailures, (LONG)(1u << index));
+			InterlockedOr64((volatile LONG64*)&g_shared->shaderFailures, (LONG64)(1ull << index));
 			return VK_NULL_HANDLE;
 		}
 		if (g_pipelineCacheLive) PipelineCacheSave(h.vk.device, "a shader registered after the start");
@@ -2499,7 +2499,7 @@ namespace {
 					h.pipelineTried[i] = true;
 					if (!built[i].failure.empty()) {
 						Status("%s", built[i].failure.c_str());
-						InterlockedOr((volatile LONG*)&shared->shaderFailures, (LONG)(1u << i));
+						InterlockedOr64((volatile LONG64*)&shared->shaderFailures, (LONG64)(1ull << i));
 					} else h.pipelines[i] = built[i].pipeline;
 				}
 			}

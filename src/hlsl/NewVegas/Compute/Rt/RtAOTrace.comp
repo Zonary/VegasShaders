@@ -1130,7 +1130,8 @@ void main() {
                 if (w <= 0.0) continue;
                 total += w;
             }
-            const float blocked = SkyBlocked(start, d, reach, j < 0 ? int(cb.gi3.y + 0.5) : 2, skyFlags, insideReach);
+            // UNOFFICIAL 2026-11-19: respect AOAlpha (cb.gi3.y) across all sky ring rays too (previously hardcoded alpha=2 for j >= 0).
+            const float blocked = SkyBlocked(start, d, reach, int(cb.gi3.y + 0.5), skyFlags, insideReach);
             if (j < 0) { covered = blocked; open = total * (1.0 - covered); }
             else open += w * (1.0 - blocked);   // (flags 0: open += w on a miss, as before)
         }

@@ -2293,7 +2293,7 @@ namespace {
 			instance.transform[1][3] = entry.poseCamera[1] - cy;
 			instance.transform[2][3] = entry.poseCamera[2] - cz;
 			instance.geometryId = entry.id;
-			instance.customIndex = walkingPlayer && playerHidden ? NVR_RT_CUSTOM_HIDDEN : 0u;	// (2026-11-07) the first-person body: not drawn
+			instance.customIndex = NVR_RT_CUSTOM_ACTOR | (walkingPlayer && playerHidden ? NVR_RT_CUSTOM_HIDDEN : 0u);	// (2026-11-07 hidden; 2026-11-19 actor tag)
 			instance.mask = NVR_RT_MASK_ACTOR;
 			instance.flags = 0x1u;
 			skip[kTaken]++;
@@ -3824,7 +3824,7 @@ bool RtCore::AddPass(int Shader, const int* Images, UINT ImageCount, UINT WriteM
 	// shaderFailures bit: a missing .spv, a driver that refuses the pipeline). The helper skips such a pass without a word to the game,
 	// which went on to copy out and use an image nothing had written (all shadow, or last frame's). Refused here instead, so the effect
 	// takes the path it takes for any failed AddPass (its own passes); logged once per shader.
-	if (TheCore.shared && Shader < (int)NVR_RT_MAX_SHADERS && (TheCore.shared->shaderFailures & (1u << Shader))) {
+	if (TheCore.shared && Shader < (int)NVR_RT_MAX_SHADERS && (TheCore.shared->shaderFailures & (1ull << Shader))) {
 		static uint32_t logged = 0;
 		if (!(logged & (1u << Shader))) {
 			logged |= 1u << Shader;

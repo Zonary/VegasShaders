@@ -100,7 +100,6 @@ void ShaderManager::Initialize() {
 	EnrollEffect<AmbientLightEffect>(sm, sm->Effects.AmbientLight);
 	EnrollEffect<AmbientOcclusionEffect>(sm, sm->Effects.AmbientOcclusion);
 	EnrollEffect<SkinScatteringEffect>(sm, sm->Effects.SkinScattering);	// UNOFFICIAL Conor's skin shader
-	EnrollEffect<BloodLensEffect>(sm, sm->Effects.BloodLens);
 	EnrollEffect<BloomEffect>(sm, sm->Effects.Bloom);
 	EnrollEffect<BloomLegacyEffect>(sm, sm->Effects.BloomLegacy);
 	EnrollEffect<ColoringEffect>(sm, sm->Effects.Coloring);
@@ -152,9 +151,6 @@ void ShaderManager::Initialize() {
 	EnrollEffect<WetnessReflectionsEffect>(sm, sm->Effects.WetnessReflections);	// UNOFFICIAL 2026-11-04 Wetness Effects
 	EnrollEffect<HudRaindropsEffect>(sm, sm->Effects.HudRaindrops);
 	EnrollEffect<VolumetricCloudsEffect>(sm, sm->Effects.VolumetricClouds);
-#if !NVR_SHELVED_OUT	// UNOFFICIAL 2026-11-16 ShelvedEffects.h: not in release builds
-	EnrollEffect<BloodFlowEffect>(sm, sm->Effects.BloodFlow);
-#endif
 	sm->Effects.BarrelHaze->Enabled = sm->Effects.BarrelHaze->Effect != nullptr;
 	EnrollEffect<VolumetricSmokeEffect>(sm, sm->Effects.VolumetricSmoke);
 	sm->Effects.VolumetricSmoke->Enabled = sm->Effects.VolumetricSmoke->Effect != nullptr;
@@ -164,7 +160,6 @@ void ShaderManager::Initialize() {
 	EnrollEffect<TAAEffect>(sm, sm->Effects.TAA);
 #if NVR_SHELVED_OUT
 	sm->Effects.DustMotes = nullptr;	// never created: the chain steps and every reader skip a null slot
-	sm->Effects.BloodFlow = nullptr;
 	Logger::Log("%s", ShelvedEffects::LogLine());
 	TheSettingManager->GetSettingI(ShelvedEffects::kSettingSections[0], "Enabled");	// (reads as 0; notes whether the saved file had it on)
 	if (ShelvedEffects::SavedOn) Logger::Log("Capsule shadows ([Shaders.ShadowsInteriors.Capsules] Enabled) are not part of this release (work in progress): left off although your settings file has them on; the setting is kept as it is.");
@@ -912,7 +907,6 @@ ShaderCollection* ShaderManager::GetShaderCollection(const char* shaderName) {
 	// UNOFFICIAL lit particles and blood decals (NOLIGHT006/016/017.vso, NOLIGHTTEXVC.pso, GDECAL(S)); 2026-11-05 soft particles: the rest
 	// of the NOLIGHT family too (Includes/NoLighting.hlsl), except the skinned NOLIGHT008-015.vso, which stay the game's.
 	if (ShaderNameBegins(shaderName, "NOLIGHT", 7) || ShaderNameBegins(shaderName, "GDECAL", 6)) return Shaders.Particles;
-	if (strstr(BloodShaders, shaderName)) return Shaders.Blood;	// (a substring of the list)
 
 	// Last, the families that list their shaders in a template table.
 	if (Shaders.PBR->GetTemplate(shaderName).Name) return Shaders.PBR;

@@ -502,7 +502,9 @@ void EffectRecord::Render(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTar
 	// UNOFFICIAL 2026-10-23 (NVR DXVK): the ported effects draw through the extension when it is there and on.
 	// (UNOFFICIAL 2026-10-26: not for a technique whose passes all have an SM6 build while NvrSm6Shaders is on: those draw below;
 	// nor for an effect NvrDxvkKeepD3D9 names.)
-	if (!ExtFailed && DxvkCompute::PassesOn() && !DxvkCompute::KeptOnD3D9(Name) && !Sm6Covers(techniqueIndex) && [&] { GpuDebug::LabelScope ext(Name, " (DXVK extension)");
+	// UNOFFICIAL 2026-11-19: RenderRect-aware Vulkan effects (ExtSupportsRenderRect) run through PassesOnRect() at RenderScale < 1.0 too.
+	const bool extAllowed = DxvkCompute::PassesOn() || (ExtSupportsRenderRect() && DxvkCompute::PassesOnRect());
+	if (!ExtFailed && extAllowed && !DxvkCompute::KeptOnD3D9(Name) && !Sm6Covers(techniqueIndex) && [&] { GpuDebug::LabelScope ext(Name, " (DXVK extension)");
 			return ExtRender(Device, RenderTarget, RenderedSurface, techniqueIndex, ClearRenderTarget, SourceBuffer); }()) {
 		finishOnTarget("EffectRecord::ExtRender ");
 		return;

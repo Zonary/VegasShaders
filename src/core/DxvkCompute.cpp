@@ -1,4 +1,5 @@
 #include "DxvkCompute.h"
+#include "ShaderTemplate.h"
 #include <unordered_map>
 #include "RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
 #include "CapturedNormals.h"	// UNOFFICIAL 2026-10-28 (DisplaceObjectsLayout)
@@ -341,7 +342,7 @@ bool DxvkCompute::RegisterReplacement(const char* Name, const void* Bytecode, UI
 			_snprintf_s(definesPath, sizeof(definesPath), _TRUNCATE, "%sReplace\\dump\\%s@%08X.defines", Paths::ComputeDir(), Name, hash);
 			std::ofstream defs(definesPath, std::ios::binary);
 			defs << "template=" << Template << "\n";
-			for (int d = 0; Defines && d < 64 && Defines[d].Name; d++)
+			for (int d = 0; Defines && d < ShaderTemplate::kMaxDefines && Defines[d].Name; d++)
 				defs << Defines[d].Name << "=" << (Defines[d].Definition ? Defines[d].Definition : "") << "\n";
 		}
 	}

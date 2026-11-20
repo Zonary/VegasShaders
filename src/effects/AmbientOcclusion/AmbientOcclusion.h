@@ -5,7 +5,6 @@ class AmbientOcclusionEffect : public EffectRecord
 public:
 	AmbientOcclusionEffect() : EffectRecord("AmbientOcclusion") {};
 
-	bool bNVAOLoaded = false;
 	bool packedAOFailed = false;
 	// Composite apply (set by ShaderManager around one Render call):
 	// deferCombine -- run estimate and blurs only, leaving the result in ResultTexture() for the

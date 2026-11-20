@@ -216,9 +216,12 @@ void TAAEffect::NoteWorldDraw(bool firstPerson) {
 		// size, so its whole viewport looked like a reset one, and the copy was put into the render viewport: the whole target squeezed
 		// into RenderScale of the copy, the world's picture into RenderScale squared. The water shaders, which read the copy at the
 		// projected position x TESR_RenderScale (the world target's own layout), then showed the room magnified and, past RenderScale of
-		// the frame in x or y, flat blue (indoors) or white (the Strip fountain). A world-scene pass into another target keeps the viewport
-		// it has. First-person passes (the weapon, v2) are put into the render rect as before, without this test.
-		if (!firstPerson) {
+		// the frame in x or y, flat blue (indoors) or white (the Strip fountain).
+		// UNOFFICIAL 2026-11-19 (owner: Stealth Boy first-person hands disappear and a smaller copy appears in the top-left RenderScale corner):
+		// the same rule applies to first-person passes — a Stealth Boy draws refracting arms/weapon into the game's separate full-screen
+		// refraction target (target != up.Target), which ImageSpaceEffectRefraction composites 1:1 AFTER FlushRenderScale upscales the world.
+		// Shrinking its viewport to RenderRect put the Stealth Boy hands at RenderScale x RenderScale in the top-left corner.
+		{
 			IDirect3DSurface9* target = nullptr;
 			TheRenderManager->device->GetRenderTarget(0, &target);
 			if (target) target->Release();	// (compared only: the device holds it)

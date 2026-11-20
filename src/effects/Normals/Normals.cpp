@@ -35,8 +35,8 @@ bool NormalsEffect::RenderSmooth(IDirect3DDevice9* Device) {
 
 	static GpuTimer timer("  Normal smoothing (shared)");
 	GpuProfileScope gpu(timer, Device);
-	// UNOFFICIAL 2026-10-25 (NVR DXVK): both passes as Vulkan passes (ExtSmooth); the D3D9 passes below when that is off or fails.
-	bool drawn = DxvkCompute::PassesOn() && !ExtFailed && ExtSmooth(Device);
+	// UNOFFICIAL 2026-10-25 (NVR DXVK) / 2026-11-19 RenderRect: both passes as Vulkan passes (also at RenderScale < 1.0).
+	bool drawn = DxvkCompute::PassesOnRect() && !ExtFailed && ExtSmooth(Device);
 	if (!drawn) {
 		IDirect3DSurface9* target = nullptr;
 		Device->GetRenderTarget(0, &target);
@@ -89,11 +89,14 @@ bool NormalsEffect::ExtSmooth(IDirect3DDevice9* Device) {
 	const D3DXVECTOR4* projection = Registered("TESR_ProjectionTransform");
 	if (!depth || !Textures.NormalsTexture || !Textures.NormalsSurface || !SmoothTempTexture || !SmoothTempSurface || !reciprocal || !cameraData || !projection) return false;
 
-	struct Push { D3DXVECTOR4 reciprocalResolution; D3DXVECTOR4 smoothData; D3DXVECTOR4 cameraData; D3DXMATRIX projection; UInt32 samplerIndex; UInt32 alongY; } push = {};
+	struct Push { D3DXVECTOR4 reciprocalResolution; D3DXVECTOR4 smoothData; D3DXVECTOR4 cameraData; D3DXMATRIX projection; UInt32 samplerIndex; UInt32 alongY; UInt32 pad[2]; D3DXVECTOR4 renderScale; } push = {};
 	push.reciprocalResolution = *reciprocal;
 	push.smoothData = SmoothData;
 	push.cameraData = *cameraData;
 	memcpy(&push.projection, projection, sizeof(D3DXMATRIX));
+	const float sx = RenderRect::Active() ? RenderRect::ScaleX : 1.0f;
+	const float sy = RenderRect::Active() ? RenderRect::ScaleY : 1.0f;
+	push.renderScale = D3DXVECTOR4(sx, sy, 1.0f / sx, 1.0f / sy);
 	for (UINT pass = 0; pass < 2; pass++) {
 		push.alongY = pass;
 		IDirect3DBaseTexture9* textures[] = { pass == 0 ? Textures.NormalsTexture : SmoothTempTexture, depth };
@@ -113,10 +116,13 @@ bool NormalsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rende
 	const D3DXVECTOR4* invProjection = Registered("TESR_InvProjectionTransform");
 	if (!depth || !reciprocal || !cameraData || !invProjection) return false;
 
-	struct Push { D3DXVECTOR4 reciprocalResolution; D3DXVECTOR4 cameraData; D3DXMATRIX invProjection; UInt32 samplerIndex; UInt32 pad[3]; } push = {};
+	struct Push { D3DXVECTOR4 reciprocalResolution; D3DXVECTOR4 cameraData; D3DXMATRIX invProjection; UInt32 samplerIndex; UInt32 pad[3]; D3DXVECTOR4 renderScale; } push = {};
 	push.reciprocalResolution = *reciprocal;
 	push.cameraData = *cameraData;
 	memcpy(&push.invProjection, invProjection, sizeof(D3DXMATRIX));
+	const float sx = RenderRect::Active() ? RenderRect::ScaleX : 1.0f;
+	const float sy = RenderRect::Active() ? RenderRect::ScaleY : 1.0f;
+	push.renderScale = D3DXVECTOR4(sx, sy, 1.0f / sx, 1.0f / sy);
 	IDirect3DBaseTexture9* textures[] = { depth };
 	return ExtTexturePass(Device, RenderTarget, RenderedSurface, SourceBuffer, extPass, "Normals", textures, _countof(textures), &push, sizeof(push), 96, true);
 }

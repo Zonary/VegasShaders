@@ -14,7 +14,8 @@ layout(push_constant) uniform Push {
     vec4 cameraData;			// 16: TESR_CameraData (x near, y far)
     mat4 invProjection;			// 32: TESR_InvProjectionTransform
     uint samplerIndex;			// 96: POINT, CLAMP
-    uint pad[3];
+    uint pad[3];				// 100
+    vec4 renderScale;			// 112: (scaleX, scaleY, 1/scaleX, 1/scaleY) (UNOFFICIAL 2026-11-19 RenderRect)
 } pc;
 
 float viewZAt(vec2 uv) {
@@ -23,23 +24,25 @@ float viewZAt(vec2 uv) {
 
 void main() {
     vec2 t = pc.reciprocalResolution.xy;
+    vec2 scale = pc.renderScale.x > 0.0 ? pc.renderScale.xy : vec2(1.0);
+    vec2 invScale = pc.renderScale.z > 0.0 ? pc.renderScale.zw : vec2(1.0);
     vec2 uv = gl_FragCoord.xy * t;
     vec2 lo = 0.5 * t;
-    vec2 hi = vec2(1.0) - 0.5 * t;
+    vec2 hi = scale - 0.5 * t;
     vec2 uvL1 = clamp(uv - vec2(t.x, 0.0), lo, hi), uvL2 = clamp(uv - vec2(2.0 * t.x, 0.0), lo, hi);
     vec2 uvR1 = clamp(uv + vec2(t.x, 0.0), lo, hi), uvR2 = clamp(uv + vec2(2.0 * t.x, 0.0), lo, hi);
     vec2 uvU1 = clamp(uv - vec2(0.0, t.y), lo, hi), uvU2 = clamp(uv - vec2(0.0, 2.0 * t.y), lo, hi);
     vec2 uvD1 = clamp(uv + vec2(0.0, t.y), lo, hi), uvD2 = clamp(uv + vec2(0.0, 2.0 * t.y), lo, hi);
 
-    vec3 pC = nvrViewPosition(uv, viewZAt(uv), pc.cameraData, pc.invProjection);
-    vec3 pL1 = nvrViewPosition(uvL1, viewZAt(uvL1), pc.cameraData, pc.invProjection);
-    vec3 pL2 = nvrViewPosition(uvL2, viewZAt(uvL2), pc.cameraData, pc.invProjection);
-    vec3 pR1 = nvrViewPosition(uvR1, viewZAt(uvR1), pc.cameraData, pc.invProjection);
-    vec3 pR2 = nvrViewPosition(uvR2, viewZAt(uvR2), pc.cameraData, pc.invProjection);
-    vec3 pU1 = nvrViewPosition(uvU1, viewZAt(uvU1), pc.cameraData, pc.invProjection);
-    vec3 pU2 = nvrViewPosition(uvU2, viewZAt(uvU2), pc.cameraData, pc.invProjection);
-    vec3 pD1 = nvrViewPosition(uvD1, viewZAt(uvD1), pc.cameraData, pc.invProjection);
-    vec3 pD2 = nvrViewPosition(uvD2, viewZAt(uvD2), pc.cameraData, pc.invProjection);
+    vec3 pC = nvrViewPosition(uv * invScale, viewZAt(uv), pc.cameraData, pc.invProjection);
+    vec3 pL1 = nvrViewPosition(uvL1 * invScale, viewZAt(uvL1), pc.cameraData, pc.invProjection);
+    vec3 pL2 = nvrViewPosition(uvL2 * invScale, viewZAt(uvL2), pc.cameraData, pc.invProjection);
+    vec3 pR1 = nvrViewPosition(uvR1 * invScale, viewZAt(uvR1), pc.cameraData, pc.invProjection);
+    vec3 pR2 = nvrViewPosition(uvR2 * invScale, viewZAt(uvR2), pc.cameraData, pc.invProjection);
+    vec3 pU1 = nvrViewPosition(uvU1 * invScale, viewZAt(uvU1), pc.cameraData, pc.invProjection);
+    vec3 pU2 = nvrViewPosition(uvU2 * invScale, viewZAt(uvU2), pc.cameraData, pc.invProjection);
+    vec3 pD1 = nvrViewPosition(uvD1 * invScale, viewZAt(uvD1), pc.cameraData, pc.invProjection);
+    vec3 pD2 = nvrViewPosition(uvD2 * invScale, viewZAt(uvD2), pc.cameraData, pc.invProjection);
 
     vec3 n = nvrNormal(pC, pL1, pL2, pR1, pR2, pU1, pU2, pD1, pD2);
     outColor = vec4(n * 0.5 + 0.5, 1.0);

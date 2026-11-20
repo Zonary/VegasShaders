@@ -59,7 +59,7 @@ namespace DeferredSkin {
 		if (!name || !tmpl.Name || strcmp(tmpl.Name, "SkinTemplate")) return false;
 		const size_t length = strlen(name);
 		if (length < 4 || strcmp(name + length - 4, ".pso")) return false;
-		for (int d = 0; d < 63 && tmpl.Defines[d].Name; d++)
+		for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && tmpl.Defines[d].Name; d++)
 			if (!strcmp(tmpl.Defines[d].Name, "ONLY_LIGHT") || !strcmp(tmpl.Defines[d].Name, "DIFFUSE")) return false;
 		return true;
 	}

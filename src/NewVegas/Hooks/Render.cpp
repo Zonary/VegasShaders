@@ -2351,12 +2351,9 @@ namespace ScopeSunShadows { static void ForDraw(const PointShadowForward::Render
 
 // UNOFFICIAL 2026-10-13: blood on the first-person weapon and gloves (Shaders/Includes/HandBlood.hlsl; the idea and its wiring
 // are mrfury97's HUD raindrops in the Physically-Based-Reloaded testbed). Fresh blood splats appearing near the camera (an NPC
-// hit up close: BloodFlowNewBloodNear, BloodFlow.cpp) add blood, more the nearer; it dries over DryTime and fades over FadeTime,
-// and goes underwater. The object shaders draw it only when compiled in ([Shaders.HandBlood.Status] Enabled at startup,
-// ShaderRecord.cpp HAND_BLOOD) and only for draws whose c218.x is above 0: set here for every first-person pass, cleared for
-// the first other one.
-float BloodFlowNewBloodNear(const D3DXVECTOR3& eye, float reach);
-bool BloodFlowLastTint(float out[3]);
+// hit up close) add blood, more the nearer; it dries over DryTime and fades over FadeTime, and goes underwater. The object
+// shaders draw it only when compiled in ([Shaders.HandBlood.Status] Enabled at startup, ShaderRecord.cpp HAND_BLOOD) and only
+// for draws whose c218.x is above 0: set here for every first-person pass, cleared for the first other one.
 namespace HandBlood {
 	static bool Checked = false, Compiled = false, Set = false;
 	static float Amount = 0.0f, Wet = 0.0f, Seed = 0.0f, Spray = 0.0f;
@@ -2364,6 +2361,85 @@ namespace HandBlood {
 	static float Draw[8] = {};
 	static ULONGLONG LastTick = 0;
 	static int Logged = 0;
+	static float LastTint[3] = { 0.0f, 0.0f, 0.0f };
+	static bool HaveTint = false;
+	static std::unordered_map<void*, bool> BloodTextureSets;
+
+	struct RawDecal { float Origin[3]; bool Local; void* TextureSet; void* Decal; float Tint[3]; };
+	struct DecalListNode { void* Item; DecalListNode* Next; };
+
+	static int ReadDecals(UInt32 list, RawDecal* out, int n, int max) {
+		__try {
+			DecalListNode* node = (DecalListNode*)list;
+			for (int guard = 0; node && guard < 16384 && n < max; node = node->Next, guard++) {
+				UInt8* e = (UInt8*)node->Item;
+				if (!e || *(UInt32*)e != 0x1069DDCu) continue;	// BSTempEffectSimpleDecal vtbl
+				if (!*(bool*)(e + 0x2D)) continue;
+				RawDecal& s = out[n];
+				memcpy(s.Origin, e + 0x34, 12);
+				s.Local = *(bool*)(e + 0x140);
+				s.TextureSet = *(void**)(e + 0x30);
+				s.Decal = e;
+				memcpy(s.Tint, e + 0x134, 12);
+				n++;
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+		return n;
+	}
+
+	static void ReadTexturePath(void* textureSet, char* out, int size) {
+		out[0] = 0;
+		__try {
+			const char* path = *(const char**)((UInt8*)textureSet + 0x3C);
+			if (!path) return;
+			int i = 0;
+			for (; i < size - 1 && path[i]; i++) out[i] = (char)tolower((unsigned char)path[i]);
+			out[i] = 0;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
+	}
+
+	static UInt32 HashOrigin(const float v[3]) {
+		UInt32 h = 2166136261u;
+		for (int i = 0; i < 3; i++) { UInt32 bits; memcpy(&bits, &v[i], 4); h = (h ^ bits) * 16777619u; }
+		return h;
+	}
+
+	// Game blood splats that appeared since the last call within `reach` of `eye` (reach+ = none).
+	static float NewBloodNear(const D3DXVECTOR3& eye, float reach) {
+		static RawDecal raw[1024];
+		static std::unordered_map<void*, UInt32> seen;
+		static ULONGLONG lastCall = 0;
+		const ULONGLONG now = GetTickCount64();
+		const bool fresh = lastCall == 0 || now - lastCall > 1000;
+		lastCall = now;
+		const int fromTemp = ReadDecals(0x11E0E80u + 0x58u, raw, 0, 1024);
+		const int total = ReadDecals(0x11D6A30u, raw, fromTemp, 1024);
+		float nearest = reach;
+		std::unordered_map<void*, UInt32> next;
+		next.reserve(total);
+		for (int i = 0; i < total; i++) {
+			const RawDecal& s = raw[i];
+			const UInt32 key = HashOrigin(s.Origin);
+			next[s.Decal] = key;
+			auto old = seen.find(s.Decal);
+			if (fresh || (old != seen.end() && old->second == key) || !s.TextureSet || s.Local) continue;
+			auto found = BloodTextureSets.find(s.TextureSet);
+			if (found == BloodTextureSets.end()) {
+				char path[260];
+				ReadTexturePath(s.TextureSet, path, sizeof(path));
+				found = BloodTextureSets.emplace(s.TextureSet, strstr(path, "blood") != nullptr).first;
+			}
+			if (!found->second) continue;
+			if (s.Tint[0] + s.Tint[1] + s.Tint[2] > 0.0f) { for (int c = 0; c < 3; c++) LastTint[c] = s.Tint[c]; HaveTint = true; }
+			const float dx = s.Origin[0] - eye.x, dy = s.Origin[1] - eye.y, dz = s.Origin[2] - eye.z;
+			const float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+			if (distance < nearest) nearest = distance;
+		}
+		seen.swap(next);
+		return nearest;
+	}
 
 	// Once a frame, before the scene.
 	static void Update() {
@@ -2379,7 +2455,7 @@ namespace HandBlood {
 		LastTick = now;
 		const float reach = std::clamp(TheSettingManager->GetSettingF(section, "Reach"), 10.0f, 1000.0f);
 		const D3DXVECTOR3 eye(TheRenderManager->CameraPosition.x, TheRenderManager->CameraPosition.y, TheRenderManager->CameraPosition.z);
-		const float nearest = BloodFlowNewBloodNear(eye, reach);
+		const float nearest = NewBloodNear(eye, reach);
 		if (nearest < reach) {
 			if (Amount < 0.02f) { Seed = (float)(rand() % 997); Spray = (rand() % 6283) / 1000.0f; }	// clean: a new spatter
 			const float closeness = 1.0f - nearest / reach;
@@ -2395,11 +2471,10 @@ namespace HandBlood {
 		if (TheShaderManager->GameState.isUnderwater) Amount = 0.0f;	// washed off
 		if (Amount < 0.003f) Amount = 0.0f;
 		if (TheSettingManager->GetSettingI(section, "DebugView")) { Amount = 1.0f; Wet = 1.0f; }
-		// The colour: the game's own blood decals' (their colour times the splatter texture's grey, BloodFlow's MatchShade), as a
-		// texture colour; Color until one has been seen.
-		float tint[3];
-		const float shade = std::clamp(TheSettingManager->GetSettingF("Shaders.BloodFlow.Main", "MatchShade"), 0.01f, 1.0f);
-		if (BloodFlowLastTint(tint)) for (int c = 0; c < 3; c++) Draw[4 + c] = std::clamp(tint[c] * shade, 0.0f, 1.0f);
+		// The colour: the game's own blood decals' (their colour times the splatter texture's grey shade 0.12),
+		// falling back to ColorR/G/B until one has been seen.
+		constexpr float kMatchShade = 0.12f;
+		if (HaveTint) for (int c = 0; c < 3; c++) Draw[4 + c] = std::clamp(LastTint[c] * kMatchShade, 0.0f, 1.0f);
 		else {
 			Draw[4] = TheSettingManager->GetSettingF(section, "ColorR");
 			Draw[5] = TheSettingManager->GetSettingF(section, "ColorG");
@@ -3032,6 +3107,22 @@ namespace GrassFirst {
 				RestoreMask = (unsigned)TheShaderManager->Shaders.Grass->DrawFirstRestore;
 				CullDraws = TheShaderManager->Shaders.Grass->DrawFirstCull;
 				Save();
+				// UNOFFICIAL 2026-11-19 (tester log: BackDepth / ShadowManager left device ZFUNC = 4 LESSEQUAL on reversed depth before early grass,
+				// so every early grass card / 3D mesh draw was depth-rejected against the 0.0 clear while strands & shadows kept drawing):
+				// explicitly enforce the scene's depth test on both the game's state cache and the device for the early grass pass.
+				IDirect3DDevice9* grassDev = TheRenderManager->device;
+				NiDX9RenderState* grassRs = TheRenderManager->renderState;
+				DWORD savedEarlyZEnable = D3DZB_TRUE, savedEarlyZWrite = TRUE, savedEarlyZFunc = D3DCMP_LESSEQUAL;
+				grassDev->GetRenderState(D3DRS_ZENABLE, &savedEarlyZEnable);
+				grassDev->GetRenderState(D3DRS_ZWRITEENABLE, &savedEarlyZWrite);
+				grassDev->GetRenderState(D3DRS_ZFUNC, &savedEarlyZFunc);
+				const DWORD wantEarlyZFunc = TheRenderManager->IsReversedDepth() ? D3DCMP_GREATEREQUAL : D3DCMP_LESSEQUAL;
+				grassRs->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE, RenderStateArgs);
+				grassRs->SetRenderState(D3DRS_ZWRITEENABLE, TRUE, RenderStateArgs);
+				grassRs->SetRenderState(D3DRS_ZFUNC, wantEarlyZFunc, RenderStateArgs);
+				grassDev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+				grassDev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+				grassDev->SetRenderState(D3DRS_ZFUNC, wantEarlyZFunc);
 				GrassShaders::DrawPart = 1;
 				Recording = true;
 				// UNOFFICIAL 2026-10-27 GPU grass (effects/GpuGrass.h): when it takes this call, NewGrass stays out of it (both hook the same draw call)
@@ -3050,6 +3141,12 @@ namespace GrassFirst {
 				DrawGrassShadows();
 				GrassShaders::DrawPart = 0;
 				((void(__cdecl*)())kEndPass)();
+				grassRs->SetRenderState(D3DRS_ZENABLE, savedEarlyZEnable, RenderStateArgs);
+				grassRs->SetRenderState(D3DRS_ZWRITEENABLE, savedEarlyZWrite, RenderStateArgs);
+				grassRs->SetRenderState(D3DRS_ZFUNC, savedEarlyZFunc, RenderStateArgs);
+				grassDev->SetRenderState(D3DRS_ZENABLE, savedEarlyZEnable);
+				grassDev->SetRenderState(D3DRS_ZWRITEENABLE, savedEarlyZWrite);
+				grassDev->SetRenderState(D3DRS_ZFUNC, savedEarlyZFunc);
 				Restore();
 				ActiveAccumulator = accumulator;
 				RecordedFrame = TheFrameRateManager->FrameNumber;	// fixes-b #29: the late part replays these pass pointers in this frame only
@@ -3365,14 +3462,14 @@ namespace GameEyes {
 		if (family) {
 			ShaderTemplate tmpl = family->GetTemplate(ps->Name);
 			if (tmpl.Name && !strcmp(tmpl.Name, "ObjectTemplate")) {
-				static D3DXMACRO eye[] = { { "NVR_EYE", "1" }, { "FORWARD_SHADOWS", "0" }, { "INTERIOR_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" },
+				static D3DXMACRO eye[] = { { "NVR_EYE", "1" }, { "INTERIOR_SHADOWS", "0" }, { "SUN_CROSSFADE", "0" },
 					{ "CONTACT_HARDENING", "0" }, { NULL, NULL } };
 				const double start = CpuTimer::NowMs();
 				record = (ShaderRecordPixel*)ShaderRecord::LoadShader(ps->Name, NULL, tmpl, "Eyes\\", eye);
 				// its SetCT runs inside the draw, after the game bound the pass's textures: it must not empty the stages (a pixel record's
 				// SetCT clears all 16 at a normal bind). The second eye drawn had no colour texture, so came out black (warm slot, 11-09).
 				if (record) record->ClearSamplers = false;
-				Logger::Log("UNOFFICIAL eye variant: %s %s (%.0f ms)", ps->Name, record ? "has its eye record (eyes: ambient + wrapped diffuse, no shadows, no metal)" :
+				Logger::Log("UNOFFICIAL eye variant: %s %s (%.0f ms)", ps->Name, record ? "has its eye record (eyes: ambient + wrapped diffuse, offset sun shadow, no metal)" :
 					"did not load an eye record: its eyes keep the old way", CpuTimer::NowMs() - start);
 			}
 		}
@@ -5722,6 +5819,10 @@ static void RenderMainMenuMovie() {
 
 CallDetour kRenderInterfaceDetour;
 void __fastcall RenderInterfaceHook(void* apThis, void*, void* apCuller, bool abPipboyVisible) {
+	if (!TheRenderManager || !TheShaderManager) {
+		ThisCall(kRenderInterfaceDetour.GetOverwrittenAddr(), apThis, apCuller, abPipboyVisible);
+		return;
+	}
 	SessionLog::StageScope stage("the interface");
 	// UNOFFICIAL 2026-11-16 fast-restart (core/LateInteriors.h): at the main menu the lamp-shadow records are made once the workers finish them;
 	// the warm-ups (native D3D9) wait for that, so they draw those records too, as before
@@ -5858,7 +5959,8 @@ void __fastcall MuzzleLightCullingFix(MuzzleFlash* This) {
 BSFogProperty* __cdecl ShadowSceneNode__GetFogPropertyEx(UInt32 aeType) {
 	// The master switch counts too: with RenderEffects off NVR's fog is not drawn, so the game's must stay (2026-10-16 vanilla
 	// check: "NVR all off" showed no distance fog at all).
-	if (TheSettingManager->SettingsMain.Main.RenderEffects && TheShaderManager->Effects.VolumetricFog->Enabled && !TheShaderManager->GameState.isUnderwater) {
+	if (TheSettingManager && TheShaderManager && TheShaderManager->Effects.VolumetricFog &&
+		TheSettingManager->SettingsMain.Main.RenderEffects && TheShaderManager->Effects.VolumetricFog->Enabled && !TheShaderManager->GameState.isUnderwater) {
 		aeType = 1;  // Use UI scene node and thus render no fog.
 	}
 

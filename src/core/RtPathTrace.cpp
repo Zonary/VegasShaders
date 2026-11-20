@@ -207,6 +207,8 @@ namespace {
 
 	int			imageA = -1, imageB = -1, imageDisplay = -1, shader = -1;
 	int			shaderGrid = -1;
+	int			shaderPrimary = -1, shaderPrimaryGrid = -1, shaderSpatial = -1, shaderBounce = -1, shaderBounceGrid = -1;	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split
+	bool		splitScratchReady = false;
 	int			shaderCache = -1;	// (2026-11-07) PTRadianceCache's resolve pass (RtPathTraceCache.spv)
 	int			cacheLog2Setup = 0;	// (2026-11-07) the cache's entries (log2) the scratch store was sized for at this helper start (0: none)	// (2026-11-04) PTLightGrid's variant (RtPathTraceGrid.spv: RtPathTrace.comp with PT_LIGHT_GRID)
 	// UNOFFICIAL 2026-11-04 d PTRestirGI (RT-PATH-TRACING.md section 29): the trace's variant (the first bounce written out), the reuse pass,
@@ -267,13 +269,17 @@ namespace {
 	constexpr int kFlashOwnTexel = 305, kFlashRasterTexel = 306, kFlashRasterTexel2 = 298;
 	// UNOFFICIAL 2026-11-15 (rt-reuse) PTRestirCGNS's candidates for ReSTIR DI: texel 299.x (RtPathTrace.comp kCgnsTexel: keep them equal), y 0
 	constexpr int kCgnsTexel = 299;
-	static_assert(kCgnsTexel > kFlashRasterTexel2 && kCgnsTexel < kFlashOwnTexel && kCgnsTexel < kLightTexels, "PTRestirCGNS's frame row texel");
+	constexpr int kSplitBaseTexel = 300;	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split scratch base (4096-word pages; RtPathTrace.comp kSplitBaseTexel)
+	static_assert(kCgnsTexel > kFlashRasterTexel2 && kSplitBaseTexel < kFlashOwnTexel && kSplitBaseTexel < kLightTexels, "PTRestirCGNS / 3-pass split frame row texel");
 	RtRestirRow::State restirState;
 	// (2026-11-07) the scratch store's layout: the ReSTIR DI reservoirs (two sets of w x h x 4 words) at word 0, the radiance cache from here
 	// (2026-11-07 ptaaa-emissive: two sets of w x h x 6 words, was x 4: an emissive sample's triangle and barycentrics)
 	unsigned long long CacheBaseWords(UINT w, UINT h) { return ((12ull * w * h + 4095ull) / 4096ull) * 4096ull; }
 	// (2026-11-07 ptaaa-emissive) PTEmissive's blocks + triangle list after the radiance cache's table (RtEmissiveRow.h kScratchWords)
 	unsigned long long EmissiveBaseWords(UINT w, UINT h, int cacheLog2) { return CacheBaseWords(w, h) + (16ull << cacheLog2); }
+	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split region (6 words/px intermediate temporal reservoirs + 16 words/px primary payload)
+	unsigned long long SplitBaseWords(UINT w, UINT h, int cacheLog2) { return ((EmissiveBaseWords(w, h, cacheLog2) + (unsigned long long)RtEmissiveRow::kScratchWords + 4095ull) / 4096ull) * 4096ull; }
+	unsigned long long SplitNeedWords(UINT w, UINT h) { return 22ull * w * h; }
 	RtEmissiveRow::State emissiveState;
 	int			shaderEmissive = -1;	// RtEmissiveBuild.spv
 	int			emissiveCount = 0;	// this frame's
@@ -452,7 +458,7 @@ namespace {
 		S.earlyLook = i("PTEarlyLook", 0, 3);	// UNOFFICIAL 2026-11-11 (a missing key: 0, off)
 		{ SettingManager::Configuration::ConfigNode cn; S.denoiseCeiling = TheSettingManager->Config.FillNode(&cn, kSection, "PTDenoiseCeiling") ? (std::min)((std::max)(cn.FloatValue, 0.0f), 60000.0f) : 200.0f; }	// UNOFFICIAL 2026-11-11 (a missing key: the documented 200; 0 = the old 60000)
 		{ SettingManager::Configuration::ConfigNode ln; S.restirDILampMatch = TheSettingManager->Config.FillNode(&ln, kSection, "PTRestirDILampMatch") ? (std::min)((std::max)(ln.FloatValue, 0.0f), 256.0f) : 32.0f; }	// UNOFFICIAL 2026-11-10 (BUG FIX: a missing key reads the documented 32; 0 = the old exact match)
-		S.restirDIRays = i("PTRestirDIRays", 0, 3);	// (2026-11-07 perf-ptcost)
+		S.restirDIRays = i("PTRestirDIRays", 0, 4);	// (2026-11-07 perf-ptcost; 2026-11-19 mode 4 = RTXDI 2-ray visibility)
 		S.restirCGNS = i("PTRestirCGNS", 0, 31);	// UNOFFICIAL 2026-11-15 (rt-reuse; a missing key: 0, off)
 		S.restirDupMap = i("PTRestirDupMap", 0, 1) != 0;
 		S.bounceLights = i("PTBounceLights", 0, 1);
@@ -942,7 +948,10 @@ namespace {
 		// (2026-11-07) the scratch store (binding 20): PTRestirDI's reservoirs, two sets of 16 bytes a pixel at the screen's size
 		// + (2026-11-07) PTRadianceCache's table after them (64 bytes an entry; its size is fixed at the helper start: PTCacheEntriesLog2 needs a restart)
 		cacheLog2Setup = (std::min)((std::max)(TheSettingManager->GetSettingI(kSection, "PTCacheEntriesLog2"), 12), 22);
-		RtCore::AskScratch((UINT)((EmissiveBaseWords(w, h, cacheLog2Setup) * 4ull + 4ull * RtEmissiveRow::kScratchWords + (1ull << 20) - 1) >> 20) + 1u);	// (+ PTEmissive)
+		const UINT baseScratchMB = (UINT)((EmissiveBaseWords(w, h, cacheLog2Setup) * 4ull + 4ull * RtEmissiveRow::kScratchWords + (1ull << 20) - 1) >> 20) + 1u;
+		const UINT splitScratchMB = (UINT)(((SplitBaseWords(w, h, cacheLog2Setup) + SplitNeedWords(w, h)) * 4ull + (1ull << 20) - 1) >> 20) + 1u;
+		splitScratchReady = splitScratchMB <= 1024u;
+		RtCore::AskScratch(splitScratchReady ? splitScratchMB : baseScratchMB);
 		emissiveState = RtEmissiveRow::State();
 		restirState.valid = false;
 		// (2026-11-04 d) PTRestirGI's images (9). (2026-11-05) Only when PTRestirGI is on at the helper start (off by default; turning it on
@@ -1381,6 +1390,8 @@ namespace {
 					}
 					row[2 * RtEmissiveRow::kFrameTexel] = (float)emissiveCount;
 					row[2 * RtEmissiveRow::kFrameTexel + 1] = (float)(EmissiveBaseWords(w, h, cacheLog2Setup) / 4096ull);
+					row[2 * kSplitBaseTexel] = splitScratchReady ? (float)(SplitBaseWords(w, h, cacheLog2Setup) / 4096ull) : 0.0f;
+					row[2 * kSplitBaseTexel + 1] = 0.0f;
 				}
 				lampTexture->UnlockRect(0);
 				if (RtCore::CopyIn(imageLamps, lampTexture)) { flags |= 1024u | (gridOn ? 4096u : 0u) | (restir ? 262144u : 0u) | (cache ? 524288u : 0u) | (restir || cache || energy ? 1048576u : 0u); c.misc[0] = (float)lampCount; c.rect[2] = (float)glowCount; }
@@ -1450,7 +1461,25 @@ namespace {
 			int images16[16];
 			memcpy(images16, images, sizeof(images));
 			images16[15] = split ? imageSpec : imageDisplay;
-			if (!RtCore::AddPass(flags & 4096u ? shaderGrid : shader, images16, split ? 16 : 15, 0x7u | (flags & 512u ? 1u << 13 : 0u) | (split ? 1u << 15 : 0u), &c, sizeof(c), (tw + 7) / 8, (th + 7) / 8)) return;
+			const UINT imgCount = split ? 16u : 15u;
+			const UINT writeMask = 0x7u | (flags & 512u ? 1u << 13 : 0u) | (split ? 1u << 15 : 0u);
+			const UINT gx = (tw + 7) / 8, gy = (th + 7) / 8;
+			// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass split (Primary+Temporal -> Spatial+Boiling -> Secondary Bounces) for realtime 1-SPP ReSTIR DI.
+			const bool useGrid = (flags & 4096u) != 0u;
+			const int p1Shader = useGrid ? shaderPrimaryGrid : shaderPrimary;
+			const int p3Shader = useGrid ? shaderBounceGrid : shaderBounce;
+			const bool want3Pass = splitScratchReady && (flags & 512u) != 0u && (flags & 262144u) != 0u && S.debugView == 0 && S.samples == 1 &&
+				p1Shader >= 0 && shaderSpatial >= 0 && p3Shader >= 0 && RtCore::PassesLeft() >= (3 + ((flags & 524288u) ? 1 : 0));
+			bool dispatched = false;
+			if (want3Pass && RtCore::AddPass(p1Shader, images16, imgCount, 0u, &c, sizeof(c), gx, gy)) {
+				if (RtCore::AddPass(shaderSpatial, images16, imgCount, 0u, &c, sizeof(c), gx, gy) &&
+					RtCore::AddPass(p3Shader, images16, imgCount, writeMask, &c, sizeof(c), gx, gy)) {
+					dispatched = true;
+					static bool splitLogged = false;
+					if (!splitLogged) { splitLogged = true; Logger::Log("UNOFFICIAL RT path trace: 3-pass split active (Primary+Temporal -> Spatial+Boiling -> Secondary Bounces)"); }
+				} else return;
+			}
+			if (!dispatched && !RtCore::AddPass(useGrid ? shaderGrid : shader, images16, imgCount, writeMask, &c, sizeof(c), gx, gy)) return;
 			if (flags & 524288u) {	// (2026-11-07) PTRadianceCache: fold this frame's samples into the cells (RtPathTraceCache.comp)
 				const UINT entries = 1u << cacheLog2Setup;
 				// (2026-11-07 perf-history) PTCacheMaxFrames is frames at 60 fps (the lag behind a change of light): the same seconds here.
@@ -2024,6 +2053,11 @@ namespace RtPathTrace {
 	void Register() {
 		shader = RtCore::AddShader("RtPathTrace");
 		shaderGrid = RtCore::AddShader("RtPathTraceGrid");	// (2026-11-04) PTLightGrid
+		shaderPrimary = RtCore::AddShader("RtPathTracePrimary");	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split
+		shaderPrimaryGrid = RtCore::AddShader("RtPathTracePrimaryGrid");
+		shaderSpatial = RtCore::AddShader("RtPathTraceSpatial");
+		shaderBounce = RtCore::AddShader("RtPathTraceBounce");
+		shaderBounceGrid = RtCore::AddShader("RtPathTraceBounceGrid");
 		shaderCache = RtCore::AddShader("RtPathTraceCache");	// (2026-11-07) PTRadianceCache's resolve pass
 		shaderEmissive = RtCore::AddShader("RtEmissiveBuild");	// (2026-11-07 ptaaa-emissive) PTEmissive's light list
 		shaderGI = RtCore::AddShader("RtPathTraceGI");		// (2026-11-04 d) PTRestirGI

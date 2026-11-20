@@ -15,6 +15,8 @@ layout(push_constant) uniform Push {
     vec4 depthConstants;        // 32: TESR_DepthConstants (x view model near Z)
     mat4 invProjection;         // 48: TESR_InvProjectionTransform
     uint samplerIndex;          // 112: POINT, CLAMP
+    uint pad[3];                // 116
+    vec4 renderScale;           // 128: (scaleX, scaleY, 1/scaleX, 1/scaleY) (UNOFFICIAL 2026-11-19 RenderRect)
 } pc;
 
 layout(location = 0) in vec2 uv;
@@ -46,14 +48,19 @@ vec2 combinedDepthAt(vec2 p) {
 void main() {
     vec2 texel = pc.reciprocalResolution.xy;
     float farZ = pc.cameraData.y;
+    vec2 scale = pc.renderScale.x > 0.0 ? pc.renderScale.xy : vec2(1.0);
+    vec2 invScale = pc.renderScale.z > 0.0 ? pc.renderScale.zw : vec2(1.0);
+    vec2 ruv = uv * scale;
+    vec2 lo = 0.5 * texel;
+    vec2 hi = scale - 0.5 * texel;
 
-    vec2 centerDepth = combinedDepthAt(uv);
-    vec3 viewNormal = viewNormalFromTaps(uv, texel, pc.invProjection, farZ,
+    vec2 centerDepth = combinedDepthAt(clamp(ruv, lo, hi));
+    vec3 viewNormal = viewNormalFromTaps(uv, texel * invScale, pc.invProjection, farZ,
         centerDepth,
-        combinedDepthAt(uv + vec2(1.0, 0.0) * texel), combinedDepthAt(uv + vec2(2.0, 0.0) * texel),
-        combinedDepthAt(uv + vec2(-1.0, 0.0) * texel), combinedDepthAt(uv + vec2(-2.0, 0.0) * texel),
-        combinedDepthAt(uv + vec2(0.0, -1.0) * texel), combinedDepthAt(uv + vec2(0.0, -2.0) * texel),
-        combinedDepthAt(uv + vec2(0.0, 1.0) * texel), combinedDepthAt(uv + vec2(0.0, 2.0) * texel));
+        combinedDepthAt(clamp(ruv + vec2(1.0, 0.0) * texel, lo, hi)), combinedDepthAt(clamp(ruv + vec2(2.0, 0.0) * texel, lo, hi)),
+        combinedDepthAt(clamp(ruv + vec2(-1.0, 0.0) * texel, lo, hi)), combinedDepthAt(clamp(ruv + vec2(-2.0, 0.0) * texel, lo, hi)),
+        combinedDepthAt(clamp(ruv + vec2(0.0, -1.0) * texel, lo, hi)), combinedDepthAt(clamp(ruv + vec2(0.0, -2.0) * texel, lo, hi)),
+        combinedDepthAt(clamp(ruv + vec2(0.0, 1.0) * texel, lo, hi)), combinedDepthAt(clamp(ruv + vec2(0.0, 2.0) * texel, lo, hi)));
 
     o_depth = vec4(centerDepth.x, centerDepth.y, 1.0, 1.0);
     o_normal = vec4(viewNormal * 0.5 + 0.5, 1.0);

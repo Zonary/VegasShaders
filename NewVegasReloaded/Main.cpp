@@ -103,9 +103,6 @@ namespace {
 			combine->JG_GetClipDist = reinterpret_cast<float(__cdecl*)()>(GetProcAddress(jg, "JGGetViewmodelClipDistance"));
 		}
 
-		// Vanilla Plus AO present: NVR's ambient occlusion knows the game's AO is replaced
-		if (GetModuleHandle(L"VanillaPlusAO.dll")) TheShaderManager->Effects.AmbientOcclusion->bNVAOLoaded = true;
-
 		// (Vanilla Plus Skin is detected earlier, in InitializeRendererHook (core/Hooks/GameCommon.cpp): the game has made all
 		// its SKIN shaders by the time this message arrives, so knowing it here would be too late.)
 

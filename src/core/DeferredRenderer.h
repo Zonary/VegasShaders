@@ -135,7 +135,7 @@ namespace DeferredRenderer {
 		// record: LightFreeRecords::Eligible); it binds inside the main list's span, where DeferredDistant draws the game's geometry group 0
 		const bool farLand = (!strcmp(tmpl.Name, "TerrainLODTemplate") || !strcmp(tmpl.Name, "TerrainFadeTemplate")) && DeferredDistant::CompiledIn();	// (2026-11-15 DeferredSun: + the hand-over band, its sun taken out with the land's under it)
 		if (!object && !parallax && !(land && mode >= 2) && !(farLand && mode >= 2)) return false;
-		for (int d = 0; d < 63 && tmpl.Defines[d].Name; d++) {
+		for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && tmpl.Defines[d].Name; d++) {
 			const char* define = tmpl.Defines[d].Name;
 			if (!strcmp(define, "DIFFUSE") || !strcmp(define, "ONLY_SPECULAR") || !strcmp(define, "NO_LIGHT") || (!strcmp(define, "HAIR") && !LightFreeRecords::HairDeferred())) return false;	// (2026-11-15 DeferredHair)
 		}
@@ -143,7 +143,7 @@ namespace DeferredRenderer {
 	}
 
 	inline bool HasDefine(const ShaderTemplate& tmpl, const char* define) {
-		for (int d = 0; d < 63 && tmpl.Defines[d].Name; d++) if (!strcmp(tmpl.Defines[d].Name, define)) return true;
+		for (int d = 0; d < ShaderTemplate::kMaxDefines - 1 && tmpl.Defines[d].Name; d++) if (!strcmp(tmpl.Defines[d].Name, define)) return true;
 		return false;
 	}
 	// gameHandle (2026-11-18 DeferredStandalone): with no forward record, the game's own shader takes the forward record's place in the span-end

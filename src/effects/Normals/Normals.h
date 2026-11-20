@@ -23,6 +23,7 @@ public:
 
 	// UNOFFICIAL 2026-10-25 (NVR DXVK): the normals pass as src\hlsl\NewVegas\Compute\Normals.frag (EffectRecord::ExtRender).
 	bool	ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTarget, IDirect3DSurface9* RenderedSurface, UINT techniqueIndex, bool ClearRenderTarget, IDirect3DSurface9* SourceBuffer) override;
+	bool	ExtSupportsRenderRect() const override { return true; }
 
 	// UNOFFICIAL 2026-10-23 (sharednormals; [Main.Main.Quality] SmoothNormals = reach in pixels, 0 off): the normals buffer smoothed
 	// in place right after it is drawn (technique NormalsSmooth, Normals.fx.hlsl), so every effect reading TESR_NormalsBuffer gets

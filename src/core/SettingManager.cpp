@@ -85,6 +85,12 @@ static bool RetiredSetting(const std::string& Name) {
 		"Shaders.Reflections.RT.DenoiserClip",
 	};
 	for (const char* k : kKeys) if (Name == k) return true;
+	// (2026-11-19: BloodFlow, BloodLens, and dead Blood stub removed; keep old user configs quiet)
+	static const char* const kPrefixes[] = { "Shaders.BloodFlow", "Shaders.BloodLens", "Shaders.Blood" };
+	for (const char* p : kPrefixes) {
+		const size_t n = strlen(p);
+		if (Name.compare(0, n, p) == 0 && (Name.size() == n || Name[n] == '.')) return true;
+	}
 	return false;
 }
 
