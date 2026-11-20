@@ -34,6 +34,7 @@
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the SunSmoothing notes)
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: shelved effects have no page, row or search entry in a release build
 #include "SettingForce.h"	// UNOFFICIAL 2026-11-16: keys the deferred renderer sets (on or off) show greyed, at the value in effect
+#include "CompileProgress.h"	// UNOFFICIAL 2026-11-20: close startup shader-compile overlay once the first frame arrives
 
 // The settings overlay (ImGui on the game's D3D9 device). Layout, top to bottom: a menu bar (File / View / Tools and the
 // global switches), the sidebar of sections next to the page of the selected section, and a one-line status bar. Input
@@ -336,10 +337,12 @@ void ImGuiManager::Initialize() {
 
 	gOverlay.ready = true;
 	Logger::Log("ImGuiManager: Initialized");
+	CompileProgress::Finish();	// UNOFFICIAL 2026-11-20: startup shader compilation finished; close progress overlay if shown
 	ShaderRecord::LogCompileTimes();	// UNOFFICIAL 2026-11-11: the start's slowest shader compiles (log only; docs/next/SHADER-COMPILE-TIMES-2026-11-11.md)
 }
 
 void ImGuiManager::Shutdown() {
+	CompileProgress::Finish();
 	if (!gOverlay.ready) return;
 	SetOverlayVisible(false);
 	MenuSkin::Release();
@@ -5698,24 +5701,31 @@ static void RenderQuickSettingsPage() {
 			"FSR (AMD upscaler / AA)",
 			"DLSS (NVIDIA upscaler / AA)"
 		};
-		const int aaMode = DetectAaUpscalerMode();
+		const int aaCount = DxvkCompute::Available() ? 6 : 4;
+		const int aaMode = (std::min)(DetectAaUpscalerMode(), aaCount - 1);
 		ImGui::PushID("qs_aa");
 		const float aaW = MenuWidgets::RowBegin("Anti-aliasing", MenuWidgets::ResetSlotWidth());
 		ImGui::SetNextItemWidth(aaW);
-		const int pickedAa = NamePicker("##aa", kAaNames[aaMode], kAaNames, 6, aaMode);
+		const int pickedAa = NamePicker("##aa", kAaNames[aaMode], kAaNames, aaCount, aaMode);
 		if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
-			WrappedTooltip("Picks one anti-aliasing or upscaling method and turns conflicting ones off cleanly.");
+			WrappedTooltip(DxvkCompute::Available()
+				? "Picks one anti-aliasing or upscaling method and turns conflicting ones off cleanly."
+				: "Picks one anti-aliasing method. FSR and DLSS are disabled because the Vegas Shaders DXVK fork is not loaded.");
 		ImGui::PopID();
 		if (pickedAa >= 0 && pickedAa != aaMode) {
 			TheSettingManager->SetSetting("Main.Main.ReducedQuality", "FXAA", pickedAa == 1);
 			SetShaderEnabled("SMAA", pickedAa == 2);
 			SetShaderEnabled("TAA", pickedAa >= 3);
-			TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", pickedAa == 4);
-			TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", pickedAa == 5);
+			if (DxvkCompute::Available()) {
+				TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", pickedAa == 4);
+				TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", pickedAa == 5);
+			}
 			TheSettingManager->LoadSettings();
 		}
-		if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
-		else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+		if (DxvkCompute::Available()) {
+			if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
+			else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+		}
 	}
 
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 1.25f));
@@ -6193,7 +6203,10 @@ static void RenderCatCamera() {
 		DrawSimpleEffectCard("Tonemapping", "Tone mapping", { "Main", "Interiors", "Night" }, "Filmic tone curve, contrast and night colour shift.");
 		DrawSimpleEffectCard("Exposure", "Exposure", { "Main", "Interiors", "Night" }, "Auto-exposure brightness adaptation.");
 		DrawSimpleEffectCard("LocalExposure", "Local exposure", { "Main" }, "Keeps bright skies and dark corners balanced together.");
-		DrawSimpleEffectCard("HDR", "HDR output", { "Main" }, "High dynamic range output settings.");
+		if (DxvkCompute::Available())
+			DrawSimpleEffectCard("HDR", "HDR output", { "Main" }, "High dynamic range output settings.");
+		else if (MenuWidgets::SubHeader("HDR output (requires Vegas Shaders DXVK)###cat_hdr_nodxvk", false))
+			ImGui::TextDisabled("HDR output is inactive on native D3D9 / stock DXVK (Windows Auto HDR is controlled in Windows Display settings).");
 		DrawSimpleEffectCard("Bloom", "Bloom", { "Main", "Night", "Interiors" }, "Soft glow around bright lights and skies.");
 		DrawSimpleEffectCard("BloomLegacy", "Legacy bloom", { "Exteriors", "Interiors" }, "Older bloom for legacy presets.");
 		DrawSimpleEffectCard("LUT", "Colour lookup table (LUT)", { "Main" }, "Custom colour grading LUT files.", true);
@@ -6222,23 +6235,30 @@ static void RenderCatAA() {
 			"Off", "FXAA (fast)", "SMAA (sharp, low cost)",
 			"TAA (temporal anti-aliasing)", "FSR (AMD upscaler / AA)", "DLSS (NVIDIA upscaler / AA)"
 		};
-		const int aaMode = DetectAaUpscalerMode();
+		const int aaCount = DxvkCompute::Available() ? 6 : 4;
+		const int aaMode = (std::min)(DetectAaUpscalerMode(), aaCount - 1);
 		ImGui::PushID("cat_aa");
 		const float aw = MenuWidgets::RowBegin("Method", MenuWidgets::ResetSlotWidth());
 		ImGui::SetNextItemWidth(aw);
-		const int picked = NamePicker("##aa", kAaNames[aaMode], kAaNames, 6, aaMode);
+		const int picked = NamePicker("##aa", kAaNames[aaMode], kAaNames, aaCount, aaMode);
 		ImGui::PopID();
 		if (picked >= 0 && picked != aaMode) {
 			TheSettingManager->SetSetting("Main.Main.ReducedQuality", "FXAA", picked == 1);
 			SetShaderEnabled("SMAA", picked == 2);
 			SetShaderEnabled("TAA", picked >= 3);
-			TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", picked == 4);
-			TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", picked == 5);
+			if (DxvkCompute::Available()) {
+				TheSettingManager->SetSetting("Shaders.TAA.FSR", "Enabled", picked == 4);
+				TheSettingManager->SetSetting("Shaders.TAA.DLSS", "Enabled", picked == 5);
+			}
 			TheSettingManager->LoadSettings();
 		}
+		if (!DxvkCompute::Available())
+			ImGui::TextDisabled("FSR and DLSS are disabled automatically when the Vegas Shaders DXVK fork is not loaded.");
 		s_inCategoryPage = true;
-		if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
-		else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+		if (DxvkCompute::Available()) {
+			if (aaMode == 4) DrawVisualItem({ "Shaders.TAA.FSR", "RenderScale", nullptr }, false);
+			else if (aaMode == 5) DrawVisualItem({ "Shaders.TAA.DLSS", "RenderScale", nullptr }, false);
+		}
 		s_inCategoryPage = false;
 		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
 	}

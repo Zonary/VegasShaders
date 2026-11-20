@@ -348,17 +348,17 @@ namespace DeferredSkin {
 		if (!DrawnThisSpan || FillFailed || !blurSurface || !albedoSurface || !CapturedNormals::Texture || !CapturedNormals::AlbedoTexture) return false;
 		if (!FillScatterPS) {
 			static const char* kScatter =
-				"sampler2D N : register(s0);"
+				"sampler2D N : register(s0); sampler2D A : register(s1);"
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
-				"  float4 n = tex2D(N, uv); clip(n.a - 3.5);"
+				"  float4 n = tex2D(N, uv); clip(min(n.a - 3.5, tex2D(A, uv).a - 0.5));"
 				"  return float4(0.0, 0.0, 0.0, n.b); }";
 			// (2026-11-15 SSS v2) the share from the highlight target: N normals, A albedo (its a: the keep, Includes/DeferredPixel.hlsl
 			// FDAddedLightKeep under GBufferV2), F the frame's copy, S the highlights; G as below
 			static const char* kShare =
 				"sampler2D N : register(s0); sampler2D A : register(s1); sampler2D F : register(s2); sampler2D S : register(s3); float4 G : register(c0);"
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
-				"  float4 n = tex2D(N, uv); clip(n.a - 3.5);"
-				"  float a = tex2D(A, uv).a; float keep = saturate(a > 4.5 ? a - 5.0 : a > 2.5 ? a - 3.0 : a > 1.0001 ? a - 1.0 : a);"
+				"  float4 n = tex2D(N, uv); float a = tex2D(A, uv).a; clip(min(n.a - 3.5, a - 0.5));"
+				"  float keep = saturate(a > 4.5 ? a - 5.0 : a > 2.5 ? a - 3.0 : a > 1.0001 ? a - 1.0 : a);"
 				"  float3 f = max(tex2D(F, uv).rgb, 0.0); float3 s = max(tex2D(S, uv).rgb, 0.0) * keep;"
 				"  float e = G.x > 1.0 ? 1.0 / G.x : 1.0;"
 				"  float3 fLin = G.y > 0.5 ? f : (G.x > 1.0 ? pow(f, G.x) : f);"
@@ -371,8 +371,8 @@ namespace DeferredSkin {
 			static const char* kAlbedo =
 				"sampler2D N : register(s0); sampler2D A : register(s1); sampler2D F : register(s2); float4 G : register(c0);"
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
-				"  clip(tex2D(N, uv).a - 3.5);"
-				"  float3 a = max(tex2D(A, uv).rgb, 0.0); float3 f = max(tex2D(F, uv).rgb, 0.0);"
+				"  float4 a4 = tex2D(A, uv); clip(min(tex2D(N, uv).a - 3.5, a4.a - 0.5));"
+				"  float3 a = max(a4.rgb, 0.0); float3 f = max(tex2D(F, uv).rgb, 0.0);"
 				"  if (G.x > 1.0) a = pow(a, 1.0 / G.x);"
 				"  if (G.y > 0.5 && G.x > 1.0) f = pow(f, 1.0 / G.x);"
 				"  return float4(saturate(a), dot(f, float3(0.2126, 0.7152, 0.0722))); }";
@@ -400,7 +400,7 @@ namespace DeferredSkin {
 			IDirect3DBaseTexture9* share[4] = { CapturedNormals::Texture, CapturedNormals::AlbedoTexture, FrameCopyTex, SpecTex };
 			Quad(d, blurSurface, FillSharePS, share, 4);
 		}
-		else CapturedNormals::FullScreenPass(d, blurSurface, FillScatterPS, CapturedNormals::Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO);
+		else CapturedNormals::FullScreenPass(d, blurSurface, FillScatterPS, CapturedNormals::Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO, CapturedNormals::AlbedoTexture);
 		CapturedNormals::FullScreenPass(d, albedoSurface, FillAlbedoPS, CapturedNormals::Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO, CapturedNormals::AlbedoTexture, FrameCopyTex);
 		d->SetPixelShaderConstantF(0, saved, 1);
 		StatFills++;

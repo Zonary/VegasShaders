@@ -1784,6 +1784,7 @@ static bool ForcedValue(SettingManager* manager, const char* section, const char
 int SettingManager::GetSettingI(const char* section, const char* key) {
 	std::lock_guard<std::mutex> lock(SettingCacheLock);
 	CachedSetting scratch;
+	if (SettingForce::DxvkRequiredOff(section, key)) return 0;	// UNOFFICIAL 2026-11-20: FSR / DLSS / HDR off when DXVK fork is absent
 	if (SettingForce::State) { int forced; if (ForcedValue(this, section, key, forced)) return forced; }
 	const CachedSetting* node = CachedNode(this, section, key, scratch);
 	if constexpr (ShelvedEffects::Active) { if (ShelvedEffects::ForcedOff(section, key, node->i)) return 0; }	// UNOFFICIAL 2026-11-16 (release builds only)
@@ -1793,6 +1794,7 @@ int SettingManager::GetSettingI(const char* section, const char* key) {
 float SettingManager::GetSettingF(const char* section, const char* key) {
 	std::lock_guard<std::mutex> lock(SettingCacheLock);
 	CachedSetting scratch;
+	if (SettingForce::DxvkRequiredOff(section, key)) return 0.0f;	// UNOFFICIAL 2026-11-20: FSR / DLSS / HDR off when DXVK fork is absent
 	if (SettingForce::State) { int forced; if (ForcedValue(this, section, key, forced)) return (float)forced; }	// UNOFFICIAL 2026-11-14 (above)
 	float value = CachedNode(this, section, key, scratch)->f;
 	if constexpr (ShelvedEffects::Active) { if (ShelvedEffects::ForcedOff(section, key, value != 0.0f)) return 0.0f; }	// UNOFFICIAL 2026-11-16 (release builds only)

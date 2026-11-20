@@ -1356,6 +1356,7 @@ namespace CapturedNormals {
 				if (src == D3DBLEND_ONE) contrast = true; else ContrastOtherBlend++;
 			}
 		}
+		bool opaqueHair = false;	// UNOFFICIAL 2026-11-20 (Character Kit Remake 4844 one-bit alpha-test hair): opaque/alpha-tested hair in the main list
 		if (write) {
 			if (!Bound) Bind(d);
 			SetMask(d, D3DRS_COLORWRITEENABLE3, 0xF);
@@ -1369,20 +1370,24 @@ namespace CapturedNormals {
 			if (!VmSpan && ((!LastGrassWriter && !LastLeafWriter) || LastFoliageDeferred)) FlashlightLamp::NoteWrite();
 			if (LastGrassWriter) GrassWrites++; else if (LastLeafWriter) LeafWrites++;
 		}
-		else if (LastBeamMarker && BeamNow && !VmSpan) {
+		else if (LastBeamMarker && !VmSpan) {
 			// UNOFFICIAL 2026-11-12 HairAndEyes: hair that takes the flashlight's beam itself, drawn in the main list (before the light
-			// pass). Its mark: the distance alone (blue), under no blend or the hair's own (see BeamMarkers); the other two records stay
-			// masked below (the hair is no writer of theirs).
+			// pass). Its mark: the distance alone (blue), under no blend or the hair's own (see BeamMarkers).
+			// UNOFFICIAL 2026-11-20 (4844 one-bit alpha-test hair): hair without alpha blend draws in the main opaque list after the
+			// deferred head skin and before DeferredSun / DeferredLamps / DeferredSkinSSS. Clear RT1 (albedo.a = 0) and RT2 (model = 0)
+			// and write FLASH_BEAM_FAR to RT3.b so the scalp's deferred skin record behind the hair is never lit over it; D3D9's
+			// hardware alpha test still discards cutout pixels before writing COLOR1..3.
 			const DWORD mask = StateNow(d, D3DRS_COLORWRITEENABLE, 0xF), blend = StateNow(d, D3DRS_ALPHABLENDENABLE, FALSE);
 			const DWORD src = blend ? StateNow(d, D3DRS_SRCBLEND, D3DBLEND_ONE) : D3DBLEND_ONE, dst = blend ? StateNow(d, D3DRS_DESTBLEND, D3DBLEND_ZERO) : D3DBLEND_ZERO;
-			if ((mask & 7) && (!blend || (src == D3DBLEND_SRCALPHA && dst == D3DBLEND_INVSRCALPHA))) {
+			opaqueHair = (mask & 7) && !blend;
+			if (opaqueHair || (BeamNow && (mask & 7) && (src == D3DBLEND_SRCALPHA && dst == D3DBLEND_INVSRCALPHA))) {
 				if (!Bound) Bind(d);
 				SetMask(d, D3DRS_COLORWRITEENABLE3, D3DCOLORWRITEENABLE_BLUE);
-				BeamMarks++;
+				if (BeamNow) BeamMarks++;
 			}
 			else {
 				if (Bound) SetMask(d, D3DRS_COLORWRITEENABLE3, 0);
-				BeamUnmarked++;
+				if (BeamNow) BeamUnmarked++;
 			}
 		}
 		else if (Bound) {
@@ -1409,9 +1414,9 @@ namespace CapturedNormals {
 		if (MaterialTexture && MaterialCompiled) {
 			IDirect3DSurface9* rt2 = TargetNow(d, 2);
 			const bool ours = rt2 && rt2 == MaterialDrawSurface();
-			if (write && LastMaterialWriter) {
+			if ((write && LastMaterialWriter) || opaqueHair) {
 				if (!rt2) { D3DVIEWPORT9 vp; d->GetViewport(&vp); d->SetRenderTarget(2, MaterialDrawSurface()); d->SetViewport(&vp); }
-				if (!rt2 || ours) { SetMask(d, D3DRS_COLORWRITEENABLE2, 0xF); MaterialBound = true; MaterialDrawn = true; MaterialWrites++; }
+				if (!rt2 || ours) { SetMask(d, D3DRS_COLORWRITEENABLE2, 0xF); MaterialBound = true; if (!opaqueHair) { MaterialDrawn = true; MaterialWrites++; } }
 				else MaterialBusy++;
 			}
 			else if (contrast) {	// UNOFFICIAL ShadowContrast: alpha only (the opaque draws' rgb stays)
@@ -1426,9 +1431,9 @@ namespace CapturedNormals {
 		if (AlbedoTexture && AlbedoCompiled) {
 			IDirect3DSurface9* rt1 = TargetNow(d, 1);
 			const bool ours = rt1 && rt1 == AlbedoDrawSurface();
-			if (write && LastAlbedoWriter) {
+			if ((write && LastAlbedoWriter) || opaqueHair) {
 				if (!rt1) { D3DVIEWPORT9 vp; d->GetViewport(&vp); d->SetRenderTarget(1, AlbedoDrawSurface()); d->SetViewport(&vp); }
-				if (!rt1 || ours) { SetMask(d, D3DRS_COLORWRITEENABLE1, 0xF); AlbedoBound = true; AlbedoDrawn = true; AlbedoWrites++; if (LastAlbedoLightOnly) AlbedoLightOnlyDraws++; }
+				if (!rt1 || ours) { SetMask(d, D3DRS_COLORWRITEENABLE1, 0xF); AlbedoBound = true; if (!opaqueHair) { AlbedoDrawn = true; AlbedoWrites++; if (LastAlbedoLightOnly) AlbedoLightOnlyDraws++; } }
 				else AlbedoBusy++;
 			}
 			else if (ours) SetMask(d, D3DRS_COLORWRITEENABLE1, 0);

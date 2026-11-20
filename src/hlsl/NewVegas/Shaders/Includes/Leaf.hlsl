@@ -81,7 +81,7 @@ struct PS_OUTPUT {
         #define FP_ATLAS_REG s12
         #define FP_NO_BEAM	// (the deferred flashlight pass lights the deferred leaves: their game flashlight lamp is left out, CapturedNormals)
         #define FP_ATT(toLamp, reach) (1.0f - saturate(dot(toLamp, toLamp) / ((reach) * (reach))))
-        #define FP_LAMP_TERM(toLamp, att, color, V, n, albedo, rough, metal) ((color) * ((att) * saturate(dot(n, toLamp) * rsqrt(max(dot(toLamp, toLamp), 1.0e-6f)))))
+        #define FP_LAMP_TERM(toLamp, att, color, V, n, albedo, rough, metal) ((color) * (LampAtt(att) * saturate(dot(n, toLamp) * rsqrt(max(dot(toLamp, toLamp), 1.0e-6f)))))
         #ifdef __INTELLISENSE__
             #include "ForwardPlus.hlsl"
         #else

@@ -1,4 +1,5 @@
 #include "DxvkCompute.h"
+#include "SettingForce.h"	// UNOFFICIAL 2026-11-20 NoDxvkFork: disable FSR / DLSS / HDR when DXVK fork is absent
 #include "ShaderTemplate.h"
 #include <unordered_map>
 #include "RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
@@ -22,19 +23,23 @@ void DxvkCompute::Initialize(IDirect3DDevice9* device) {
 
 	ID3D9NvrExt* ext = nullptr;
 	if (FAILED(device->QueryInterface(__uuidof(ID3D9NvrExt), (void**)&ext)) || !ext) {
-		_snprintf_s(StatusText, sizeof(StatusText), _TRUNCATE, "Vegas Shaders DXVK extension not present (native D3D9 or stock DXVK): compute paths off, D3D9 passes used");
+		SettingForce::NoDxvkFork = true;
+		_snprintf_s(StatusText, sizeof(StatusText), _TRUNCATE, "Vegas Shaders DXVK extension not present (native D3D9 or stock DXVK): compute paths, FSR, DLSS and HDR output off");
 		Logger::Log("UNOFFICIAL Vegas Shaders DXVK:%s", StatusText);
 		return;
 	}
 
 	ext->GetInfo(&ExtInfo);
 	if (ExtInfo.ExtVersionMajor != NVR_EXT_VERSION_MAJOR) {
-		_snprintf_s(StatusText, sizeof(StatusText), _TRUNCATE, "Vegas Shaders DXVK extension %u.%u found but this build of Vegas Shaders needs %u.x: compute paths off",
+		SettingForce::NoDxvkFork = true;
+		_snprintf_s(StatusText, sizeof(StatusText), _TRUNCATE, "Vegas Shaders DXVK extension %u.%u found but this build of Vegas Shaders needs %u.x: compute paths, FSR, DLSS and HDR output off",
 			ExtInfo.ExtVersionMajor, ExtInfo.ExtVersionMinor, (unsigned)NVR_EXT_VERSION_MAJOR);
 		Logger::Log("UNOFFICIAL Vegas Shaders DXVK:%s", StatusText);
 		ext->Release();
 		return;
 	}
+
+	SettingForce::NoDxvkFork = false;
 
 	Ext = ext;	// keeps a device reference for the session (never disposed, like the managers)
 	_snprintf_s(StatusText, sizeof(StatusText), _TRUNCATE, "Vegas Shaders DXVK extension %u.%u on DXVK %s (push %u bytes, subgroup %u): compute paths available",

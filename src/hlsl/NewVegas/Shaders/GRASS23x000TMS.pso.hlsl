@@ -63,19 +63,24 @@ float4 TESR_GrassLightData                   : register(c82);
 float4 TESR_GrassLightPosition[GRASS_LIGHTS] : register(c83);
 float4 TESR_GrassLightColor[GRASS_LIGHTS]    : register(c91);
 
-// The lamps' light on a blade: vanilla's falloff (1 - d^2 / r^2, as the object shaders' vanillaAtt), and a wrapped diffuse, as a
-// thin blade lets light through to its back face.
+// The lamps' light on a blade: vanilla's falloff through LampAtt (matching objects and LampFalloff.Exterior), per-light linear
+// decode (PBRLight inside the loop so overlapping lights sum linearly instead of exploding via pow(sum, gamma)), and wrapped diffuse
+// without abs(dot) so lights below the ground do not glow upward through terrain.
 float3 GrassLamps(float3 position, float3 normal) {
     float3 lamps = 0.0f;
-    [loop] for (int i = 0; i < GRASS_LIGHTS; i++) {
-        [branch] if (i >= TESR_GrassLightData.x) break;
+    const int count = (int)min(TESR_GrassLightData.x, (float)GRASS_LIGHTS);
+    [loop] for (int i = 0; i < count; i++) {
         float3 toLight = TESR_GrassLightPosition[i].xyz - position;
+        float d2 = dot(toLight, toLight);
         float radius = TESR_GrassLightPosition[i].w;
-        float att = saturate(1.0f - dot(toLight, toLight) / (radius * radius));
-        float wrap = 0.5f + 0.5f * abs(dot(normal, toLight * rsqrt(max(dot(toLight, toLight), 1.0f))));
-        lamps += TESR_GrassLightColor[i].rgb * (att * wrap);
+        float att = saturate(1.0f - d2 / (radius * radius));
+        [branch] if (att > 0.0f) {
+            float3 dir = toLight * rsqrt(max(d2, 1.0f));
+            float wrap = saturate((dot(normal, dir) + 0.35f) / 1.35f);
+            lamps += PBRLight(TESR_GrassLightColor[i].rgb) * (LampAtt(att) * wrap);
+        }
     }
-    return lamps * TESR_GrassLightData.y;
+    return lamps * LinScale(TESR_GrassLightData.y);
 }
 
 // UNOFFICIAL 2026-11-04 the deferred flashlight on the grass (Grass.cpp UpdateLights, core/FlashlightDeferred.h LightParams): the light pass
@@ -209,7 +214,7 @@ PixResult main(PixVaryings pa, float2 vpos_s : VPOS) {
     light_term *= TESR_GrassBrightness.y;
     specular *= TESR_GrassBrightness.y;
     [branch] if (TESR_GrassLightData.x > 0.0f && nvr_vs)
-        light_term += PBRLight(GrassLamps(pa.f_shadow_world_pos.xyz, normal.xyz));
+        light_term += GrassLamps(pa.f_shadow_world_pos.xyz, normal.xyz) * pa.f_amount.x;
     [branch] if (TESR_GrassSpot[0].w > 0.0f && nvr_vs)	// (linear light already: no PBRLight)
         light_term += GrassSpot(pa.f_shadow_world_pos.xyz, normal.xyz);
 
@@ -325,7 +330,7 @@ PixResult main(PixVaryings pa, float2 vpos_s : VPOS) {
         }
         float3 fdRest = (PBRAmbient(pa.f_ambient.xyz) * pa.f_amount.x + SkyAmbient(shadow_normal, nvr_vs ? sky_scale : 0.0f)) * TESR_GrassBrightness.y;
         [branch] if (TESR_GrassLightData.x > 0.0f && nvr_vs)
-            fdRest += PBRLight(GrassLamps(pa.f_shadow_world_pos.xyz, normal.xyz));
+            fdRest += GrassLamps(pa.f_shadow_world_pos.xyz, normal.xyz) * pa.f_amount.x;
         const float3 fdSun = PBRLight(pa.f_sun.xyz) * (sun_base * TESR_GrassBrightness.y);
         const float3 fdBase = LinColor(base_rgb.rgb);
         const float fdKeep = FDFoliageGrassKeepQ(1.0f - pa.f_fog.w);	// (2026-11-14 fog: the keep the code holds, so DeferredSun's FDAddFogged is exact)

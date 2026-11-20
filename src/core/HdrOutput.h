@@ -285,15 +285,14 @@ namespace HdrOutput {
 
 	inline const char* OnOff(int value) { return value > 0 ? "on" : value == 0 ? "off" : "not found"; }
 
-	// At plugin load, before the game makes its window and swap chain: which monitors Windows has in HDR mode (Render.cpp's
-	// HdrOutputNoteDesktop, called from NVSEPlugin_Load). Only with HDR output enabled.
+	// At plugin load, before the game makes its window and swap chain: read the Windows HDR setting without calling
+	// LoadLibraryEx("dxgi.dll") / CreateDXGIFactory1 inside NVSEPlugin_Load (avoids loader/DXGI lock hazards with overlays;
+	// DXGI monitor enumeration runs on the background CheckWorker thread once rendering starts).
 	inline void NoteDesktop() {
 		if (!TheSettingManager->GetSettingI("Shaders.HDR.Main", "Enabled")) return;
-		int hdr; float maxNits;
-		ReadMonitors(nullptr, hdr, maxNits, S.SeenHdr);
 		const WindowsHdr windows = ReadWindowsSetting(nullptr);
-		Logger::Log("UNOFFICIAL HDR output: at load, before the game's window, %u monitor(s) in HDR mode; Windows HDR setting %s (%s), advanced colour %s",
-			(unsigned)S.SeenHdr.size(), OnOff(windows.Setting), windows.From, OnOff(windows.Active));
+		Logger::Log("UNOFFICIAL HDR output: at load, before the game's window, Windows HDR setting %s (%s), advanced colour %s",
+			OnOff(windows.Setting), windows.From, OnOff(windows.Active));
 	}
 
 	// UNOFFICIAL 2026-11-03 (tester log: a 49 s frame 13 s after HDR came on, RTX 4070 Ti SUPER with two virtual display adapters
@@ -408,12 +407,16 @@ namespace HdrOutput {
 	inline HRESULT Send(const NVR_EXT_HDR_OUTPUT& out, bool rebuild) {
 		const bool switching = rebuild || out.Mode != S.ForkMode;
 		if (switching) Logger::Log("UNOFFICIAL HDR output: asking the fork for %s (was %s%s): its swap chain is rebuilt at the next present", ModeName(out.Mode), ModeName(S.ForkMode), rebuild ? ", asked again" : "");
+		else Logger::Log("UNOFFICIAL HDR output: updating %s parameters (paper white %.0f, peak %.0f, flags 0x%X)", ModeName(out.Mode), out.PaperWhiteNits, out.PeakNits, (unsigned)out.Flags);
 		const DWORD start = GetTickCount();
 		const HRESULT hr = S.Hdr->SetHdrOutput(&out);
 		if (switching) {
 			Logger::Log("UNOFFICIAL HDR output: the fork answered %08lX in %lu ms", (unsigned long)hr, GetTickCount() - start);
 			S.SwitchFrame = S.Frame;
 			S.SwitchTime = GetTickCount();
+		}
+		else {
+			Logger::Log("UNOFFICIAL HDR output: parameter update answered %08lX in %lu ms", (unsigned long)hr, GetTickCount() - start);
 		}
 		return hr;
 	}
@@ -458,7 +461,7 @@ namespace HdrOutput {
 			S.Hdr->GetHdrInfo(&S.Info);
 			Logger::Log("UNOFFICIAL HDR output: the fork's surface offers HDR10 %s, scRGB %s; EDID peak %.0f nits", S.Info.SupportsHdr10 ? "yes" : "no", S.Info.SupportsScRgb ? "yes" : "no", S.Info.DisplayMaxNits);
 		}
-		if (S.DisplayHdr < 0 || S.Frame % 600 == 0) StartCheck(Device);	// UNOFFICIAL 2026-11-03: on its own thread
+		if (!S.SwitchFrame && (S.DisplayHdr < 0 || S.Frame % 600 == 0)) StartCheck(Device);	// UNOFFICIAL 2026-11-03: on its own thread (never overlapping a swapchain switch)
 		const bool check = FinishCheck();	// a new answer this frame (what the old every-600-frames check did, a few frames later)
 		if (S.DisplayHdr < 0 && !Setting("IgnoreDisplayCheck")) { Reason("Enabled: checking the display"); return; }
 		if (!S.DisplayHdr && !Setting("IgnoreDisplayCheck")) {
@@ -594,7 +597,12 @@ namespace HdrOutput {
 	// After NVR's last effect (and ReShade's, which draws before the HUD), before the HUD: the fork copies the picture and the gain.
 	inline void MarkScene(IDirect3DSurface9* Finished) {
 		if (!S.Active || !S.GainReady || !Finished) return;
-		if (FAILED(S.Hdr->MarkHdrScene(Finished, S.GainSurface))) Reason("MarkHdrScene failed (DXVK's log says why): HUD-free pixels shown without highlight gain");
+		const HRESULT hr = S.Hdr->MarkHdrScene(Finished, S.GainSurface);
+		if (FAILED(hr)) {
+			char text[160];
+			sprintf_s(text, "MarkHdrScene failed (%08lX; DXVK's log says why): HUD-free pixels shown without highlight gain", (unsigned long)hr);
+			Reason(text);
+		}
 	}
 
 	// Test tool, once a frame (Render.cpp, after MarkScene): CaptureFrame changed -> ask the fork; the frame after -> read and save.

@@ -761,6 +761,20 @@ static bool RefMovesByKind(TESObjectREFR* Ref, NiNode* Node) {
 }
 
 // Hands one geometry to the pass that draws its kind (skinned, tree, LOD land, alpha tested, opaque).
+// UNOFFICIAL 2026-11-20 (exterior ~24m dark circle with Forms.Actors = true): weapon animation mods (e.g. MMP TOZ-34 / TOZ-66)
+// hide sub-meshes like "##CVSHStock:0" by scaling a bone by 1e-9 and counter-scaling the child by 1e+9; on NPCs not playing that
+// animation the child sits at world scale ~1e9 with a ~26-billion-unit world bound, passes frustum tests in every cascade, and is
+// pancaked to depth 0 across 100% of cascades 0..2. Reject any non-land/non-LOD caster with a non-finite or absurd scale/bound.
+static inline bool IsExplodedShadowCaster(const NiGeometry* geo, bool isLandOrLOD = false) {
+	if (!geo || isLandOrLOD) return false;
+	const float s = geo->m_worldTransform.scale;
+	if (!isfinite(s) || fabsf(s) > 1000.0f) return true;
+	const NiBound* b = geo->m_kWorldBound;
+	if (b && (!isfinite(b->Radius) || !isfinite(b->Center.x) || !isfinite(b->Center.y) || !isfinite(b->Center.z) || b->Radius > 1000000.0f))
+		return true;
+	return false;
+}
+
 void ShadowManager::AccumObject(NiAVObject* Object, ShadowsExteriorEffect::FormsStruct* Forms, bool isLODLand) {
 	auto* geo = static_cast<NiGeometry*>(Object);
 #if NVR_TEST_TOOLS
@@ -775,6 +789,7 @@ void ShadowManager::AccumObject(NiAVObject* Object, ShadowsExteriorEffect::Forms
 	if (SunShadowStats::Current) SunShadowStats::Current->geometry++;
 #endif
 	if (geo->shader == nullptr || !CheckShaderFlags(geo)) return;	// no shader, or one that casts no shadow
+	if (IsExplodedShadowCaster(geo, isLODLand || AccumulatingLand)) return;
 #if NVR_TEST_TOOLS
 	OrthoProbe::NoteGeometry(geo);
 #endif
@@ -1290,6 +1305,7 @@ void ShadowManager::WalkSunChildren(NiAVObject* Root, unsigned mask, bool isLand
 void ShadowManager::WalkSunObject(NiAVObject* Object, unsigned mask, bool isLODLand) {
 	auto* geo = static_cast<NiGeometry*>(Object);
 	if (geo->shader == nullptr || !CheckShaderFlags(geo)) return;	// as in AccumObject
+	if (IsExplodedShadowCaster(geo, isLODLand || AccumulatingLand)) return;
 #if NVR_TEST_TOOLS
 	OrthoProbe::NoteGeometry(geo);
 #endif
@@ -1624,6 +1640,7 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 		for (auto iter = Lights[LightIndex]->kGeometryList.start; iter; iter = iter->next) {
 			NiGeometry* const geo = iter->data;
 			if (geo == nullptr || (geo->m_flags & NiAVObject::APP_CULLED) != 0) continue;
+			if (IsExplodedShadowCaster(geo)) continue;
 
 			auto* casterShade = static_cast<BSShaderProperty*>(geo->GetProperty(NiProperty::kType_Shade));
 			auto* casterMat = static_cast<NiMaterialProperty*>(geo->GetProperty(NiProperty::kType_Material));
@@ -1954,12 +1971,15 @@ void ShadowManager::CollectMovers(const D3DXVECTOR3& SunDir) {
 	FrameMovers.clear();
 	// How far a shadow reaches sideways per unit of height, for the current sun (capped for a sun near the horizon).
 	MoverShadowStretch = min(sqrtf(SunDir.x * SunDir.x + SunDir.y * SunDir.y) / max(SunDir.z, 0.1f), 10.0f);
-	auto add = [this](NiNode* node) {
+	auto add = [this](NiNode* node, const TESObjectREFR* ref) {
 		if (!node || node->m_flags & NiAVObject::APP_CULLED) return;
 		NiBound* bound = node->GetWorldBound();
-		if (bound) FrameMovers.push_back(D3DXVECTOR4(bound->Center.x, bound->Center.y, bound->Center.z, bound->Radius));
+		if (bound && isfinite(bound->Radius) && isfinite(bound->Center.x) && isfinite(bound->Center.y) && isfinite(bound->Center.z) && bound->Radius <= 2000.0f)
+			FrameMovers.push_back(D3DXVECTOR4(bound->Center.x, bound->Center.y, bound->Center.z, bound->Radius));
+		else if (ref)	// exploded child bound (e.g. counter-scaled weapon anim node): keep a sane mover sphere at the actor's position
+			FrameMovers.push_back(D3DXVECTOR4(ref->pos.x, ref->pos.y, ref->pos.z + 64.0f, 128.0f));
 	};
-	add(Player->GetNode());
+	add(Player->GetNode(), Player);
 	if (!Player->GetWorldSpace() || !Tes || !Tes->gridCellArray) return;
 	GridCellArray* CellArray = Tes->gridCellArray;
 	const UInt32 CellArraySize = CellArray->size * CellArray->size;
@@ -1972,7 +1992,7 @@ void ShadowManager::CollectMovers(const D3DXVECTOR3& SunDir) {
 			const UInt8 type = Ref->baseForm->formType;
 			if (type == TESForm::FormType::kFormType_NPC || type == TESForm::FormType::kFormType_Creature ||
 				type == TESForm::FormType::kFormType_LeveledCreature)
-				add(Ref->GetNode());
+				add(Ref->GetNode(), Ref);
 		}
 	}
 }
