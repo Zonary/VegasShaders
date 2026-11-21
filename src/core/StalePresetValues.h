@@ -86,6 +86,7 @@ namespace StalePresetValues {
 		{ "Main.Main.Quality", "DeferredSkinSSS", 0.0f, 88 }, { "Shaders.Skin.SSS", "Kernel", 0.0f, 88 },
 		{ "Main.Main.Quality", "DeferredSkin", 0.0f, 88 }, { "Main.Main.Quality", "DeferredHair", 0.0f, 88 },
 		{ "Main.Main.Quality", "DeferredTransparents", 0.0f, 89 },
+		{ "Shaders.PBR.Main", "VanillaBridgeDielectricMax", 0.08f, 94 },
 	};
 
 	// Keys that moved (UpdateOldDefaults 61 and 67): the value goes to the new key. [Shaders.VolumetricLight.Main] NightStrength (64) has

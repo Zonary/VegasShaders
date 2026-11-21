@@ -14,6 +14,8 @@
 #include "DxvkCompute.h"
 #include "GpuProfiler.h"
 #include "RtDenoise.h"
+#include "RtShadowDenoise.h"	// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: helper SIGMA shadow denoiser for decoupled PT direct sun
+#include "RtSunShadows.h"		// UNOFFICIAL 2026-11-20: avoid mode-0 RtShadowDenoise collision if PTStandDownRT is off
 #include "ManyLamps.h"
 #include "../effects/PBR/PBR.h"	// (2026-11-04 rtgap) the game's light scale	// (2026-11-03 rtspec) PTGameLamps 4: the game's lamp table
 #include "RtLightUnits.h"	// UNOFFICIAL 2026-11-19 (Finding 4.1) shared PBR decode gamma + light / ambient / sky scales
@@ -130,6 +132,7 @@ namespace {
 		// ghost) with PTDenoiseMovingHistory frames on moving surfaces. PTDenoiseUnderRr 0: while DLSS Ray Reconstruction runs, it gets the
 		// raw paths and the path tracer's own albedos (its denoiser steps aside); 1: the path tracer keeps its own denoiser under RR.
 		bool	denoiseSplit = true;
+		bool	denoiseSplitSun = true;	// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: denoise primary direct sun visibility via RtShadowDenoise (SIGMA + actor anti-lag) separately from 32-frame GI
 		bool	denoiseObjectMotion = true;
 		int		denoiseMovingHistory = 8;
 		float	denoiseMirrorHistory = 12.0f;
@@ -209,6 +212,15 @@ namespace {
 	int			shaderGrid = -1;
 	int			shaderPrimary = -1, shaderPrimaryGrid = -1, shaderSpatial = -1, shaderBounce = -1, shaderBounceGrid = -1;	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split
 	bool		splitScratchReady = false;
+	// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: decoupled primary direct sun shadow denoising (helper RtPathTraceSunUnpack + RtShadowDenoise mode 0)
+	int			shaderSunUnpack = -1, shaderSunDenoise = -1;
+	int			imageSunVis = -1, imageSunHit = -1, imageSunDirect = -1, imageSunMotion = -1;
+	bool		sunSplitScratchReady = false;
+	IDirect3DTexture9*	sunVisTexture = nullptr;	IDirect3DSurface9*	sunVisSurface = nullptr;
+	IDirect3DTexture9*	sunDirectTexture = nullptr;	IDirect3DSurface9*	sunDirectSurface = nullptr;
+	bool		sunSplitThisFrame = false;
+	RtShadowDenoise::View sunDenoiseView;
+	UInt32		sunDenoiseFrames = 0;
 	int			shaderCache = -1;	// (2026-11-07) PTRadianceCache's resolve pass (RtPathTraceCache.spv)
 	int			cacheLog2Setup = 0;	// (2026-11-07) the cache's entries (log2) the scratch store was sized for at this helper start (0: none)	// (2026-11-04) PTLightGrid's variant (RtPathTraceGrid.spv: RtPathTrace.comp with PT_LIGHT_GRID)
 	// UNOFFICIAL 2026-11-04 d PTRestirGI (RT-PATH-TRACING.md section 29): the trace's variant (the first bounce written out), the reuse pass,
@@ -280,6 +292,9 @@ namespace {
 	// UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split region (6 words/px intermediate temporal reservoirs + 16 words/px primary payload)
 	unsigned long long SplitBaseWords(UINT w, UINT h, int cacheLog2) { return ((EmissiveBaseWords(w, h, cacheLog2) + (unsigned long long)RtEmissiveRow::kScratchWords + 4095ull) / 4096ull) * 4096ull; }
 	unsigned long long SplitNeedWords(UINT w, UINT h) { return 22ull * w * h; }
+	// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: 3 words/px (vis+signedHitT, sunDiffDemod.rgb) right after the 3-pass split region
+	unsigned long long SunSplitBaseWords(UINT w, UINT h, int cacheLog2) { return ((SplitBaseWords(w, h, cacheLog2) + (splitScratchReady ? SplitNeedWords(w, h) : 0ull) + 4095ull) / 4096ull) * 4096ull; }
+	unsigned long long SunSplitNeedWords(UINT w, UINT h) { return 3ull * w * h; }
 	RtEmissiveRow::State emissiveState;
 	int			shaderEmissive = -1;	// RtEmissiveBuild.spv
 	int			emissiveCount = 0;	// this frame's
@@ -399,6 +414,7 @@ namespace {
 		S.denoiseGuide = f("PTDenoiseGuide", 0.0f, 4.0f);
 		// (2026-11-07 ptaaa-denoiser; a missing key reads 0: the toml defaults carry the ON values)
 		S.denoiseSplit = TheSettingManager->GetSettingI(kSection, "PTDenoiseSplit") != 0;
+		{ SettingManager::Configuration::ConfigNode sn; S.denoiseSplitSun = TheSettingManager->Config.FillNode(&sn, kSection, "PTDenoiseSplitSun") ? (sn.IntValue != 0) : true; }
 		S.denoiseObjectMotion = TheSettingManager->GetSettingI(kSection, "PTDenoiseObjectMotion") != 0;
 		S.denoiseMovingHistory = i("PTDenoiseMovingHistory", 0, 256);
 		S.denoiseMirrorHistory = f("PTDenoiseMirrorHistory", 1.0f, 256.0f);
@@ -944,6 +960,15 @@ namespace {
 		imageAlbedoOut = RtCore::AddImage("NVR RT path trace first albedo", w, h, NVR_EXT_SHARED_RGBA16F);	// (2026-11-03) PTDenoise's demodulation
 		// (2026-11-07 ptaaa-denoiser) PTDenoiseSplit's specular signal: only when it is on at the helper start (one more full-size image)
 		imageSpec = TheSettingManager->GetSettingI(kSection, "PTDenoiseSplit") != 0 ? RtCore::AddImage("NVR RT path trace specular", w, h, NVR_EXT_SHARED_RGBA16F) : -1;
+		// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: decoupled primary direct sun shadow images (R16F vis, R16F signed hit, RGBA16F unshadowed sun, RGBA16F motion)
+		{
+			SettingManager::Configuration::ConfigNode sn;
+			const bool wantSun = TheSettingManager->Config.FillNode(&sn, kSection, "PTDenoiseSplitSun") ? (sn.IntValue != 0) : true;
+			imageSunVis = wantSun ? RtCore::AddImage("NVR RT path trace sun vis", w, h, NVR_EXT_SHARED_R16F) : -1;
+			imageSunHit = wantSun ? RtCore::AddImage("NVR RT path trace sun hit", w, h, NVR_EXT_SHARED_R16F) : -1;
+			imageSunDirect = wantSun ? RtCore::AddImage("NVR RT path trace sun direct", w, h, NVR_EXT_SHARED_RGBA16F) : -1;
+			imageSunMotion = wantSun ? RtCore::AddImage("NVR RT path trace sun motion", w, h, NVR_EXT_SHARED_RGBA16F) : -1;
+		}
 		imageLamps = RtCore::AddImage("NVR RT path trace lamps", kLightTexels, kLampRows, NVR_EXT_SHARED_RG32F);
 		// (2026-11-07) the scratch store (binding 20): PTRestirDI's reservoirs, two sets of 16 bytes a pixel at the screen's size
 		// + (2026-11-07) PTRadianceCache's table after them (64 bytes an entry; its size is fixed at the helper start: PTCacheEntriesLog2 needs a restart)
@@ -951,7 +976,10 @@ namespace {
 		const UINT baseScratchMB = (UINT)((EmissiveBaseWords(w, h, cacheLog2Setup) * 4ull + 4ull * RtEmissiveRow::kScratchWords + (1ull << 20) - 1) >> 20) + 1u;
 		const UINT splitScratchMB = (UINT)(((SplitBaseWords(w, h, cacheLog2Setup) + SplitNeedWords(w, h)) * 4ull + (1ull << 20) - 1) >> 20) + 1u;
 		splitScratchReady = splitScratchMB <= 1024u;
-		RtCore::AskScratch(splitScratchReady ? splitScratchMB : baseScratchMB);
+		const UINT sunSplitScratchMB = (UINT)(((SunSplitBaseWords(w, h, cacheLog2Setup) + SunSplitNeedWords(w, h)) * 4ull + (1ull << 20) - 1) >> 20) + 1u;
+		sunSplitScratchReady = sunSplitScratchMB <= 1024u;
+		RtCore::AskScratch(sunSplitScratchReady ? sunSplitScratchMB : (splitScratchReady ? splitScratchMB : baseScratchMB));
+		sunDenoiseView = RtShadowDenoise::View();
 		emissiveState = RtEmissiveRow::State();
 		restirState.valid = false;
 		// (2026-11-04 d) PTRestirGI's images (9). (2026-11-05) Only when PTRestirGI is on at the helper start (off by default; turning it on
@@ -1391,13 +1419,22 @@ namespace {
 					row[2 * RtEmissiveRow::kFrameTexel] = (float)emissiveCount;
 					row[2 * RtEmissiveRow::kFrameTexel + 1] = (float)(EmissiveBaseWords(w, h, cacheLog2Setup) / 4096ull);
 					row[2 * kSplitBaseTexel] = splitScratchReady ? (float)(SplitBaseWords(w, h, cacheLog2Setup) / 4096ull) : 0.0f;
-					row[2 * kSplitBaseTexel + 1] = 0.0f;
+					// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: decouple primary direct sun diffuse for SIGMA shadow denoising when room permits
+					const bool sunSplitRoom = RtCore::PassesLeft() >= (emissiveCount > 0 ? 1 : 0) + 1 + (cache ? 1 : 0) + 2;
+					const bool sunSplitWant = sunSplitScratchReady && sunSplitRoom && S.denoise && S.denoiseSplitSun && (flags & 512u) != 0u && !giReady &&
+						S.debugView == 0 && S.samples == 1 && sunUp && !earlyRecording &&
+						imageSunVis >= 0 && imageSunHit >= 0 && imageSunDirect >= 0 && shaderSunUnpack >= 0 && shaderSunDenoise >= 0 &&
+						!(S.denoiseUnderRr == 0 && Upscaler::RayReconstructionWantsRaw()) && !RtSunShadows::HelperDenoisedThisFrame();
+					row[2 * kSplitBaseTexel + 1] = sunSplitWant ? (float)(SunSplitBaseWords(w, h, cacheLog2Setup) / 4096ull) : 0.0f;
+					sunSplitThisFrame = sunSplitWant;
 				}
 				lampTexture->UnlockRect(0);
 				if (RtCore::CopyIn(imageLamps, lampTexture)) { flags |= 1024u | (gridOn ? 4096u : 0u) | (restir ? 262144u : 0u) | (cache ? 524288u : 0u) | (restir || cache || energy ? 1048576u : 0u); c.misc[0] = (float)lampCount; c.rect[2] = (float)glowCount; }
-				else restirState.valid = false;
+				else { restirState.valid = false; sunSplitThisFrame = false; }
 			}
 		}
+		else sunSplitThisFrame = false;
+		if (!(flags & 1024u)) sunSplitThisFrame = false;
 		if (!(flags & 262144u)) restirState.valid = false;
 		c.accum[3] = (float)flags;	// (the lamp image's flag 1024 comes after the reset check: a lamp list change does not restart the mean)
 		// (2026-11-03 b) FIX: these three were inside the comment above since 940b1ef2 (the lamp image), so the ray length was 0: no
@@ -1468,8 +1505,9 @@ namespace {
 			const bool useGrid = (flags & 4096u) != 0u;
 			const int p1Shader = useGrid ? shaderPrimaryGrid : shaderPrimary;
 			const int p3Shader = useGrid ? shaderBounceGrid : shaderBounce;
+			const bool sunSplitActive = sunSplitThisFrame;
 			const bool want3Pass = splitScratchReady && (flags & 512u) != 0u && (flags & 262144u) != 0u && S.debugView == 0 && S.samples == 1 &&
-				p1Shader >= 0 && shaderSpatial >= 0 && p3Shader >= 0 && RtCore::PassesLeft() >= (3 + ((flags & 524288u) ? 1 : 0));
+				p1Shader >= 0 && shaderSpatial >= 0 && p3Shader >= 0 && RtCore::PassesLeft() >= (3 + ((flags & 524288u) ? 1 : 0) + (sunSplitActive ? 2 : 0));
 			bool dispatched = false;
 			if (want3Pass && RtCore::AddPass(p1Shader, images16, imgCount, 0u, &c, sizeof(c), gx, gy)) {
 				if (RtCore::AddPass(shaderSpatial, images16, imgCount, 0u, &c, sizeof(c), gx, gy) &&
@@ -1480,6 +1518,65 @@ namespace {
 				} else return;
 			}
 			if (!dispatched && !RtCore::AddPass(useGrid ? shaderGrid : shader, images16, imgCount, writeMask, &c, sizeof(c), gx, gy)) return;
+			// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun: unpack decoupled primary direct sun and denoise sun visibility via helper RtShadowDenoise (SIGMA + actor anti-lag)
+			if (sunSplitActive) {
+				const float unpackParams[4] = { (float)tw, (float)th, (float)(SunSplitBaseWords(w, h, cacheLog2Setup) / 4096ull), 0.0f };
+				const int unpackImages[3] = { imageSunVis, imageSunHit, imageSunDirect };
+				bool sunOk = RtCore::AddPass(shaderSunUnpack, unpackImages, 3, 0x7u, unpackParams, sizeof(unpackParams), gx, gy);
+				if (sunOk && RtCore::PassesLeft() >= 1) {
+					RtShadowDenoise::View now;
+					for (int i = 0; i < 3; i++) { now.forward[i] = c.forward[i]; now.right[i] = c.right[i]; now.up[i] = c.up[i]; }
+					const D3DXVECTOR4& cam = TheRenderManager->CameraPosition;
+					now.eye[0] = (double)cam.x + eye.x; now.eye[1] = (double)cam.y + eye.y; now.eye[2] = (double)cam.z + eye.z;
+					now.jitter[0] = c.rect[0]; now.jitter[1] = c.rect[1]; now.farZ = c.forward[3]; now.valid = true;
+					static UINT lastSunW = 0, lastSunH = 0;
+					static UInt32 lastSunFrame = 0;
+					const UInt32 frameNow = TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0;
+					RtShadowDenoise::View before = sunDenoiseView;
+					before.valid = sunDenoiseView.valid && lastSunW == tw && lastSunH == th && frameNow - lastSunFrame <= 2 && !TheShaderManager->GameState.isCameraCut;
+					static D3DXVECTOR3 lastPtSun(0.0f, 0.0f, 0.0f);
+					const D3DXVECTOR3 sunNow(c.sunDir[0], c.sunDir[1], c.sunDir[2]);
+					if (D3DXVec3Dot(&sunNow, &lastPtSun) < 0.99985f) before.valid = false;
+					lastPtSun = sunNow;
+					lastSunW = tw; lastSunH = th; lastSunFrame = frameNow;
+					IDirect3DBaseTexture9* motion = texture("TESR_ObjectMotionBuffer");
+					const D3DXVECTOR4* motionData = constant("TESR_ObjectMotionData");
+					const bool moved = imageSunMotion >= 0 && tw == w && th == h && motion && motionData && motionData->x > 0.0f && RtCore::CopyIn(imageSunMotion, motion);
+					RtShadowDenoise::Settings ds;
+					ds.maxHistory = 16.0f; ds.maxRadius = 24.0f; ds.stabilize = 4.0f;
+					RtShadowDenoise::TimeScale(ds, RtDenoise::HistoryClock());
+					RtShadowDenoise::DenoiseConstants d;
+					RtShadowDenoise::Fill(d, now, before, tw, th, tw, th, 0, 1, sunDenoiseFrames, ds, moved, c.sunColor[3]);
+					d.history[3] = 1.0f;	// motion-adaptive history so shadows stay crisp under camera movement
+					d.layerReset[0][0] = before.valid ? 0.0f : 1.0f;
+					const int denoiseImages[5] = { imageDepth, imageNormals, moved ? imageSunMotion : imageNormals, imageSunVis, imageSunHit };
+					if (RtCore::AddPass(shaderSunDenoise, denoiseImages, 5, 0x8u, &d, sizeof(d), 1, 1)) {
+						sunDenoiseView = now;
+						sunDenoiseView.valid = true;
+						if (sunDenoiseFrames++ == 0)
+							Logger::Log("UNOFFICIAL RT path trace: PTDenoiseSplitSun active (%ux%u, SIGMA sun shadow denoiser + actor anti-lag, ObjectMotion %s)", tw, th, moved ? "yes" : "no");
+					} else {
+						sunDenoiseView.valid = false;
+					}
+				} else {
+					sunDenoiseView.valid = false;
+				}
+				if (sunOk) {
+					auto makeSun = [&](IDirect3DTexture9*& t, IDirect3DSurface9*& s, D3DFORMAT format) {
+						if (t) { D3DSURFACE_DESC d = {}; t->GetLevelDesc(0, &d); if (d.Width != w || d.Height != h) { DxvkCompute::Drop(s); DxvkCompute::Drop(t); } }
+						if (!t && SUCCEEDED(TheRenderManager->device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, format, D3DPOOL_DEFAULT, &t, nullptr)) && t) t->GetSurfaceLevel(0, &s);
+						return s != nullptr;
+					};
+					sunSplitThisFrame = makeSun(sunVisTexture, sunVisSurface, D3DFMT_R16F) &&
+						makeSun(sunDirectTexture, sunDirectSurface, D3DFMT_A16B16G16R16F) &&
+						RtCore::CopyOut(imageSunVis, sunVisSurface, tw, th) &&
+						RtCore::CopyOut(imageSunDirect, sunDirectSurface, tw, th);
+				} else {
+					sunSplitThisFrame = false;
+				}
+			} else {
+				sunDenoiseView.valid = false;
+			}
 			if (flags & 524288u) {	// (2026-11-07) PTRadianceCache: fold this frame's samples into the cells (RtPathTraceCache.comp)
 				const UINT entries = 1u << cacheLog2Setup;
 				// (2026-11-07 perf-history) PTCacheMaxFrames is frames at 60 fps (the lag behind a change of light): the same seconds here.
@@ -1542,7 +1639,7 @@ namespace {
 		std::vector<char> spirv;
 		ID3D9NvrExt* ext = DxvkCompute::Extension();
 		if (!ext || !DxvkCompute::LoadSpirv("RtPathTraceShow", spirv)) return nullptr;
-		NVR_EXT_BINDING_DESC bindings[11] = {
+		NVR_EXT_BINDING_DESC bindings[13] = {
 			{ 1, 0, NVR_EXT_BIND_SAMPLED_IMAGE, 0, NVR_EXT_VIEW_2D, FALSE, 0 },
 			{ 1, 1, NVR_EXT_BIND_SAMPLED_IMAGE, 1, NVR_EXT_VIEW_2D, FALSE, 0 },
 			{ 1, 2, NVR_EXT_BIND_SAMPLED_IMAGE, 2, NVR_EXT_VIEW_2D, FALSE, 0 },
@@ -1553,12 +1650,14 @@ namespace {
 			{ 1, 7, NVR_EXT_BIND_SAMPLED_IMAGE, 7, NVR_EXT_VIEW_2D, FALSE, 0 },	// its raw trace
 			{ 1, 8, NVR_EXT_BIND_SAMPLED_IMAGE, 8, NVR_EXT_VIEW_2D, FALSE, 0 },	// its albedo r, g
 			{ 1, 9, NVR_EXT_BIND_SAMPLED_IMAGE, 9, NVR_EXT_VIEW_2D, FALSE, 0 },	// its albedo b, roughness
+			{ 1, 10, NVR_EXT_BIND_SAMPLED_IMAGE, 10, NVR_EXT_VIEW_2D, FALSE, 0 },	// (2026-11-20 PTDenoiseSplitSun) denoised sun visibility
+			{ 1, 11, NVR_EXT_BIND_SAMPLED_IMAGE, 11, NVR_EXT_VIEW_2D, FALSE, 0 },	// (2026-11-20 PTDenoiseSplitSun) unshadowed demodulated diffuse sun
 			{ 0, 0, NVR_EXT_BIND_SAMPLER, 0, NVR_EXT_VIEW_2D, FALSE, 4 },
 		};
 		NVR_EXT_GRAPHICS_PIPELINE_DESC desc = {};
 		desc.pFragmentSpirv = spirv.data();
 		desc.FragmentSpirvSize = (UINT)spirv.size();
-		desc.BindingCount = 11;
+		desc.BindingCount = 13;
 		desc.pBindings = bindings;
 		desc.PushConstantSize = 52;	// RtPathTraceShow.frag's Push block (2026-11-10: + detailEdge; at 48 the draw with the 52-byte block was dropped: the game's own picture stayed)
 		desc.UsesSamplerHeap = TRUE;
@@ -1767,11 +1866,12 @@ namespace {
 		// light (PTDenoise), also when the denoiser did not run (it failed, or DLSS RR takes the raw paths): it showed the light / colour then
 		const bool modulate = S.denoise && (shown == denoisedTexture || shown == displayTexture) && albedoThisFrame && albedoTexture;
 		const bool splitShow = modulate && specShown && splitThisFrame;	// (ptaaa-denoiser) + the specular light x its albedo
+		const bool sunSplitShow = modulate && sunSplitThisFrame && sunVisTexture && sunDirectTexture;	// (2026-11-20 PTDenoiseSplitSun)
 		// UNOFFICIAL 2026-11-11 PTEarlyLook: the merged first surface (bit 8: its a < -0.5 keeps the game's pixel); else the trace's own, as before
 		IDirect3DTexture9* const firstSurface = modulate ? FirstSurface() : nullptr;
 		const bool earlyLook = modulate && firstSurface != albedoTexture;
 		struct { float exposure; UInt32 samplerIndex; float split, gamma; UInt32 modulate, pad[3]; float detail, detailRadius, texel[2], detailEdge; } push = { S.exposure, 0, S.split,
-			S.debugView == 1 || S.debugView == 2 || S.debugView == 4 ? 1.0f : 1.0f / 2.2f, (modulate ? 1u : 0u) | (hdr ? 2u : 0u) | (splitShow ? 4u : 0u) | (earlyLook ? 8u : 0u), { 0, 0, 0 }, 0.0f, 4.0f, { 0.0f, 0.0f }, S.detailEdge };	// (the last: 2026-11-10 PTDetailEdge)
+			S.debugView == 1 || S.debugView == 2 || S.debugView == 4 ? 1.0f : 1.0f / 2.2f, (modulate ? 1u : 0u) | (hdr ? 2u : 0u) | (splitShow ? 4u : 0u) | (earlyLook ? 8u : 0u) | (sunSplitShow ? 16u : 0u), { 0, 0, 0 }, 0.0f, 4.0f, { 0.0f, 0.0f }, S.detailEdge };	// (the last: 2026-11-10 PTDetailEdge)
 		static_assert(sizeof(push) == 52, "RtPathTraceShow's push block: keep desc.PushConstantSize (the pipeline, above) the same");
 		IDirect3DBaseTexture9* depthBuffer = nullptr;
 		{ auto found = TheTextureManager->TextureNames.find("TESR_DepthBuffer"); if (found != TheTextureManager->TextureNames.end() && found->second) depthBuffer = *found->second; }
@@ -1794,7 +1894,7 @@ namespace {
 		IDirect3DTexture9* viewModel = TheTextureManager->DepthTextureViewModel;
 		push.pad[2] = viewModel && !(vmThisFrame && hdr) ? (TheRenderManager->DepthConstants.z == 0.0f ? 1u : 2u) : 0u;
 		shownKeepViewModel = push.pad[2] != 0u;	// (2026-11-12 the far hand-over leaves those pixels alone too)
-		NVR_EXT_RESOURCE_BINDING bindings[11] = {};
+		NVR_EXT_RESOURCE_BINDING bindings[13] = {};
 		bindings[0].Slot = 0; bindings[0].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[0].pResource = shown;
 		bindings[1].Slot = 1; bindings[1].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[1].pResource = modulate ? firstSurface : shown;
 		bindings[2].Slot = 2; bindings[2].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[2].pResource = displayTexture;	// (the raw trace: sky / frame pixels)
@@ -1805,12 +1905,14 @@ namespace {
 		IDirect3DBaseTexture9* const specImages[4] = { splitShow ? specShown : displayTexture, splitShow ? specTexture : displayTexture,
 			splitShow ? specAlbedoA : displayTexture, splitShow ? specAlbedoB : displayTexture };
 		for (UINT k = 0; k < 4; k++) { bindings[6 + k].Slot = 6 + k; bindings[6 + k].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[6 + k].pResource = specImages[k]; }
-		bindings[10].Slot = 0; bindings[10].Type = NVR_EXT_BIND_SAMPLER; bindings[10].pResource = point;
+		bindings[10].Slot = 10; bindings[10].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[10].pResource = sunSplitShow ? sunVisTexture : displayTexture;
+		bindings[11].Slot = 11; bindings[11].Type = NVR_EXT_BIND_SAMPLED_IMAGE; bindings[11].pResource = sunSplitShow ? sunDirectTexture : displayTexture;
+		bindings[12].Slot = 0; bindings[12].Type = NVR_EXT_BIND_SAMPLER; bindings[12].pResource = point;
 		NVR_EXT_DRAW_DESC draw = {};
 		draw.pPipeline = pipeline;
 		draw.TargetCount = 1;
 		draw.Targets[0].pResource = RenderTarget;
-		draw.BindingCount = 11;
+		draw.BindingCount = 13;
 		draw.pBindings = bindings;
 		draw.pPushData = &push;
 		draw.PushDataSize = sizeof(push);
@@ -2058,6 +2160,8 @@ namespace RtPathTrace {
 		shaderSpatial = RtCore::AddShader("RtPathTraceSpatial");
 		shaderBounce = RtCore::AddShader("RtPathTraceBounce");
 		shaderBounceGrid = RtCore::AddShader("RtPathTraceBounceGrid");
+		shaderSunUnpack = RtCore::AddShader("RtPathTraceSunUnpack");	// UNOFFICIAL 2026-11-20 PTDenoiseSplitSun
+		shaderSunDenoise = RtCore::AddShader("RtShadowDenoise");
 		shaderCache = RtCore::AddShader("RtPathTraceCache");	// (2026-11-07) PTRadianceCache's resolve pass
 		shaderEmissive = RtCore::AddShader("RtEmissiveBuild");	// (2026-11-07 ptaaa-emissive) PTEmissive's light list
 		shaderGI = RtCore::AddShader("RtPathTraceGI");		// (2026-11-04 d) PTRestirGI

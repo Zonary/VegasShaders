@@ -214,7 +214,7 @@ namespace DeferredRenderer {
 	// NiD3DPixelShaderEx::SetupShader: the deferred record while the main list's G-buffer is bound (mode 1 indoors; mode 2 also outdoors once
 	// DeferredSun is ready). Counts the binds and the forward fallbacks (an eligible shader without a record).
 	inline ShaderRecordPixel* Choose(const void* shader, bool exterior) {
-		if (!Live || !CapturedNormals::InSpan) return nullptr;
+		if (!Live || !CapturedNormals::InSpan || (CapturedNormals::VmSpan && !CapturedNormals::VmDeferred)) return nullptr;
 		if (exterior && (Mode() < 2 || !SunRuns())) return nullptr;
 		SpanSeen = true;
 		auto found = Records.find(shader);
@@ -404,7 +404,8 @@ namespace DeferredRenderer {
 		const char* why = nullptr;
 		if (live && Native && CapturedNormals::MsaaWarned) { live = false; why = "the game's MSAA on native D3D9 (no G-buffer there): forward"; }
 		if (live && exterior && (mode < 2 || !SunRuns())) { live = false; why = mode < 2 ? nullptr : "outdoors: mode 2 needs the DeferredSun pass (claude/fd-sun): forward"; }
-		if (live && LockPickMenu::GetSingleton() && InterfaceManager->IsActive(Menu::kMenuType_LockPick)) live = false;	// (as DeferredLamps: the lock's own scene)
+		// Fallback when Menu3DGuard could not be installed: keep overlay 3D menus / lockpick forward.
+		if (live && !Menu3DGuardInstalled && (TheShaderManager->GameState.OverlayIsOn || (LockPickMenu::GetSingleton() && InterfaceManager->IsOpen(Menu::kMenuType_LockPick)))) live = false;
 		if (why) { static const char* lastWhy = nullptr; if (why != lastWhy) { lastWhy = why; Logger::Log("UNOFFICIAL DeferredRenderer: refused, %s (logged once a reason)", why); } }
 		if (mode >= 2 && !SunRuns() && DeferredSun::Failure()) { static bool sunTold = false; if (!sunTold) { sunTold = true; Logger::Log("[WARNING] UNOFFICIAL DeferredRenderer 2: the DeferredSun pass cannot run (%s): mode 2 draws forward", DeferredSun::Failure()); } }	// (2026-11-15: not while it is only not ready yet, frame 1)
 		{	// UNOFFICIAL 2026-11-15 (FD-RELEASE-PREP.md) the linear gamma floor (SettingForce::FloorF): one line whenever the overridden value changes

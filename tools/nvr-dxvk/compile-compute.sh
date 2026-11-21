@@ -51,6 +51,11 @@ RtPathTracePrimaryGrid RtPathTrace -DPT_SPLIT_PRIMARY -DPT_LIGHT_GRID
 RtPathTraceSpatial RtPathTrace -DPT_SPLIT_SPATIAL
 RtPathTraceBounce RtPathTrace -DPT_SPLIT_BOUNCE
 RtPathTraceBounceGrid RtPathTrace -DPT_SPLIT_BOUNCE -DPT_LIGHT_GRID
+RtShadowDenoiseTemporalSun RtShadowDenoiseTemporal -DSUN
+RtShadowDenoiseTemporalLamps RtShadowDenoiseTemporal -DLAMPS
+RtShadowDenoisePostBlur RtShadowDenoiseBlur -DPOST
+RtShadowDenoisePackSun RtShadowDenoisePack -DSUN
+RtShadowDenoisePackLamps RtShadowDenoisePack -DLAMPS
 RT_VARIANTS
 v=0
 while read -r frag suffix defs; do

@@ -365,7 +365,7 @@ namespace DeferredSun {
 		target->GetDesc(&t);
 
 
-		const bool linearDepth = DeferredDepth::LinearReady() && !Vm.on;	// (the world's view z: not the view model's)
+		const bool linearDepth = !Vm.on && DeferredDepth::EnsureLinear(d);	// (the world's view z: not the view model's)
 		if (!DeferredDepth::Ready() && !linearDepth && !Vm.on) DeferredDepth::FillFrame(d);	// the ray mapping (TESR_DeferredDepthFrame) without the copy
 		if (!Vm.on) LogSources(linearDepth);
 		if (linearDepth) StatLinearDepth++;

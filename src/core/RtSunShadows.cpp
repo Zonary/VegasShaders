@@ -9,6 +9,7 @@
 #include "GpuProfiler.h"
 #include "RtTessContact.h"	// UNOFFICIAL 2026-11-07 (rtgap-tess) the bumps' slack + ContactShadows (docs/next/RT-DETAIL-GAPS.md section 1)
 #include "RtShadowDenoise.h"	// UNOFFICIAL 2026-11-07 ShadowDenoiser (docs/next/RT-DENOISER.md)
+#include "RtPathTrace.h"		// UNOFFICIAL 2026-11-20 PTStandDownRT: stand down when path tracing replaces the scene
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (ForwardCrossFade)
 
 namespace {
@@ -173,6 +174,7 @@ namespace {
 		ReadSettings();
 		ShadowsExteriorEffect* shadows = TheShaderManager->Effects.ShadowsExteriors;
 		if (S.enabled && HitView()) return true;	// 2026-10-30: the hit texture / glow checks run indoors too (the neon is in casinos)
+		if (RtPathTrace::StandDownRT()) return false;	// UNOFFICIAL 2026-11-20: path tracing replaces the scene and owns sun shadows (+ frees RtShadowDenoise mode 0)
 		return S.enabled && TheShaderManager->GameState.isExterior && shadows && shadows->Enabled && shadows->Settings.Exteriors.Enabled;
 	}
 
@@ -877,4 +879,9 @@ namespace RtSunShadows {
 	}
 
 	D3DXVECTOR4* ReplaceConstant() { return &replaceConstant; }
+
+	bool HelperDenoisedThisFrame() {
+		const UInt32 frameNow = TheFrameRateManager ? TheFrameRateManager->FrameNumber : 0;
+		return denoisedInHelper && lastTracedFrame == frameNow;
+	}
 }

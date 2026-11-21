@@ -3221,6 +3221,12 @@ namespace {
 			return;
 		}
 		const float camera[3] = { TheRenderManager->CameraPosition.x, TheRenderManager->CameraPosition.y, TheRenderManager->CameraPosition.z };
+		GrassShaders* grass = TheShaderManager ? TheShaderManager->Shaders.Grass : nullptr;
+		const bool hasBend = grass && grass->Have && grass->BendPush > 0.0f;
+		const float bendX = hasBend ? grass->BendCentre.x : 0.0f;
+		const float bendY = hasBend ? grass->BendCentre.y : 0.0f;
+		const float bendInvRad = hasBend ? grass->Constants.Bend.w : 0.0f;
+		const float bendPush = hasBend ? grass->BendPush : 0.0f;
 		UInt32 fate[12] = {};
 		for (const GrassDraw& d : grassDraws) {
 			if (record->instanceCount >= NVR_RT_MAX_INSTANCES) break;
@@ -3302,6 +3308,7 @@ namespace {
 			auto found = albedoCache.find(d.texture);
 			if (found == albedoCache.end()) found = albedoCache.emplace(d.texture, ReadAlbedo(d.texture)).first;
 			const Albedo& albedo = found->second;
+			const bool staticGrass = hasBend && GrassShaders::IsStaticGeometry(d.geometry);
 			for (UInt32 i = 0; i < d.count && record->instanceCount < NVR_RT_MAX_INSTANCES; i++) {
 				const float* t = &grassTufts[4 * (d.first + i)];
 				NvrRtInstanceRecord& extra = record->records[record->instanceCount];
@@ -3316,6 +3323,16 @@ namespace {
 				for (int r = 0; r < 3; r++) {
 					instance.transform[r][r] = 1.0f + step * d.scale[r];
 					instance.transform[r][3] = t[r] - camera[r];
+				}
+				if (hasBend && !staticGrass) {
+					const float ax = t[0] - bendX, ay = t[1] - bendY;
+					const float inv = 1.0f / sqrtf(ax * ax + ay * ay + 1.0f);
+					const float falloff = 1.0f - bendInvRad / inv;
+					if (falloff > 0.0f) {
+						const float k = inv * falloff * falloff * bendPush * instance.transform[2][2];
+						instance.transform[0][2] = ax * k;
+						instance.transform[1][2] = ay * k;
+					}
 				}
 				instance.geometryId = entry.id;
 				instance.customIndex = 0;
@@ -3593,6 +3610,17 @@ namespace {
 		arenaUsed = 0;
 		waiting = 0;
 		atlasThisFrame = 0;
+		// UNOFFICIAL 2026-11-20: walk the player's own body FIRST (before exterior cells and LODs) so streaming static geometry
+		// on cell crossings can never fill arenaCapacity / NVR_RT_MAX_OPS first and leave the player's previous-frame posed BLAS
+		// frozen behind them (which cast a black self-shadow onto the player's back/weapon while running away from the sun).
+		if (actorsOn && rtSkin && Player && Player->GetNode()) {
+			walkingPlayer = true;
+			playerHidden = !Player->isThirdPerson;	// (2026-11-07) first person: the body is traced (FirstPersonBody) but not drawn
+			const UInt32 before = record->instanceCount;
+			Walk(Player->GetNode(), false);
+			playerInstances += record->instanceCount - before;	// (2026-10-30) the scene log: is the body traced in first person?
+			walkingPlayer = false;
+		}
 		if (Player && Player->GetWorldSpace() && Tes && Tes->gridCellArray) {
 			GridCellArray* cells = Tes->gridCellArray;
 			const UInt32 count = cells->size * cells->size;
@@ -3625,16 +3653,6 @@ namespace {
 			}
 		}
 		else if (Player) WalkCell(Player->parentCell);
-		// the player's third-person body (not in the cells' lists). (2026-11-05: indoors too: it was walked only in the exterior branch above,
-		// so indoors the player was never in the RT scene, first or third person: rtfull-body2 at Lucky 38, 0.0 body instances)
-		if (actorsOn && rtSkin && Player && Player->GetNode()) {
-			walkingPlayer = true;
-			playerHidden = !Player->isThirdPerson;	// (2026-11-07) first person: the body is traced (FirstPersonBody) but not drawn
-			const UInt32 before = record->instanceCount;
-			Walk(Player->GetNode(), false);
-			playerInstances += record->instanceCount - before;	// (2026-10-30) the scene log: is the body traced in first person?
-			walkingPlayer = false;
-		}
 		treeProbe = false;
 		if (grassOn) AddGrass();	// UNOFFICIAL 2026-10-30: the grass drawn this frame (RtCore::NoteGrass)
 		instances = record->instanceCount;

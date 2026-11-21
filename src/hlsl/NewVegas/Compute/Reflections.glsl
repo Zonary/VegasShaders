@@ -171,9 +171,9 @@ vec2 ToScreen(vec3 view) {
 }
 
 bool IsWeapon(vec2 uv) {
-    // The weapon's depth buffer is empty where there is no weapon: 1, or 0 with reversed depth (as WetWorld tests it).
+    // The weapon's depth buffer is empty where there is no weapon: 1, or 0 with reversed depth (matching CombineDepth > 0.0).
     float viewmodelDepth = textureLod(sampler2D(t_viewmodel, POINT_S), uv, 0.0).x;
-    return cb.depthConstants.z == 0.0 ? viewmodelDepth < 0.9 : viewmodelDepth > 0.01;
+    return cb.depthConstants.z == 0.0 ? viewmodelDepth < 0.99999 : viewmodelDepth > 0.0;
 }
 
 // UNOFFICIAL 2026-10-30 RT weapon reflections: the first-person weapon's pixels reflect too (only while RT traces this frame).
@@ -185,7 +185,16 @@ bool ViewModelAt(vec2 uv) { return WeaponOn && IsWeapon(uv); }
 // The pixels that reflect as the weapon: the whole first-person model (hands, arms and gun: as before), or with the mask the weapon's own only.
 bool WeaponAt(vec2 uv) {
     if (!ViewModelAt(uv)) return false;
-    return !WeaponMasked || textureLod(sampler2D(t_weaponMask, POINT_S), uv, 0.0).r > 0.5;
+    if (WeaponMasked) return textureLod(sampler2D(t_weaponMask, POINT_S), uv, 0.0).r > 0.5;
+    if (cb.material2.x >= 3.5) { // VmGBufferOn
+        vec4 written = textureLod(sampler2D(t_matbuf, POINT_S), uv, 0.0);
+        if (written.r > 0.5) {
+            float cls = floor(written.r + 0.01);
+            if (cls >= 16.0) cls -= 16.0;
+            if (abs(cls - 6.0) < 0.5 || abs(cls - 3.0) < 0.5) return false;
+        }
+    }
+    return true;
 }
 
 vec3 ViewNormal(vec2 uv) { return normalize(textureLod(sampler2D(t_normals, POINT_S), uv, 0.0).xyz * 2.0 - 1.0); }
@@ -222,13 +231,16 @@ float PuddleValueNoise(vec2 p) {
     float c = PuddleHash(i + vec2(0.0, 1.0)), d = PuddleHash(i + vec2(1.0, 1.0));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
+#define MatBufRoughOn (mod(floor(cb.material2.x + 0.01), 2.0) > 0.5)
+#define MatBufPuddleOn (mod(floor(cb.material2.x * 0.5 + 0.01), 2.0) > 0.5)
+#define VmGBufferOn (cb.material2.x >= 3.5)
 #define PuddlesOn (cb.puddle.w > 0.5 && cb.puddle.x > 0.001)
 float PuddleStanding(vec2 uv, float depth, float worldUp) {
     if (!PuddlesOn || depth > 10240.0) return 0.0;
     // 2026-11-12 the surface shaders' own mask (TESR_MaterialBuffer a = 1 + standing water, Includes/CapturedNormals.hlsl; material2.x
     // bit 2 = bound for this): the water reflects exactly where it is drawn, height pooling, cover and debris included. A pixel no template
     // wrote (r 0: grass, effects, LOD) falls back to the field below.
-    if (cb.material2.x > 1.5) {
+    if (MatBufPuddleOn) {
         vec4 written = textureLod(sampler2D(t_matbuf, POINT_S), uv, 0.0);
         if (written.r > 0.5) return saturate(written.a - 1.0);
     }
@@ -257,11 +269,15 @@ vec3 SurfacePosition(vec2 uv, float depth) {
 // the neighbours' depths, the side with the smaller step at an edge): a direction under it is bent to just over it. Directions above
 // the surface are unchanged. p: this pixel's view position (ViewPosition), R: the reflected direction, both view space.
 vec3 AboveSurface(vec2 uv, vec3 p, vec3 R) {
+    bool w0 = IsWeapon(uv);
     vec2 dx = vec2(LowTexel.x, 0.0), dy = vec2(0.0, LowTexel.y);
-    vec3 xp = ViewPosition(uv + dx, readDepthLod(uv + dx)), xm = ViewPosition(uv - dx, readDepthLod(uv - dx));
-    vec3 yp = ViewPosition(uv + dy, readDepthLod(uv + dy)), ym = ViewPosition(uv - dy, readDepthLod(uv - dy));
-    vec3 ddx = abs(xp.z - p.z) < abs(p.z - xm.z) ? xp - p : p - xm;
-    vec3 ddy = abs(yp.z - p.z) < abs(p.z - ym.z) ? yp - p : p - ym;
+    vec3 xp = SurfacePosition(uv + dx, readDepthLod(uv + dx)), xm = SurfacePosition(uv - dx, readDepthLod(uv - dx));
+    vec3 yp = SurfacePosition(uv + dy, readDepthLod(uv + dy)), ym = SurfacePosition(uv - dy, readDepthLod(uv - dy));
+    bool wXp = IsWeapon(uv + dx) == w0, wXm = IsWeapon(uv - dx) == w0;
+    bool wYp = IsWeapon(uv + dy) == w0, wYm = IsWeapon(uv - dy) == w0;
+    if (!(wXp || wXm) || !(wYp || wYm)) return R;
+    vec3 ddx = (!wXm || (wXp && abs(xp.z - p.z) < abs(p.z - xm.z))) ? xp - p : p - xm;
+    vec3 ddy = (!wYm || (wYp && abs(yp.z - p.z) < abs(p.z - ym.z))) ? yp - p : p - ym;
     vec3 n = cross(ddx, ddy);
     float len = length(n);
     if (!(len > 1.0e-6)) return R;
@@ -344,30 +360,47 @@ float ReflectivityOwn(vec2 uv, float depth, vec3 viewNormal, out float roughness
         abs(cb.cameraPosition.z + toWorld(uv).z * depth - cb.waterSettings.x) < max(2.0, depth * 0.002)) return WaterReflectivity(depth, roughness);
     if (depth >= DrawDistance || depth >= farZ * 0.98) return 0.0;
     if (IsWeapon(uv)) {
-        // UNOFFICIAL 2026-10-30 RT weapon reflections: off, the weapon never reflects here (its own chrome pass does). On: its roughness
-        // and metal from MaterialAware where its texture has a map, else the roughness the game lit it with (TESR_MaterialBuffer), else
-        // the Weapon roughness; the strength x (1 - roughness) on the last two (a matte stock reflects little). The composite's Fresnel
-        // (metal tinted by the weapon's own colour) lays it over the weapon's own reflection.
-        // (2026-11-09 WeaponMask: with the mask, only the weapon's own pixels; the hands, gloves and arms of the first-person model do not reflect)
+        // UNOFFICIAL 2026-10-30 RT weapon reflections (2026-11-20 intuitive tuning):
+        // Weapon (cb.weapon.z), WeaponRoughness (cb.weapon.w), and WeaponMetal (cb.material2.w) always drive the
+        // weapon's reflections even when GBufferV2 (DeferredReflections) or _rmaos maps are present. Per-part
+        // material data modulates gloss/metal variation (steel slide vs matte grip/stock) instead of overriding sliders.
+        // (2026-11-09 WeaponMask: with the mask, only the weapon's own pixels; the hands, gloves and arms do not reflect)
         if (!WeaponAt(uv)) return 0.0;
+        float partRough = 0.5;
+        bool hasPartRough = false;
+        float partMetal = -1.0;
+        bool explicitRmaos = false;
         if (MaterialOn) {
             vec4 material = MaterialAt(uv);
-            if (material.b > 0.5) { roughness = max(material.r, 0.02); SurfaceMetal = material.g; return cb.weapon.z; }
+            if (material.b > 0.25) {
+                partRough = saturate(material.r);
+                hasPartRough = true;
+                if (material.a > 0.5) { partMetal = material.g; explicitRmaos = true; }
+                else if (material.g > 0.01) partMetal = material.g;
+            }
         }
-        roughness = cb.weapon.w;
-        // (2026-10-30: the first-person pass never writes MaterialAware's buffer (world scene only), so a gun has no metal data:
-        // WeaponMetal guesses it from the gun's own lit colour: grey steel (low saturation) metal, brown wood and coloured parts not.)
-        if (cb.material2.w > 0.0) {
-            vec3 lit = linearize(textureLod(sampler2D(t_rendered, POINT_S), uv, 0.0).rgb);
-            float top = max(lit.r, max(lit.g, lit.b));
-            float saturation = top > 1.0e-4 ? (top - min(lit.r, min(lit.g, lit.b))) / top : 0.0;
-            SurfaceMetal = cb.material2.w * (1.0 - smoothstep(0.12, 0.35, saturation));
-        }
-        if (mod(cb.material2.x, 2.0) > 0.5) {
+        if (!hasPartRough && MatBufRoughOn && VmGBufferOn) {
             vec4 written = textureLod(sampler2D(t_matbuf, POINT_S), uv, 0.0);
-            if (written.r > 0.5 && written.b >= 0.0) roughness = saturate(written.b);
+            if (written.r > 0.5 && written.b >= 0.0) {
+                partRough = saturate(written.b);
+                hasPartRough = true;
+            }
         }
-        return cb.weapon.z * (1.0 - roughness);
+        roughness = hasPartRough ? clamp(cb.weapon.w * mix(0.6, 1.5, partRough), 0.02, 1.0) : cb.weapon.w;
+        if (cb.material2.w > 0.0) {
+            float baseMetal;
+            if (explicitRmaos) {
+                baseMetal = partMetal;
+            } else {
+                vec3 lit = linearize(textureLod(sampler2D(t_rendered, POINT_S), uv, 0.0).rgb);
+                float top = max(lit.r, max(lit.g, lit.b));
+                float saturation = top > 1.0e-4 ? (top - min(lit.r, min(lit.g, lit.b))) / top : 0.0;
+                float satMetal = 1.0 - smoothstep(0.12, 0.35, saturation);
+                baseMetal = partMetal >= 0.0 ? max(partMetal, satMetal * 0.75) : satMetal;
+            }
+            SurfaceMetal = saturate(cb.material2.w * baseMetal);
+        }
+        return cb.weapon.z * mix(1.0, 0.25, smoothstep(0.5, 1.0, roughness));
     }
     if (cb.material.w > 0.0 && textureLod(sampler2D(t_glass, POINT_S), uv, 0.0).r > 0.5) {
         roughness = GlassRoughness;
@@ -401,7 +434,7 @@ float ReflectivityOwn(vec2 uv, float depth, vec3 viewNormal, out float roughness
     float dryRoughness = DryRoughness;
     // UNOFFICIAL 2026-10-31: the copy with MaterialAware on carries it already (b 0.5, core/CapturedNormals.h MergeIntoReflMaterial)
     if (MaterialOn) { vec4 merged = MaterialAt(uv); if (merged.b > 0.25 && merged.b <= 0.75) { dryRoughness = max(merged.r, 0.02); SurfaceMetal = merged.g; } }
-    if (mod(cb.material2.x, 2.0) > 0.5) {
+    if (MatBufRoughOn) {
         vec4 written = textureLod(sampler2D(t_matbuf, POINT_S), uv, 0.0);
         if (written.r > 0.5 && written.b >= 0.0) dryRoughness = saturate(written.b);
     }
@@ -423,7 +456,7 @@ float Reflectivity(vec2 uv, float depth, vec3 viewNormal, out float roughness) {
     float amount = ReflectivityOwn(uv, depth, viewNormal, roughness);
     float mirror = saturate(abs(cb.grid3.w));
     if (cb.grid3.w < 0.0 && roughness >= 0.05) mirror = 0.0;
-    if (amount <= 0.0 || SurfaceWater || IsWeapon(uv)) mirror = cb.grid3.w < 0.0 ? 0.0 : mirror;
+    if (amount <= 0.0 || SurfaceWater || IsWeapon(uv)) mirror = 0.0;
     SurfaceMirror = mirror;
     if (mirror > 0.0 && amount > 0.0 && !SurfaceWater && !IsWeapon(uv)) roughness = mix(roughness, min(roughness, DryRoughness), mirror);
     return amount;
@@ -471,7 +504,10 @@ vec3 SkyAlong(vec3 worldDir) {
 
 // Karis's reversible compression for averaging HDR samples: c / (1 + luminance), and back.
 vec3 Tame(vec3 c) { return c / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
-vec3 Untame(vec3 t) { return t / max(1.0 - dot(t, vec3(0.2126, 0.7152, 0.0722)), 1.0e-3); }
+vec3 Untame(vec3 t) {
+    t = max(t, vec3(0.0));
+    return t / max(1.0 - dot(t, vec3(0.2126, 0.7152, 0.0722)), 1.0 / (1.0 + BrightestReflection));
+}
 
 // World direction through texel st (-1..1, s right, t down) of a cube face, in Direct3D's face order and layout.
 vec3 FaceDirection(float face, vec2 st) {

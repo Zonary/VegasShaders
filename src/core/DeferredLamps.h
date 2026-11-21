@@ -215,7 +215,7 @@ namespace DeferredLamps {
 
 	// NiD3DPixelShaderEx::SetupShader, before the interior branch: the deferred record while the main list's G-buffer is bound.
 	inline ShaderRecordPixel* Choose(const void* shader) {
-		if (!Live || !CapturedNormals::InSpan || Records.empty()) return nullptr;	// (empty while the deferred renderer is on: it chooses)
+		if (!Live || !CapturedNormals::InSpan || (CapturedNormals::VmSpan && !CapturedNormals::VmDeferred) || Records.empty()) return nullptr;	// (empty while the deferred renderer is on: it chooses)
 		auto found = Records.find(shader);
 		return found == Records.end() ? nullptr : found->second;
 	}
@@ -229,12 +229,12 @@ namespace DeferredLamps {
 		const bool renderer = SettingForce::Mode() > 0;	// UNOFFICIAL 2026-11-14 (above): the renderer's live switch, any runtime, outdoors only when it says so
 		Live = (renderer ? RendererLive : TheSettingManager->GetSettingI(kSection, "Live") != 0 && ManyLamps::Active() && !TheShaderManager->GameState.isExterior) &&
 			!PassFailed && !CopyFailed.Blocked() && !CapturedNormals::Failed && CapturedNormals::AlbedoCompiledIn() && CapturedNormals::MaterialCompiledIn();
-		// UNOFFICIAL 2026-11-01 (user: the lock is black in the lockpick view): the lock is drawn in its own scene, lit by the menu's own light,
-		// which the frame's lamp table and the deferred pass never see. The objects light their own lamps while the lockpick screen is open.
-		if (Live && LockPickMenu::GetSingleton() && InterfaceManager->IsActive(Menu::kMenuType_LockPick)) {
+		// UNOFFICIAL 2026-11-01 / 2026-11-21: per-draw 3D menu isolation (Menu3DGuard + GameShadersInMenus) keeps 3D menus
+		// outside the G-buffer span; fall back to frame-level forward only if Menu3DGuard could not be installed.
+		if (Live && !Menu3DGuardInstalled && (TheShaderManager->GameState.OverlayIsOn || (LockPickMenu::GetSingleton() && InterfaceManager->IsOpen(Menu::kMenuType_LockPick)))) {
 			Live = false;
 			static bool lockLogged = false;
-			if (!lockLogged) { lockLogged = true; Logger::Log("UNOFFICIAL DeferredLamps: off while the lockpick screen is open (logged once)"); }
+			if (!lockLogged) { lockLogged = true; Logger::Log("UNOFFICIAL DeferredLamps: off while a 3D overlay/lockpick menu is open (fallback, logged once)"); }
 		}
 		{	// UNOFFICIAL 2026-11-01 (core/EffectStatus.h): live this frame, or which condition kept it forward
 			static int statusSlot = -1;
@@ -578,7 +578,7 @@ namespace DeferredLamps {
 		cb.dlTable[0] = (float)ManyLamps::TableRowsNow(); cb.dlTable[1] = (float)ManyLamps::TileRow(); cb.dlTable[2] = gamma; cb.dlTable[3] = 1.0f / gamma;
 		cb.dlDebug[0] = (float)DebugView; cb.dlDebug[1] = Shadows ? 1.0f : 0.0f; cb.dlDebug[2] = ManyLamps::BinWidth / (float)ManyLamps::TileSize; cb.dlDebug[3] = ManyLamps::BinHeight / (float)ManyLamps::TileSize;
 		const float bias = (std::max)(TheSettingManager->GetSettingF(kSection, "PrecisionBias"), 0.0f) * 0.001f;
-		const bool linearZ = DeferredDistant::CompiledIn() && depthIsLinear;
+		const bool linearZ = DeferredDistant::CompiledIn() && (depthIsLinear || DeferredDepth::Ready());
 		cb.dlShadow[2] = bias; cb.dlShadow[3] = linearZ ? 1.0f : 0.0f;
 		cb.dlDepth[0] = drawn._33; cb.dlDepth[1] = drawn._43; cb.dlDepth[2] = 0.01f; cb.dlDepth[3] = 2.0f;
 
@@ -744,6 +744,7 @@ namespace DeferredLamps {
 		D3DSURFACE_DESC t = {};
 		target->GetDesc(&t);
 		if (TryApplyCompute(d, target, t)) { target->Release(); return; }
+		if (DeferredDistant::CompiledIn() && !Vm.on) DeferredDepth::EnsureLinear(d);
 		const bool linear = LinearScene::Linear || Vm.on;	// (DeferredFirstPerson: the light target, added ONE / ONE)
 		// UNOFFICIAL 2026-11-14 the stored-curve fog (core/DeferredFog.h; DeferredLamps.hlsl DL_FOG_EXACT, compiled in with the lighting-free
 		// records or GBufferV2): with the game's fog drawn the pass reads the frame (the copy below, also when it is linear) and rebuilds the

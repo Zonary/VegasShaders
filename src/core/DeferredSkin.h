@@ -124,7 +124,7 @@ namespace DeferredSkin {
 		auto found = Records.find(shader);
 		if (found == Records.end()) return nullptr;
 		Refresh();
-		if (!Live || !CapturedNormals::InSpan) return nullptr;
+		if (!Live || !CapturedNormals::InSpan || (CapturedNormals::VmSpan && !CapturedNormals::VmDeferred)) return nullptr;
 		if (exterior && (DeferredRenderer::Mode() < 2 || !DeferredRenderer::SunRuns())) return nullptr;
 		if (DeferredRenderer::BlendedNow) { StatBlended++; return nullptr; }
 		StatBinds++;
@@ -310,6 +310,7 @@ namespace DeferredSkin {
 		if (!CopyFrame(d, target) || !EnsureTarget(d, t, D3DFMT_A16B16G16R16F, LightTex, LightSurf, LightDesc)) { target->Release(); return; }
 		static GpuTimer timer("Deferred skin SSS");
 		GpuProfileScope gpu(timer, d);
+		const bool linearZ = DeferredDepth::EnsureLinear(d);
 		float savedC[3 + kSssTaps][4];	// (+ c26 SSS_Debug, 2026-11-16)
 		d->GetPixelShaderConstantF(0, &savedC[0][0], 3 + kSssTaps);
 		// the constants: scatter distances in world units (1 unit = 1/70 m: 14.29 mm), the pixels a world unit covers at view z 1, the angle
@@ -323,7 +324,6 @@ namespace DeferredSkin {
 		const bool turn = TemporalBackbone::Shared() ? TemporalBackbone::TemporalResolve() : false;
 		const float angle = turn ? 6.2831853f * fmodf(0.61803399f * (float)((TemporalBackbone::NoiseIndex() + TemporalBackbone::OffsetSkin) % 1024), 1.0f) : 0.0f;
 		c[0][0] = 1.0f / t.Width; c[0][1] = 1.0f / t.Height; c[0][2] = 0.5f * t.Height / (std::max)(tanY, 1.0e-3f); c[0][3] = angle;
-		const bool linearZ = DeferredDepth::LinearReady();
 		c[1][0] = dmm[0];
 		c[1][1] = (std::max)(0.1f, TheSettingManager->GetSettingF("Shaders.Skin.SSS", "DepthFollow"));
 		c[1][2] = std::clamp(TheSettingManager->GetSettingF("Shaders.Skin.SSS", "AlbedoDetail"), 0.0f, 1.0f);

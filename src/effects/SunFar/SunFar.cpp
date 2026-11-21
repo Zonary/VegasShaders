@@ -434,6 +434,7 @@ namespace {
 		D3DXVECTOR4	terrainData;
 		D3DXVECTOR4	terrainSkyData;
 		D3DXVECTOR4	skyIrradiance[9];
+		D3DXVECTOR4	skyIrradianceTerrain[9];
 		D3DXVECTOR4	terrainShadowData;
 		D3DXVECTOR4	terrainShadowRange;
 		D3DXVECTOR4	terrainShadowParams;
@@ -562,6 +563,7 @@ bool SunFarEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Render
 	copy(&uniforms.terrainData, sizeof(uniforms.terrainData), "TESR_TerrainData");
 	copy(&uniforms.terrainSkyData, sizeof(uniforms.terrainSkyData), "TESR_TerrainSkyData");
 	copy(&uniforms.skyIrradiance, sizeof(uniforms.skyIrradiance), "TESR_SkyIrradianceObjects");
+	copy(&uniforms.skyIrradianceTerrain, sizeof(uniforms.skyIrradianceTerrain), "TESR_SkyIrradianceTerrain");
 	copy(&uniforms.terrainShadowData, sizeof(uniforms.terrainShadowData), "TESR_TerrainShadowData");
 	copy(&uniforms.terrainShadowRange, sizeof(uniforms.terrainShadowRange), "TESR_TerrainShadowRange");
 	copy(&uniforms.terrainShadowParams, sizeof(uniforms.terrainShadowParams), "TESR_TerrainShadowParams");

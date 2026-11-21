@@ -150,9 +150,9 @@ float2 ToScreen(float3 view) {
 }
 
 bool IsWeapon(float2 uv) {
-	// The weapon's depth buffer is empty where there is no weapon: 1, or 0 with reversed depth (as WetWorld tests it).
+	// The weapon's depth buffer is empty where there is no weapon: 1, or 0 with reversed depth (matching CombineDepth > 0.0).
 	float viewmodelDepth = tex2Dlod(TESR_DepthBufferViewModel, float4(uv, 0, 0)).x;
-	return TESR_DepthConstants.z == 0.0 ? viewmodelDepth < 0.9 : viewmodelDepth > 0.01;
+	return TESR_DepthConstants.z == 0.0 ? viewmodelDepth < 0.99999 : viewmodelDepth > 0.0;
 }
 
 float3 ViewNormal(float2 uv) { return normalize(tex2Dlod(TESR_NormalsBuffer, float4(uv, 0, 0)).xyz * 2.0 - 1.0); }
@@ -364,7 +364,10 @@ float3 SkyAlong(float3 worldDir) {
 
 // Karis's reversible compression for averaging HDR samples: c / (1 + luminance), and back.
 float3 Tame(float3 c) { return c / (1.0 + dot(c, float3(0.2126, 0.7152, 0.0722))); }
-float3 Untame(float3 t) { return t / max(1.0 - dot(t, float3(0.2126, 0.7152, 0.0722)), 1.0e-3); }
+float3 Untame(float3 t) {
+	t = max(t, 0.0);
+	return t / max(1.0 - dot(t, float3(0.2126, 0.7152, 0.0722)), 1.0 / (1.0 + BrightestReflection));
+}
 
 // ---- The surroundings cube ----
 // World direction through texel st (-1..1, s right, t down) of a cube face, in Direct3D's face order and layout (the same
@@ -638,12 +641,20 @@ float4 TemporalPS(VSOUT IN, float2 vpos : VPOS) : COLOR0 {
 	float4 current = tex2Dlod(TESR_ReflectionsTrace, float4(uv, 0, 0));
 	float depth = readDepthLod(uv - 0.5 * (LowTexel - TESR_ReciprocalResolution.xy));
 
-	float4 low = current, high = current;
+	bool hasValid = current.a > 1.0e-4;
+	float3 curC = hasValid ? max(current.rgb / current.a, 0.0) : 0.0;
+	float3 lowC = curC, highC = curC;
+	float lowA = current.a, highA = current.a;
 	[unroll] for (int y = -1; y <= 1; y++) {
 		[unroll] for (int x = -1; x <= 1; x++) {
 			if (x == 0 && y == 0) continue;
 			float4 tap = tex2Dlod(TESR_ReflectionsTrace, float4(uv + float2(x, y) * LowTexel, 0, 0));
-			low = min(low, tap); high = max(high, tap);
+			lowA = min(lowA, tap.a); highA = max(highA, tap.a);
+			if (tap.a > 1.0e-4) {
+				float3 tc = max(tap.rgb / tap.a, 0.0);
+				if (!hasValid) { lowC = tc; highC = tc; hasValid = true; }
+				else { lowC = min(lowC, tc); highC = max(highC, tc); }
+			}
 		}
 	}
 
@@ -654,9 +665,18 @@ float4 TemporalPS(VSOUT IN, float2 vpos : VPOS) : COLOR0 {
 	float4 clip = mul(float4(world, 1.0), TESR_ReflectionsReproject);
 	float w = max(clip.w, 0.001);
 	float2 last = screenToRect(float2(clip.x / w * 0.5 + 0.5, 0.5 - clip.y / w * 0.5));	// UNOFFICIAL 2026-10-27 RenderScale v2: the history is in the rect too
-	float inside = all(last > 0.0) && all(last < TESR_RenderScale.xy) && current.a + high.a > 0.0;
+	float inside = all(last > 0.0) && all(last < TESR_RenderScale.xy) && highA > 0.0;
 	float4 history = tex2Dlod(TESR_ReflectionsHistory, float4(last, 0, 0));
-	history = clamp(history, low, high);
+	if (hasValid && history.a > 1.0e-4) {
+		float3 hc = clamp(max(history.rgb / history.a, 0.0), lowC, highC);
+		float hl = dot(hc, float3(0.2126, 0.7152, 0.0722));
+		float maxTameL = BrightestReflection / (1.0 + BrightestReflection);
+		if (hl > maxTameL) hc *= maxTameL / hl;
+		float ha = clamp(history.a, lowA, highA);
+		history = float4(hc * ha, ha);
+	} else {
+		history = 0.0;
+	}
 	return lerp(current, history, HistoryWeight * inside);
 }
 
@@ -732,14 +752,17 @@ float4 CompositePS(VSOUT IN) : COLOR0 {
 	float2 base = floor(position);
 	float2 fraction = position - base;
 	float tolerance = depth * 0.03 + 4.0;
+	bool pixelWeapon = IsWeapon(uv);
 	float4 reflection = 0.0;
 	float weights = 1.0e-5;
 	[unroll] for (int y = 0; y < 2; y++) {
 		[unroll] for (int x = 0; x < 2; x++) {
 			float2 at = clampToRectIfOn((base + float2(x, y) + 0.5) * LowTexel, LowTexel);	// UNOFFICIAL 2026-10-27 RenderScale v2
-			float tapDepth = readDepthLod(at - 0.5 * (LowTexel - TESR_ReciprocalResolution.xy));
+			float2 tapPixelUV = at - 0.5 * (LowTexel - TESR_ReciprocalResolution.xy);
+			float tapDepth = readDepthLod(tapPixelUV);
 			float weight = (x ? fraction.x : 1 - fraction.x) * (y ? fraction.y : 1 - fraction.y);
 			weight /= 1.0 + abs(tapDepth - depth) / tolerance;
+			if (IsWeapon(tapPixelUV) != pixelWeapon) weight *= 1.0e-4;
 			reflection += tex2Dlod(TESR_ReflectionsBuffer, float4(at, 0, 0)) * weight;
 			weights += weight;
 		}

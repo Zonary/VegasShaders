@@ -1253,9 +1253,12 @@ bool VolumetricFogEffect::ExtSetup(IDirect3DBaseTexture9* (&inputs)[ExtInputCoun
 	inputs[0] = nullptr;
 	inputs[1] = depth; inputs[2] = atlas; inputs[3] = normals; inputs[4] = pointShadow; inputs[5] = noiseTexture;
 	inputs[6] = skyView ? skyView : depth;
-	for (UINT i = 7; i < ExtInputCount; i++) inputs[i] = depth;	// the grid, the fog buffers, AO, sky factor, SunFar
+	for (UINT i = 7; i < ExtInputCount; i++) inputs[i] = depth;	// the grid, the fog buffers, AO, sky factor, SunFar, viewmodel depth
+	IDirect3DBaseTexture9* vmDepth = ExtTextureOf("TESR_DepthBufferViewModel");
+	if (vmDepth) inputs[14] = vmDepth;
 	push = {};
 	push.physicalSky = physical ? 1 : 0;
+	push.sunFarFlags.y = !vmDepth ? 0.0f : (TheRenderManager && TheRenderManager->IsReversedDepth() ? 2.0f : 1.0f);
 	return true;
 }
 
@@ -1300,7 +1303,7 @@ bool VolumetricFogEffect::ExtDedicated(IDirect3DDevice9* Device, IDirect3DSurfac
 		push.compositeFlags = D3DXVECTOR4(compositeShadow ? 1.0f : 0.0f, ao ? 1.0f : 0.0f, (ao && compositeSkyTexture) ? 1.0f : 0.0f,
 			compositeInteriorShadow ? compositeRound : 0.0f);
 		IDirect3DTexture9* sunFar = compositeShadow && !compositeInteriorShadow ? SunFarFor(true) : SunFarFor(false);
-		push.sunFarFlags = D3DXVECTOR4(sunFar ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+		push.sunFarFlags.x = sunFar ? 1.0f : 0.0f;
 		if (sunFar) inputs[12] = sunFar;
 		D3DSURFACE_DESC aoDesc = {};
 		if (ao && SUCCEEDED(compositeAOTexture->GetLevelDesc(0, &aoDesc)))
@@ -1346,7 +1349,7 @@ bool VolumetricFogEffect::ExtShadowAO(IDirect3DDevice9* Device, IDirect3DSurface
 	push.mode = 3;
 	push.compositeFlags = D3DXVECTOR4(shadow ? 1.0f : 0.0f, aoTexture ? 1.0f : 0.0f, sky ? 1.0f : 0.0f, 0.0f);
 	IDirect3DTexture9* sunFar = SunFarFor(shadow);
-	push.sunFarFlags = D3DXVECTOR4(sunFar ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+	push.sunFarFlags.x = sunFar ? 1.0f : 0.0f;
 	if (sunFar) inputs[12] = sunFar;
 	D3DSURFACE_DESC aoDesc = {};
 	if (aoTexture && SUCCEEDED(aoTexture->GetLevelDesc(0, &aoDesc)))

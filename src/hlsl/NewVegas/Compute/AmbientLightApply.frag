@@ -73,12 +73,13 @@ vec4 Apply(vec2 uv, bool sky) {
     vec2 scale = cb.renderScale.x > 0.0 && cb.renderScale.y > 0.0 ? cb.renderScale.xy : vec2(1.0);
     vec2 ruv = uv * scale;
     vec4 color = texture(sampler2D(t_source, LINEAR_S), ruv);
-    if (cb.alFlags.x > 0.5) color = vec4(SunShadowApply(color.rgb, ruv, uv), 1.0);
+    bool viewModel = IsViewModel(t_viewModel, ruv);
+    if (!viewModel && cb.alFlags.x > 0.5) color = vec4(SunShadowApply(color.rgb, ruv, uv), 1.0);
     float depth = texture(sampler2D(t_depth, POINT_S), ruv).x * farZ;   // readDepth
     vec2 skyFactor = vec2(1.0);
-    if (sky) skyFactor = SkyFactorAt(ruv, scale, depth);
-    if (depth < NearFade || depth > DrawDistance || IsViewModel(t_viewModel, ruv)) {
-        if (sky) color.rgb = pows(SkyTake(pows(color.rgb, 2.2), skyFactor.x, skyFactor.y, cb.aoSky5.x, cb.aoSky5.w), 1.0 / 2.2);
+    if (sky && !viewModel) skyFactor = SkyFactorAt(ruv, scale, depth);
+    if (!viewModel && (depth < NearFade || depth > DrawDistance)) {
+        if (sky) color.rgb = pows(SkyTake(pows(color.rgb, 2.2), max(skyFactor.x, DarkestAO), skyFactor.y, cb.aoSky5.x, cb.aoSky5.w), 1.0 / 2.2);
         return DebugView > 0.5 ? vec4(0.0, 0.0, 0.0, 1.0) : color;
     }
 
@@ -115,7 +116,8 @@ vec4 Apply(vec2 uv, bool sky) {
     vec3 lin = linearize(color.rgb);
     float shadedLuma = luma(lin);
     float ao = mix(DarkestAO, 1.0, ambient.a);
-    ao = mix(ao, 1.0, saturate((shadedLuma - BrightFade) * 3.0));
+    bool balanced = (cb.alInterior.x > 0.5) || (cb.alInterior.w > 0.0);
+    if (!balanced) ao = mix(ao, 1.0, smoothstep(BrightFade * 0.5, BrightFade * 1.5 + 0.15, shadedLuma));
     vec2 px = cb.reciprocalResolution.xy;
     vec2 minFullUV = 0.5 * px, maxFullUV = max(scale - 0.5 * px, minFullUV);
     float left = readDepthLod(t_depth, clamp(ruv - vec2(px.x, 0.0), minFullUV, maxFullUV));
@@ -143,11 +145,11 @@ vec4 Apply(vec2 uv, bool sky) {
         return vec4(saturate(m.xyz * cb.gridStep.y), 1.0);
     }
     if (DebugView > 10.5) return vec4(vec3(busy), 1.0);
-    ao = mix(ao, mix(1.0, ao, 0.25), busy);
+    ao = viewModel ? 1.0 : mix(ao, mix(1.0, ao, 0.25), busy);
     vec3 albedo = SurfaceAlbedo(t_albedo, ruv, lin);
     vec3 gridBounce = vec3(0.0);
     if (cb.gridData.x > 0.0) {
-        vec3 cameraRelative = toWorld(uv) * depth;
+        vec3 cameraRelative = viewModel ? vec3(0.0) : toWorld(uv) * depth;
         vec3 normal = normalize(GetWorldNormalLod(t_normals, ruv));
         gridBounce = GridBounce(t_gridAccum, t_gridAccumColor, cameraRelative, normal) * (cb.gridData.x * ao);
     }
@@ -162,11 +164,17 @@ vec4 Apply(vec2 uv, bool sky) {
     if (DebugView > 6.5) return delinearize(vec4(gridBounce * albedo, 1.0));
     if (DebugView > 2.5) return vec4(pointLod(t_buffer, ruv).rgb, 1.0);
     if (DebugView > 0.5) return delinearize(vec4(DebugView < 1.5 ? vec3(ao) : gridBounce * albedo, 1.0));
-    if (cb.alInterior.x > 0.5) lin = lin - (1.0 - ao) * min(lin, albedo * cb.alScene.rgb) + gridBounce * albedo;
-    else {
+    // UNOFFICIAL 2026-11-12 AmbientReplaceInterior (RoomGI; AmbientLight.fx.hlsl Apply, line for line; cb.alBump.y mirrors NVR_ALRoom.x)
+    if (viewModel) {
+        lin = lin + gridBounce * albedo;
+    } else if (cb.alInterior.x > 0.5) {
+        lin = lin - ((1.0 - ao) + ao * max(cb.alInterior.x - 1.0, 0.0)) * min(lin, albedo * cb.alScene.rgb * (1.0 - cb.alBump.y)) + gridBounce * albedo;
+    } else {
+        // UNOFFICIAL 2026-11-11 (sungi) ExteriorBalance + AmbientReplace (AmbientLight.fx.hlsl Apply, line for line)
         vec3 ambShare = min(lin, albedo * cb.alScene.rgb * cb.alInterior.w);
-        vec3 lit = cb.alInterior.w > 0.0 ? lin - (1.0 - ao) * ambShare : lin * ao;
-        if (sky) lit = SkyTake(lit, skyFactor.x, skyFactor.y, cb.aoSky5.x, cb.aoSky5.w);
+        float keepShare = 1.0 - cb.alInterior.y * (1.0 - cb.alInterior.z);
+        vec3 lit = cb.alInterior.w > 0.0 ? lin - ambShare + keepShare * ambShare * ao : lin * ao;
+        if (sky) lit = SkyTake(lit, max(skyFactor.x, DarkestAO), skyFactor.y, cb.aoSky5.x, cb.aoSky5.w);
         lin = lit + gridBounce * albedo;
     }
 #ifdef NVR_GI_APPLY
@@ -183,15 +191,10 @@ vec4 Apply(vec2 uv, bool sky) {
     vec3 localLin = localSum / localWeight;
     float shade = shadedLuma / max(luma(c0), 1.0e-4);
     float detail = clamp(luma(c0) / max(luma(localLin), 1.0e-4), 0.0, 2.0);
+    vec3 guess = SurfaceColourCap(localLin * shade, FallbackCap()) * detail;
     vec4 a = pointLod(t_albedo, ruv);
     float hasAlbedo = step(0.5, cb.alFlags.z) * step(0.5, a.a);
-    vec3 giAlbedo = mix(SurfaceColourCap(localLin * shade, FallbackCap()), max(a.rgb, vec3(0.0)), hasAlbedo);
-    float detailRelief = clamp(detail, 0.5, 1.35);
-    vec3 nSmooth = normalize(pointLod(t_normals, ruv).xyz * 2.0 - 1.0);
-    vec3 nBump = normalize(pointLod(t_shadingNormals, ruv).xyz * 2.0 - 1.0);
-    float bumpRelief = clamp(0.35 + 0.65 * max(dot(nBump, nSmooth), 0.0), 0.35, 1.15);
-    float relief = mix(detailRelief, bumpRelief, step(0.5, cb.alBump.x) * hasAlbedo);
-    lin += (giLight * relief) * giAlbedo * MultiBounceAO(ao, giAlbedo);
+    lin += giLight * mix(guess, max(a.rgb, vec3(0.0)), hasAlbedo);
 #endif
     return delinearize(vec4(lin, color.a));
 }

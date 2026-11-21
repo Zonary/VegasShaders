@@ -28,8 +28,8 @@ namespace RtReflDenoise {
 		float params2[4];        // x core (ours), y debug view, z ours: blur radius, w ours: contact share
 		float params3[4];        // x ours: anti-lag sigma, y ours: max history for a near mirror, z ours: firefly clamp, w frame % 64
 		float rect[4];           // xy curScale, zw lastScale (RenderRect sub-rect scales; 1, 1 when native)
-		float activeSize[4];     // xy activeW, activeH (grid pixels drawn), z MirrorJitter code (0 off), w unused
-		uint32_t linearIndex, pointIndex, pad0, pad1;
+		float activeSize[4];     // xy activeW, activeH (grid pixels drawn), z MirrorJitter code (0 off), w weaponFovScale
+		uint32_t linearIndex, pointIndex, vmMotionValid, pad1;
 	};
 	static_assert(sizeof(Push) == 240 && sizeof(Push) <= NVR_EXT_MAX_PUSH_BYTES, "RtReflDenoise.glsl Push");
 
@@ -58,6 +58,7 @@ namespace RtReflDenoise {
 		float jitterX = 0.0f, jitterY = 0.0f;
 		float mirrorJitterCode = 0.0f;
 		float mirrorJitterRoughness = 0.03f;
+		float weaponFovScale = 1.0f;
 	};
 
 	// Shader file names per pass (ours; core parameter kept for caller compatibility)
@@ -70,7 +71,7 @@ namespace RtReflDenoise {
 	class Denoiser {
 	public:
 		using Loader = std::function<bool(const char* name, std::vector<char>& spirv)>;
-		static const UINT Images = 10;
+		static const UINT Images = 11;
 
 		// Made once for a grid size (and again when it changes). False: something could not be made (the caller keeps the old path).
 		bool Init(IDirect3DDevice9* device, ID3D9NvrExt* ext, UINT width, UINT height, ID3D9NvrExtSampler* linear, ID3D9NvrExtSampler* point, const Loader& load) {
@@ -98,8 +99,8 @@ namespace RtReflDenoise {
 		bool Ready() const { return ready; }
 
 		// The four passes. signal: Resolve's output; ray: the Ray image (x view z, y roughness + flags); hitDist: Resolve's hit
-		// distance; normals / motion: the full-size buffers (motion may be null). After it, Result() holds this frame's result.
-		bool Run(IUnknown* signal, IUnknown* ray, IUnknown* hitDist, IUnknown* normals, IUnknown* motion, const Frame& fr, const Settings& s) {
+		// distance; normals / motion / vmMotion: the full-size buffers (motion / vmMotion may be null). After it, Result() holds this frame's result.
+		bool Run(IUnknown* signal, IUnknown* ray, IUnknown* hitDist, IUnknown* normals, IUnknown* motion, const Frame& fr, const Settings& s, IUnknown* vmMotion = nullptr) {
 			if (!ready) return false;
 			for (int p = 0; p < 4; p++) if (!Pipe(p)) return false;
 			const UINT aw = fr.activeW > 0 && fr.activeW <= w ? fr.activeW : w;
@@ -118,30 +119,32 @@ namespace RtReflDenoise {
 			Put(push.params2, 2.0f, float(s.DebugView), s.BlurRadius, s.ContactShare);
 			Put(push.params3, s.AntiLag, s.MirrorHistory, s.Firefly, float(frame % 64));
 			Put(push.rect, fr.curScaleX, fr.curScaleY, fr.lastScaleX, fr.lastScaleY);
-			Put(push.activeSize, float(aw), float(ah), fr.mirrorJitterCode, 0.0f);
+			Put(push.activeSize, float(aw), float(ah), fr.mirrorJitterCode, fr.weaponFovScale > 1.0e-3f ? fr.weaponFovScale : 1.0f);
+			push.vmMotionValid = vmMotion ? 1u : 0u;
 			const UINT now = frame & 1, last = now ^ 1;
 			IUnknown* m = motion ? motion : normals;
+			IUnknown* vm = vmMotion ? vmMotion : normals;
 			// 1 Reproject: in0 last result, in1 last moments, in2 last guide
 			{
-				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, result[last].t, moments[last].t, guide[last].t, guide[last].t, average.t };
+				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, result[last].t, moments[last].t, guide[last].t, guide[last].t, average.t, vm };
 				IUnknown* out[4] = { reproj.s, momentsNow.s, avgSource.s, guide[now].s };
 				if (!Draw(pipes[0], out, 4, in, push, aw, ah)) return false;
 			}
 			// 2 Average
 			{
-				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, avgSource.t, avgSource.t, avgSource.t, avgSource.t, reproj.t };
+				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, avgSource.t, avgSource.t, avgSource.t, avgSource.t, reproj.t, vm };
 				IUnknown* out[1] = { average.s };
 				if (!Draw(pipes[1], out, 1, in, push, avgW, avgH)) return false;
 			}
 			// 3 Blur: in0 this frame's moments, in1 the reprojected history, in2 this guide
 			{
-				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, momentsNow.t, reproj.t, guide[now].t, guide[now].t, average.t };
+				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, momentsNow.t, reproj.t, guide[now].t, guide[now].t, average.t, vm };
 				IUnknown* out[2] = { pref.s, prefVar.s };
 				if (!Draw(pipes[2], out, 2, in, push, aw, ah)) return false;
 			}
 			// 4 Temporal: in0 prefiltered, in1 its variance, in2 reprojected, in3 this frame's moments
 			{
-				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, pref.t, prefVar.t, reproj.t, momentsNow.t, average.t };
+				IUnknown* in[Images] = { signal, ray, hitDist, normals, m, pref.t, prefVar.t, reproj.t, momentsNow.t, average.t, vm };
 				IUnknown* out[2] = { result[now].s, moments[now].s };
 				if (!Draw(pipes[3], out, 2, in, push, aw, ah)) return false;
 			}

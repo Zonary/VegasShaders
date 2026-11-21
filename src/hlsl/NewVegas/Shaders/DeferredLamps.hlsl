@@ -31,6 +31,15 @@
     #define POINT_SHADOW_RT 0
 #endif
 
+// UNOFFICIAL 2026-11-21: per-pixel dielectric F0 from FDSunVisCode in TESR_CapturedNormalsBuffer.a
+// (material rules, _rmaos SpecularFromMap, VanillaBridgeDielectricMax). Placed before Includes/Object.hlsl
+// so PBR.hlsl uses DLSpecF0 instead of hardcoded 0.04.
+#if CAPTURED_NORMALS_ON >= 4 && !defined(DL_SKIN_ONLY) && !defined(DL_LAND_ONLY) && !defined(DL_SHADOW_PASS) && !defined(DL_FOG_RESOLVE)
+static float DLSpecF0 = 0.04f;
+#define PBR_SPEC_F0(baseColor, metal) lerp(DLSpecF0.xxx, (baseColor), (metal))
+#define PBR_DIELECTRIC_F0 min(DLSpecF0, 0.04f)
+#endif
+
 #include "includes/Helpers.hlsl"
 #include "includes/Object.hlsl"
 #include "includes/LampFalloff.hlsl"
@@ -447,7 +456,7 @@ float4 main(PS_IN IN, out float depth : DEPTH DL_SKIN_SPEC_OUT) : COLOR0 {
     { DL_LAMP_LOOP(DLLampLand) }
     #else
     [branch] if (dlDiffuseOnly) { DL_LAMP_LOOP(DLLampDiffuse) }
-    else { DL_LAMP_LOOP(getPointLightLightingAtt) }
+    else { DLSpecF0 = FDSpecF0Decode(tex2Dlod(DL_Normals, uv4).a); DL_LAMP_LOOP(getPointLightLightingAtt) }
     #endif
 #else
     DL_LAMP_LOOP(getPointLightLightingAtt)

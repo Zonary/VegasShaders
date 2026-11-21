@@ -22,6 +22,7 @@ layout(set = 1, binding = 10) uniform texture2D t_ao;          // NVR_AOBuffer (
 layout(set = 1, binding = 11) uniform texture2D t_skyVis;      // NVR_SkyVis (POINT, CLAMP)
 layout(set = 1, binding = 12) uniform texture2D t_sunFar;      // NVR_SunFar (POINT, CLAMP)
 layout(set = 1, binding = 13) uniform texture2D t_skyCov;      // NVR_FogSkyCoverage (POINT, CLAMP; UNOFFICIAL 2026-11-05 MsaaEdgeFix)
+layout(set = 1, binding = 14) uniform texture2D t_viewmodel;   // TESR_DepthBufferViewModel (POINT, CLAMP; pc.sunFarFlags.y > 0.5)
 #endif
 
 layout(set = 2, binding = 0, std140) uniform Constants {
@@ -1006,7 +1007,14 @@ vec3 FogApply(vec3 gammaColor, vec2 coord, bool legacy, bool interior, bool clas
 }
 
 // ---- the composites' shadow and AO applies ----
+bool IsFogViewModel(vec2 coord) {
+    if (pc.sunFarFlags.y <= 0.5) return false;
+    float vmD = POINT_LOD(t_viewmodel, coord).x;
+    return pc.sunFarFlags.y > 1.5 ? vmD > 0.0 : vmD < 0.99999;
+}
+
 vec3 CompositeSunShadow(vec3 linearColor, vec2 coord) {
+    if (IsFogViewModel(coord)) return linearColor;
     linearColor *= mix(vec3(1.0), pows(POINT_LOD(t_sunFar, coord).rgb, 2.2), pc.sunFarFlags.x);
     if (cb.waterSettings.z == 1.0) {
         float depth = readDepthLod(coord);
@@ -1037,6 +1045,7 @@ vec3 SkyTake(vec3 linearColor, float factor, float visibility, float cap, float 
 }
 
 vec3 CompositeAO(vec3 linearColor, vec2 coord) {
+    if (IsFogViewModel(coord)) return linearColor;
     float depth = readDepthLod(coord);
     if (depth >= CompositeAOEndFade) return linearColor;
 
@@ -1060,8 +1069,8 @@ vec3 CompositeAO(vec3 linearColor, vec2 coord) {
         }
     }
     float ao = mix(cb.aoAOData.z, 1.0, sum / max(weights, 1.0e-6));
-    ao = mix(ao, 1.0, saturate((luma(linearColor) - cb.aoData.y) * 3.0));
-    if (sky) { vec2 skyAt = saturate(skySum / max(weights, 1.0e-6)); return SkyTake(linearColor * ao, skyAt.x, skyAt.y, pc.compositeAOTexel.z, pc.compositeAOTexel.w); }
+    ao = mix(ao, 1.0, smoothstep(cb.aoData.y * 0.5, cb.aoData.y * 1.5 + 0.15, luma(linearColor)));
+    if (sky) { vec2 skyAt = saturate(skySum / max(weights, 1.0e-6)); return SkyTake(linearColor * ao, max(skyAt.x, cb.aoAOData.z), skyAt.y, pc.compositeAOTexel.z, pc.compositeAOTexel.w); }
     return linearColor * ao;
 }
 #endif

@@ -164,15 +164,18 @@ void main() {
     vec2 base = floor(position);
     vec2 fraction = position - base;
     float tolerance = depth * 0.03 + 4.0;
+    bool pixelWeapon = IsWeapon(ruv);
     vec4 reflection = vec4(0.0);
     float weights = 1.0e-5;
     vec2 rectMaxTap = max(cb.renderScale.xy - 0.5 * LowTexel, 0.5 * LowTexel);
     for (int y = 0; y < 2; y++) {
         for (int x = 0; x < 2; x++) {
             vec2 at = clamp((base + vec2(x, y) + 0.5) * LowTexel, 0.5 * LowTexel, rectMaxTap);
-            float tapDepth = readDepthLod(at - 0.5 * (LowTexel - cb.reciprocalResolution.xy));
+            vec2 tapPixelUV = at - 0.5 * (LowTexel - cb.reciprocalResolution.xy);
+            float tapDepth = readDepthLod(tapPixelUV);
             float weight = (x != 0 ? fraction.x : 1.0 - fraction.x) * (y != 0 ? fraction.y : 1.0 - fraction.y);
             weight /= 1.0 + abs(tapDepth - depth) / tolerance;
+            if (IsWeapon(tapPixelUV) != pixelWeapon) weight *= 1.0e-4;
             reflection += textureLod(sampler2D(t_buffer, POINT_S), at, 0.0) * weight;
             weights += weight;
         }
@@ -182,16 +185,38 @@ void main() {
     vec3 surfPos = SurfacePosition(ruv, depth);
     vec3 V = normalize(surfPos);   // (2026-10-30: the weapon's own FOV)
     float NdotV = saturate(dot(-V, N));
-    vec4 albedoSample = cb.wetFx2.z > 0.5 && !IsWeapon(ruv) ? textureLod(sampler2D(t_albedo, POINT_S), ruv, 0.0) : vec4(0.0);
+    // Read AlbedoBuffer for both world and 1st-person weapon pixels; on weapons, non-PBR diffuse textures paint dark blued
+    // steel at low linear values (~0.03-0.08), so remap perceptual brightness into realistic conductor F0 [0.30..0.90]
+    // instead of letting dark diffuse albedo crush metal reflections down to dielectric 0.04.
+    vec4 albedoSample = cb.wetFx2.z > 0.5 ? textureLod(sampler2D(t_albedo, POINT_S), ruv, 0.0) : vec4(0.0);
     bool albedoKnown = albedoSample.a > 0.5;
-    float baseDielectricF0 = !IsWeapon(ruv) ? DecodeGBufferF0(ruv) : 0.04;
+    float baseDielectricF0 = !pixelWeapon ? DecodeGBufferF0(ruv) : 0.04;
     if (SurfaceWetGloss > 0.0 || Wetness > 0.0) baseDielectricF0 = max(baseDielectricF0, 0.04 * max(SurfaceWetGloss, saturate(Wetness)));
     float dielectricF0 = mix(baseDielectricF0, 1.0, SurfaceMirror);
     vec3 f0 = vec3(dielectricF0);
     vec3 share;
     if (MaterialOn) {
         vec3 metalF0;
-        if (albedoKnown) {
+        if (pixelWeapon) {
+            // Non-PBR weapon diffuse textures paint dark blued steel at linear ~0.03-0.08 (sRGB 0.2-0.3); map perceptual
+            // brightness into physical gunmetal conductor F0 [0.30..0.90] so blued steel reflects realistically without
+            // turning black guns into chrome, while ReflMetalF0 still ramps smooth mirrors (< 0.06) to 0.95 silver.
+            vec3 weaponTint;
+            if (albedoKnown) {
+                vec3 pCol = sqrt(clamp(albedoSample.rgb, vec3(0.0), vec3(1.0)));
+                float pMax = max(pCol.r, max(pCol.g, pCol.b));
+                vec3 rawHue = pMax > 1.0e-4 ? pCol / pMax : vec3(1.0);
+                vec3 hue = mix(vec3(1.0), rawHue, smoothstep(0.08, 0.35, pMax));
+                weaponTint = hue * mix(0.22, 0.85, pMax);
+            } else {
+                vec3 litColour = linearize(color.rgb);
+                float top = max(litColour.r, max(litColour.g, litColour.b));
+                vec3 rawHue = top > 1.0e-4 ? saturate(litColour / top) : vec3(1.0);
+                vec3 hue = mix(vec3(1.0), rawHue, smoothstep(0.03, 0.20, top));
+                weaponTint = hue * mix(0.25, 0.80, sqrt(saturate(top)));
+            }
+            metalF0 = ReflMetalF0(weaponTint, roughness);
+        } else if (albedoKnown) {
             metalF0 = mix(max(albedoSample.rgb, vec3(0.02)), vec3(1.0), SurfaceMirror);
         } else {
             vec3 litColour = linearize(color.rgb);
@@ -206,8 +231,8 @@ void main() {
     }
     vec3 reflected = Untame(reflection.rgb / max(reflection.a, 1.0e-4));
     if (any(isnan(reflected)) || any(isinf(reflected)) || isnan(reflection.a)) { o_color = color; return; }
-    // REFL_SPECOCC_ON: SpecularOcclusion.
-    float specOcc = cb.data4.w * (1.0 - SurfaceMirror);
+    // REFL_SPECOCC_ON: SpecularOcclusion (world floor attenuation + mild roughness-aware occlusion on shadowed weapons).
+    float specOcc = pixelWeapon ? cb.data4.w * 0.4 * smoothstep(0.15, 0.65, roughness) : cb.data4.w * (1.0 - SurfaceMirror);
     if (SpecOccOn && specOcc > 0.0) {
         float surfaceLight = luma(linearize(color.rgb));
         float reflectedLight = max(luma(reflected) * cb.layoutData.z, 1.0e-6);

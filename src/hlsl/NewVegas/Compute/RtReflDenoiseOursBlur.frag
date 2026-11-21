@@ -28,10 +28,13 @@ void main() {
     if (g.x <= 0.0 || IsMirror(g.y)) return;
     vec4 m = Fetch(t_in0, px);
     float z = g.x, r = g.y, hit = max(m.x, 0.0), n = max(m.y, 1.0);
+    bool centerWeapon;
+    StripRoughness(Fetch(t_ray, px).y, centerWeapon);
     vec3 normal = OctDecodeN(g.zw);
-    vec3 point = PointAt(rectUv, z);
+    vec3 point = PointAtSurface(rectUv, z, centerWeapon);
     float a = r * r;
     float pixelAngle = 2.0 * length(pc.right.xyz) * (pc.size.z / max(pc.rect.x, 1.0e-4));
+    if (centerWeapon && pc.activeSize.w > 1.0e-3) pixelAngle /= pc.activeSize.w;
     float lobe = hit / (z + hit) * 2.0 * a / pixelAngle;
     float radius = min(lobe, pc.params2.z) * clamp(sqrt(4.0 / n), 0.25, 1.0);
     o_radius = vec4(radius, lobe, 0.0, 0.0);
@@ -40,6 +43,7 @@ void main() {
     vec4 sum = centre;
     float weights = 1.0;
     float planeTolerance = 0.01 * z + 2.0;
+    if (centerWeapon) planeTolerance = max(planeTolerance, max(z * 0.04, 0.5));
     for (int k = 0; k < 12; k++) {
         float t = sqrt((float(k) + 0.5) / 12.0);
         float ang = rotation + float(k) * 2.39996323;
@@ -48,7 +52,10 @@ void main() {
         if (q == px || any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ACTIVE_GRID))) continue;
         vec4 gq = Fetch(t_in2, q);
         if (gq.x <= 0.0) continue;
-        vec3 pq = PointAt((vec2(q) + 0.5) * pc.size.zw, gq.x);
+        bool tapWeapon;
+        StripRoughness(Fetch(t_ray, q).y, tapWeapon);
+        if (tapWeapon != centerWeapon) continue;
+        vec3 pq = PointAtSurface((vec2(q) + 0.5) * pc.size.zw, gq.x, tapWeapon);
         float plane = abs(dot(pq - point, normal)) / planeTolerance;
         float w = exp(-2.0 * t * t) * max(0.0, 1.0 - plane)
                 * pow(max(dot(OctDecodeN(gq.zw), normal), 0.0), 64.0)

@@ -1,6 +1,7 @@
 #include "Normals.h"
 #include "../../core/DxvkCompute.h"	// UNOFFICIAL 2026-10-25 (NVR DXVK)
 #include "../../core/RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
+#include "../../core/CapturedNormals.h"
 
 // The constant's registered memory: the same one SetCT uploads from (a matrix is the D3DXMATRIX as stored).
 static const D3DXVECTOR4* Registered(const char* name) {
@@ -116,15 +117,50 @@ bool NormalsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* Rende
 	const D3DXVECTOR4* invProjection = Registered("TESR_InvProjectionTransform");
 	if (!depth || !reciprocal || !cameraData || !invProjection) return false;
 
-	struct Push { D3DXVECTOR4 reciprocalResolution; D3DXVECTOR4 cameraData; D3DXMATRIX invProjection; UInt32 samplerIndex; UInt32 pad[3]; D3DXVECTOR4 renderScale; } push = {};
+	CapturedNormals::MergeParams mp;
+	const bool hasMerge = CapturedNormals::FillMergeParams(mp, inlineMergeAllowed);
+	struct Push {
+		D3DXVECTOR4 reciprocalResolution;
+		D3DXVECTOR4 cameraData;
+		D3DXMATRIX invProjection;
+		UInt32 samplerIndex;
+		UInt32 pad[3];
+		D3DXVECTOR4 renderScale;
+		D3DXVECTOR4 mergeTol;
+		D3DXVECTOR4 mergeView;
+		D3DXVECTOR4 mergeRow0;
+		D3DXVECTOR4 mergeRow1;
+		D3DXVECTOR4 mergeRow2;
+	} push = {};
+	static_assert(sizeof(Push) == 208, "Normals.frag push block");
 	push.reciprocalResolution = *reciprocal;
 	push.cameraData = *cameraData;
 	memcpy(&push.invProjection, invProjection, sizeof(D3DXMATRIX));
 	const float sx = RenderRect::Active() ? RenderRect::ScaleX : 1.0f;
 	const float sy = RenderRect::Active() ? RenderRect::ScaleY : 1.0f;
 	push.renderScale = D3DXVECTOR4(sx, sy, 1.0f / sx, 1.0f / sy);
-	IDirect3DBaseTexture9* textures[] = { depth };
-	return ExtTexturePass(Device, RenderTarget, RenderedSurface, SourceBuffer, extPass, "Normals", textures, _countof(textures), &push, sizeof(push), 96, true);
+	push.mergeTol = mp.tol;
+	push.mergeView = mp.view;
+	push.mergeRow0 = mp.row0;
+	push.mergeRow1 = mp.row1;
+	push.mergeRow2 = mp.row2;
+	IDirect3DBaseTexture9* textures[] = {
+		depth,
+		mp.captured ? mp.captured : depth,
+		mp.material ? mp.material : depth,
+		mp.vmDepth ? mp.vmDepth : depth
+	};
+	if (!ExtTexturePass(Device, RenderTarget, RenderedSurface, SourceBuffer, extPass, "Normals", textures, _countof(textures), &push, sizeof(push), 96, true))
+		return false;
+	if (hasMerge) {
+		inlineMerged = true;
+		D3DSURFACE_DESC nd = {};
+		const bool rectOn = RenderRect::Active();
+		const UInt32 w = Textures.NormalsSurface && SUCCEEDED(Textures.NormalsSurface->GetDesc(&nd)) ? (UInt32)(rectOn ? RenderRect::Width((int)nd.Width) : nd.Width) : 0;
+		const UInt32 h = nd.Height ? (UInt32)(rectOn ? RenderRect::Height((int)nd.Height) : nd.Height) : 0;
+		CapturedNormals::NoteExternalMerge(w, h);
+	}
+	return true;
 }
 	
 void NormalsEffect::RegisterTextures() {

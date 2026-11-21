@@ -1145,7 +1145,12 @@ void ShaderManager::PreStep_RayReconstruction(ChainContext& ctx) {
 	// rays (drawn with this frame's jittered depth: RR resolves them with the rest); nothing of exposure, bloom, lens and LUT yet. DLSS-D
 	// denoises and anti-aliases it here, and TAA's resolve after the tonemap skips the frame. Off, or whenever it cannot run this frame
 	// (logged once): nothing happens.
-	if (Effects.TAA) Effects.TAA->RayReconstruct(Device, RenderTarget);
+	if (Effects.TAA) {
+		if (!Effects.TAA->RayReconstruct(Device, RenderTarget)) {
+			if (Effects.TAA->PreTonemapNativeAA(Device, RenderTarget))
+				PixelInspector::AfterFrame(Effects.TAA);
+		}
+	}
 }
 
 void ShaderManager::PreStep_LumaExposureBloom(ChainContext& ctx) {

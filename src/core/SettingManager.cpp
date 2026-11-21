@@ -59,7 +59,7 @@ template <> std::string SettingManager::ToString<int>(const int number) {
 }
 
 // The user config's [_Unofficial] SettingsVersion this build brings it up to (UpdateOldDefaults, below).
-static const int UnofficialSettingsVersion = 93;  // (93, 2026-11-19: a New Vegas Reloaded settings file gets LegacyFog + LegacyAs441, FormsNear -> Forms, and no terrain sky fill or ShadowBounce; 92, 2026-11-19: HelperWait 1, RideMainExchange + FollowRenderScale + ReplaceForward + ReflectionsOwnPuddles on, SunGI/RoomGI/AmbientReplace/HiZ/FFX retired; 91, 2026-11-18: [Shaders.PBR.Rmaos] MetalFromMap on, _rmaos maps decide metal; 90, 2026-11-18: old defaults of fixes that a Cartographer / Atlas / old preset batch left in the saved file move once, when 5 or more are found; 89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
+static const int UnofficialSettingsVersion = 94;  // (94, 2026-11-21: [Shaders.PBR.Main] VanillaBridgeDielectricMax 0.08 -> 0.04; 93, 2026-11-19: a New Vegas Reloaded settings file gets LegacyFog + LegacyAs441, FormsNear -> Forms, and no terrain sky fill or ShadowBounce; 92, 2026-11-19: HelperWait 1, RideMainExchange + FollowRenderScale + ReplaceForward + ReflectionsOwnPuddles on, SunGI/RoomGI/AmbientReplace/HiZ/FFX retired; 91, 2026-11-18: [Shaders.PBR.Rmaos] MetalFromMap on, _rmaos maps decide metal; 90, 2026-11-18: old defaults of fixes that a Cartographer / Atlas / old preset batch left in the saved file move once, when 5 or more are found; 89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
 
 // UNOFFICIAL 2026-10-30: a setting is read only when the defaults file lists it (FillNode), so a line in the user's toml that
 // this build does not know (a key from a newer or an older build, a typo) silently did nothing. Each one is logged once per
@@ -69,17 +69,8 @@ static const int UnofficialSettingsVersion = 93;  // (93, 2026-11-19: a New Vega
 static bool RetiredSetting(const std::string& Name) {
 	static const char* const kKeys[] = {
 		"Shaders.Puddles.Main.Streaks", "Shaders.Puddles.Main.StreakWidth", "Shaders.Puddles.Main.StreakSpeed",	// (2026-11-18: wall streaks removed)
-		// (2026-11-19: retired HiZ, FFX reflection denoiser clip, LegacyTilt, and SunGI/RoomGI/AmbientReplace/SkyMiss ambient-subtraction sprawl)
-		"Shaders.AmbientLight.Main.HiZ", "Shaders.AmbientLight.Main.SunGI", "Shaders.AmbientLight.Main.RoomGI",
-		"Shaders.AmbientLight.Main.AmbientReplace", "Shaders.AmbientLight.Main.AmbientFloor",
-		"Shaders.AmbientLight.Main.AmbientReplaceNight", "Shaders.AmbientLight.Main.AmbientFloorNight",
-		"Shaders.AmbientLight.Main.AmbientReplaceInterior", "Shaders.AmbientLight.Main.AmbientFloorInterior",
-		"Shaders.AmbientOcclusion.RT.GISky", "Shaders.AmbientOcclusion.RT.GISkyNight",
-		"Shaders.AmbientOcclusion.RT.GIAmbient", "Shaders.AmbientOcclusion.RT.GIAmbientInterior",
-		"Shaders.AmbientOcclusion.RT.SkyMissSH", "Shaders.AmbientOcclusion.RT.SkyMissNightAmbient",
-		"Shaders.AmbientOcclusion.RT.GIScreenAmbientOut", "Shaders.AmbientOcclusion.RT.GIDenoiseSunGI",
-		"Shaders.AmbientOcclusion.RT.GIDenoiseRoomGI", "Shaders.AmbientOcclusion.RT.RoomGIGlow",
-		"Shaders.AmbientOcclusion.RT.LegacyTilt", "Shaders.AmbientOcclusion.RT.LegacyTiltInterior",
+		// (2026-11-19: retired HiZ and FFX reflection denoiser clip)
+		"Shaders.AmbientLight.Main.HiZ",
 		"Shaders.Reflections.Main.HiZ", "Shaders.Reflections.Main.HiZSafeCells",
 		"Shaders.Reflections.Main.HiZCheck", "Shaders.Reflections.Main.HiZInteriorsTest",
 		"Shaders.Reflections.RT.DenoiserClip",
@@ -946,8 +937,7 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 		}
 	}
 	// 92 (2026-11-19): RT helper handover wait (HelperWait 0 -> 1, eliminates 5-8 ms GPU queue handover stall), Reflections RT
-	// RideMainExchange + FollowRenderScale on (single exchange + RenderScale sub-rect copies), ReplaceForward + ReflectionsOwnPuddles on,
-	// and legacy SunGI / RoomGI migrated to Shaders.AmbientOcclusion.RT.{Enabled, GI}.
+	// RideMainExchange + FollowRenderScale on (single exchange + RenderScale sub-rect copies), ReplaceForward + ReflectionsOwnPuddles on.
 	if (version < 92) {
 		replace("Main.Main.RayTracing", "HelperWait", 0, 1, true);
 		auto toTrue = [&](const char* section, const char* key) {
@@ -960,16 +950,6 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 		toTrue("Shaders.Reflections.RT", "FollowRenderScale");
 		toTrue("Shaders.Reflections.Main", "ReplaceForward");
 		toTrue("Shaders.WetWorld.Main", "ReflectionsOwnPuddles");
-		tomlValue* alMain = UserSection("Shaders.AmbientLight.Main");
-		const bool hadSunOrRoomGI = alMain && alMain->is_table() &&
-			((alMain->contains("SunGI") && alMain->at("SunGI").is_boolean() && alMain->at("SunGI").as_boolean()) ||
-			 (alMain->contains("RoomGI") && alMain->at("RoomGI").is_boolean() && alMain->at("RoomGI").as_boolean()));
-		if (hadSunOrRoomGI) {
-			toTrue("Shaders.AmbientLight.Status", "Enabled");
-			toTrue("Shaders.AmbientLight.Main", "AlbedoBuffer");
-			toTrue("Shaders.AmbientOcclusion.RT", "Enabled");
-			toTrue("Shaders.AmbientOcclusion.RT", "GI");
-		}
 	}
 	// 93 (2026-11-18/19, merged from claude/preset-old-values, renumbered 92 -> 93 after RT overhaul took 92): a settings file from New Vegas
 	// Reloaded itself (no [_Unofficial] SettingsVersion: never saved by this project's builds), as preset packs ship it (Caffeine, Riven).
@@ -1025,6 +1005,12 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 				zeroIfUnsaved(group, "SkylightingScale");
 			zeroIfUnsaved("Shaders.Terrain.Parallax", "ShadowBounce");
 		}
+	}
+	// 94 (2026-11-21): [Shaders.PBR.Main] VanillaBridgeDielectricMax 0.08 -> 0.04 (caps unmapped non-metal surfaces at physical
+	// dielectric F0 so clothes, hair and rocks without _rmaos maps do not look glossy/plastic; hidden under Internal, so existing
+	// saved configs move once).
+	if (version < 94) {
+		replace("Shaders.PBR.Main", "VanillaBridgeDielectricMax", 0.08, 0.04, false);
 	}
 	if (!changed.empty())
 		Logger::Log("UNOFFICIAL settings: old defaults saved by an earlier build moved to the new defaults: %s. "
@@ -2222,6 +2208,14 @@ SettingManager::MenuSwitch SettingManager::GetMenuShaderSwitch(const char* Name)
 bool SettingManager::GetMenuShaderEnabled(const char* name) {
 	// UNOFFICIAL 2026-11-04 HudRaindrops has no section of its own: it is switched under Wetness Effects (HudRaindropsEffect::UpdateSettings).
 	if (!strcmp(name, "HudRaindrops")) return GetSettingI("Shaders.WetnessEffects.HudRaindrops", "Enabled") != 0;
+	// UNOFFICIAL 2026-11-12 (sungi p4) SunGI ([Shaders.AmbientLight.Main] SunGI, the one switch for the exterior sun bounce) implies AmbientLight's
+	// Status Enabled: it is on at load and after a revert (the runtime flag; AmbientLight::UpdateSettings follows a live change). The toml is not written;
+	// AmbientLight::ShouldRender keeps it off indoors while only SunGI has it on, so interiors stay as the user set them.
+	if (!strcmp(name, "AmbientLight")) {
+		Configuration::ConfigNode sunGi;
+		if (Config.FillNode(&sunGi, "Shaders.AmbientLight.Main", "SunGI") && sunGi.BoolValue) return true;
+		if (Config.FillNode(&sunGi, "Shaders.AmbientLight.Main", "RoomGI") && sunGi.BoolValue) return true;
+	}
 
 	char section[256];
 

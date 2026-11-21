@@ -1441,9 +1441,9 @@ float3 CompositeAO(float3 linearColor, float2 uvV)
 		}
 	}
 	float ao = lerp(TESR_AmbientOcclusionAOData.z, 1, sum / max(weights, 1.0e-6));
-	ao = lerp(ao, 1, saturate((luma(linearColor) - TESR_AmbientOcclusionData.y) * 3));
+	ao = lerp(ao, 1, saturate(luma(linearColor) - TESR_AmbientOcclusionData.y));
 	// the sky factor (its own share; not part of the AO's clamp/fade), at most what LightCap allows (UNOFFICIAL 2026-10-20 skyamb)
-	if (sky) { float2 skyAt = saturate(skySum / max(weights, 1.0e-6)); return SkyTake(linearColor * ao, skyAt.x, skyAt.y, NVR_CompositeAOTexel.z, NVR_CompositeAOTexel.w); }
+	if (sky) { float2 skyAt = saturate(skySum / max(weights, 1.0e-6)); return SkyTake(linearColor * ao, max(skyAt.x, TESR_AmbientOcclusionAOData.z), skyAt.y, NVR_CompositeAOTexel.z, NVR_CompositeAOTexel.w); }
 	return linearColor * ao;
 }
 

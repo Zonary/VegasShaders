@@ -23,7 +23,7 @@ namespace RtAmbient {
 		bool	Enabled = false;	// Enabled
 		int		RayCount = 2;		// [1-16] AO rays per half-resolution pixel and frame (2026-10-30: 2, rt-ao-6: denoised the same as 4)
 		float	Distance = 120.0f;	// [8-1000] AO ray length, world units (about 70 = 1 m)
-		bool	Sky = true;			// also the sky visibility (needs Skylighting on, as the ortho version)
+		bool	Sky = false;			// also the sky visibility (needs Skylighting on; independent of RT AO)
 		int		SkyRays = 16;		// 8 or 16 (one or two rings round the normal + straight up)
 		float	SkyDistance = 800.0f;	// [64-8000] sky ray length (Skylighting's Distance: 800)
 		// UNOFFICIAL 2026-11-08 (alsky; tester: Skylighting with RT AO draws hard straight lines on roads, RT AO alone looks right) BUG FIXES,
@@ -92,7 +92,7 @@ namespace RtAmbient {
 		// harmonics, un-convolved, x the ambient scale), in the GI passes and in the cache's rays, fading out below the horizon.
 		bool	CacheVisibility = true;
 		int		CacheCascades = 2;
-		bool	SkyMissSH = false;
+		bool	SkyMissSH = true;
 		// UNOFFICIAL 2026-10-31 (rt-ao-sky, docs/next/RT-DENOISE-BACKBONE.md "RT GI") with [Main.Main.RayTracing] DenoiseBackbone: the GI
 		// denoiser's history on pixels that move themselves (B1's object motion > 0.25 units a frame: a walking person) at most this many
 		// frames (their bounce light changes as they move; 16 frames there trail behind them); 0 = no cap
@@ -184,17 +184,17 @@ namespace RtAmbient {
 			Current.GIAmbientUnits = !TheSettingManager->Config.FillNode(&node, s, "GIAmbientUnits") || node.BoolValue;	// UNOFFICIAL 2026-11-11 (sungi, F9)
 			Current.SkySoftEdges = !TheSettingManager->Config.FillNode(&node, s, "SkySoftEdges") || node.BoolValue;
 			Current.RtFarFade = !TheSettingManager->Config.FillNode(&node, s, "RtFarFade") || node.BoolValue;
-			// UNOFFICIAL 2026-11-12 (sungi p3): a missing key = the default (visibility on, 2 cascades)
+			// UNOFFICIAL 2026-11-12 (sungi p3): a missing key = the default (visibility on, 2 cascades, directional sky on)
 			Current.CacheVisibility = !TheSettingManager->Config.FillNode(&node, s, "CacheVisibility") || node.BoolValue;
 			Current.CacheCascades = TheSettingManager->Config.FillNode(&node, s, "CacheCascades") ? std::clamp((int)node.IntValue, 1, 2) : 2;
-			Current.SkyMissSH = false;
+			Current.SkyMissSH = !TheSettingManager->Config.FillNode(&node, s, "SkyMissSH") || node.BoolValue;
 		}
 		Current.DebugView = std::clamp(TheSettingManager->GetSettingI(s, "DebugView"), 0, 9);	// (9: UNOFFICIAL 2026-11-12)
 		Current.GI = TheSettingManager->GetSettingI(s, "GI") != 0;
 		Current.GIDistance = std::clamp(TheSettingManager->GetSettingF(s, "GIDistance"), 100.0f, 8000.0f);
 		Current.GIStrength = std::clamp(TheSettingManager->GetSettingF(s, "GIStrength"), 0.0f, 20.0f);	// UNOFFICIAL 2026-11-09: 20 (was 4); the menu clamps to the same [0-20] its description gives
-		Current.GIAmbient = 0.0f;	// retired: pure direct bounce, primary pixels keep game ambient
-		Current.GISky = 0.0f;		// retired: sky visibility comes from RT Skylighting, not bounce misses
+		Current.GIAmbient = std::clamp(TheSettingManager->GetSettingF(s, "GIAmbient"), 0.0f, 1.0f);
+		Current.GISky = std::clamp(TheSettingManager->GetSettingF(s, "GISky"), 0.0f, 1.0f);	// (0-1: 4 x GIStrength 4 blew the ground out white)	// UNOFFICIAL 2026-11-10 (gisky)
 		Current.GIOffscreen = std::clamp(TheSettingManager->GetSettingF(s, "GIOffscreen"), 0.0f, 1.0f);
 		Current.GIScreenLight = TheSettingManager->GetSettingI(s, "GIScreenLight") != 0;	// UNOFFICIAL 2026-11-03 (rtgi-cal)
 		Current.GIGameLamps = TheSettingManager->GetSettingI(s, "GIGameLamps") != 0;	// UNOFFICIAL 2026-11-03 (rtspec)
@@ -227,13 +227,14 @@ namespace RtAmbient {
 			Current.SampleLockFix = !TheSettingManager->Config.FillNode(&node, s, "SampleLockFix") || node.BoolValue;	// UNOFFICIAL 2026-11-09 (rtgi-lock)
 			Current.NormalGuard = !TheSettingManager->Config.FillNode(&node, s, "NormalGuard") || node.BoolValue;	// UNOFFICIAL 2026-11-09 (rt-review)
 			Current.GIStrengthNight = TheSettingManager->Config.FillNode(&node, s, "GIStrengthNight") ? std::clamp(node.FloatValue, -1.0f, 20.0f) : -1.0f;	// UNOFFICIAL 2026-11-10
-			Current.GISkyNight = -1.0f;
+			Current.GISkyNight = TheSettingManager->Config.FillNode(&node, s, "GISkyNight") ? std::clamp(node.FloatValue, -1.0f, 1.0f) : -1.0f;
 			Current.LegacyTilt = TheSettingManager->Config.FillNode(&node, s, "LegacyTilt") ? std::clamp(node.FloatValue, 0.0f, 1.0f) : 0.0f;	// UNOFFICIAL 2026-11-10
 			if (InteriorNow) {
 				auto indoors = [&](const char* key, float& value, float lo, float hi) {
 					if (TheSettingManager->Config.FillNode(&node, s, key) && node.FloatValue >= 0.0f) value = std::clamp(node.FloatValue, lo, hi);
 				};
 				indoors("GIStrengthInterior", Current.GIStrength, 0.0f, 20.0f);
+				indoors("GIAmbientInterior", Current.GIAmbient, 0.0f, 1.0f);
 				indoors("GIClampInterior", Current.GIClamp, 0.05f, 4.0f);
 				indoors("GIDistanceInterior", Current.GIDistance, 100.0f, 8000.0f);
 				indoors("GlowGIInterior", Current.GlowGI, 0.0f, 4.0f);
@@ -241,23 +242,33 @@ namespace RtAmbient {
 				indoors("LegacyTiltInterior", Current.LegacyTilt, 0.0f, 1.0f);
 			}
 		}
-		{
+		{	// UNOFFICIAL 2026-11-12 (sungi p4) SunGI: the one switch. Outdoors only: indoors every key is the user's own (SunGI changes no interior).
 			SettingManager::Configuration::ConfigNode node;
-			Current.SunGI = false;	// retired
-			Current.RoomGI = false;	// retired
-			Current.GIDenoiseSunGI = true;
-			Current.GIDenoiseRoomGI = true;
+			Current.SunGI = TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "SunGI") && node.BoolValue;
+			Current.GIDenoiseSunGI = !TheSettingManager->Config.FillNode(&node, s, "GIDenoiseSunGI") || node.BoolValue;
+			// UNOFFICIAL 2026-11-12 (sungi nights): the keys as written (a missing key: -1 / 0 = nothing changes); what is in use: the helpers below
 			Current.GlowGINight = TheSettingManager->Config.FillNode(&node, s, "GlowGINight") ? std::clamp(node.FloatValue, -1.0f, 4.0f) : -1.0f;
 			Current.GIClampNight = TheSettingManager->Config.FillNode(&node, s, "GIClampNight") ? (node.FloatValue < 0.0f ? -1.0f : std::clamp(node.FloatValue, 0.05f, 4.0f)) : -1.0f;
-			Current.SkyMissNightAmbient = 0.0f;
+			Current.SkyMissNightAmbient = TheSettingManager->Config.FillNode(&node, s, "SkyMissNightAmbient") ? std::clamp(node.FloatValue, -1.0f, 1.0f) : -1.0f;
 			Current.GISunDuskFade = TheSettingManager->Config.FillNode(&node, s, "GISunDuskFade") ? std::clamp(node.FloatValue, -1.0f, 1.0f) : -1.0f;
 			Current.GILeafTransmission = TheSettingManager->Config.FillNode(&node, s, "GILeafTransmission") ? std::clamp(node.FloatValue, 0.0f, 0.9f) : 0.0f;
+			// UNOFFICIAL 2026-11-13 (rtgi-review)
 			Current.GIDenoiseTune = TheSettingManager->Config.FillNode(&node, s, "GIDenoiseTune") ? std::clamp((int)node.IntValue, 0, 2) : 2;
 			Current.GIGrassDenoise = TheSettingManager->Config.FillNode(&node, s, "GIGrassDenoise") ? std::clamp((int)node.IntValue, 0, 3) : 3;
 			Current.GISamplePoints = TheSettingManager->Config.FillNode(&node, s, "GISamplePoints") && node.BoolValue;
-			Current.GIScreenAmbientOut = false;
+			Current.GIScreenAmbientOut = TheSettingManager->Config.FillNode(&node, s, "GIScreenAmbientOut") && node.BoolValue;
 			Current.GIValidate = !TheSettingManager->Config.FillNode(&node, s, "GIValidate") || node.BoolValue;
+			if (Current.SunGI && !InteriorNow) Current.GI = Current.RadianceCache = Current.CacheExteriors = true;
+			if (Current.SunGI && !InteriorNow) Current.GIAmbient = 0.0f;
+			Current.RoomGI = TheSettingManager->Config.FillNode(&node, "Shaders.AmbientLight.Main", "RoomGI") && node.BoolValue;
+			Current.GIDenoiseRoomGI = !TheSettingManager->Config.FillNode(&node, s, "GIDenoiseRoomGI") || node.BoolValue;
 			Current.OcclusionOnD3D9 = !TheSettingManager->Config.FillNode(&node, s, "OcclusionOnD3D9") || node.BoolValue;	// UNOFFICIAL 2026-11-13
+			if (Current.RoomGI && InteriorNow) {
+				Current.GI = Current.RadianceCache = true;
+				Current.GIAmbient = 0.0f;
+				Current.RoomGIGlow = TheSettingManager->Config.FillNode(&node, s, "RoomGIGlow") ? std::clamp(node.FloatValue, 0.0f, 4.0f) : 1.0f;
+				if (Current.GlowGI <= 0.0f) Current.GlowGI = Current.RoomGIGlow;
+			}
 		}
 	}
 
@@ -337,29 +348,39 @@ namespace RtAmbient {
 	inline bool PassesWanted() { return TheSettingManager->SettingsMain.Main.NvrDxvkPasses && DxvkCompute::Available(); }
 	// UNOFFICIAL 2026-11-12 (sungi p4) the ray-traced path can run at all (the Ready() states 1 and 2 passed): false = SunGI's fallback (the light grid's bounce).
 	inline bool SunGIRtRunning() { return PassesWanted() && CoreReady(); }
-	inline bool SunGIOutdoors() { return false; }
-	inline bool RoomGIIndoors() { return false; }
+	inline bool SunGIOutdoors() { return Current.SunGI && !InteriorNow; }
+	inline bool RoomGIIndoors() { return Current.RoomGI && InteriorNow; }	// UNOFFICIAL 2026-11-12 RoomGI
+	// UNOFFICIAL 2026-11-12 (sungi nights) the night keys' values in use. day: the game's day-night blend as the caller reads it (outdoors
+	// GameState.transitionCurve, 1 by day .. 0 at night; indoors pass 1). With the keys at their defaults and SunGI off each returns the day value
+	// itself (not a blend of it), 0 or false: bit-identical constants.
 	inline float GlowGINow(float day) {
-		return Current.GlowGINight < 0.0f || day >= 1.0f ? Current.GlowGI : Current.GlowGI * day + Current.GlowGINight * (1.0f - day);
+		const float night = Current.GlowGINight >= 0.0f ? Current.GlowGINight : SunGIOutdoors() && Current.GlowGI <= 0.0f ? 1.0f : -1.0f;
+		return night < 0.0f || day >= 1.0f ? Current.GlowGI : Current.GlowGI * day + night * (1.0f - day);
 	}
 	inline float GIClampNow(float day) {
 		return Current.GIClampNight < 0.0f || day >= 1.0f ? Current.GIClamp : Current.GIClamp * day + Current.GIClampNight * (1.0f - day);
 	}
-	inline float SkyMissNightAmbientNow(float) { return 0.0f; }
-	inline bool GISunDuskFadeOn() { return Current.GISunDuskFade >= 0.0f ? Current.GISunDuskFade > 0.5f : !InteriorNow; }
-	inline bool Ready() {
+	inline float SkyMissNightAmbientNow(float day) {
+		const float share = Current.SkyMissNightAmbient >= 0.0f ? Current.SkyMissNightAmbient : SunGIOutdoors() ? 1.0f : 0.0f;
+		return day >= 1.0f ? 0.0f : share * (1.0f - (day > 0.0f ? day : 0.0f));
+	}
+	inline bool GISunDuskFadeOn() { return Current.GISunDuskFade >= 0.0f ? Current.GISunDuskFade > 0.5f : SunGIOutdoors(); }
+	inline bool CoreAvailable(bool wanted) {
 		static int reported = -1;
-		const int state = !Current.Enabled ? 0 : !PassesWanted() ? 1 : RtCore::Gated() ? 5 : !CoreReady() ? 2 : 3;	// (2026-11-15: 5 the RT master switches)
+		const int state = !wanted ? 0 : !PassesWanted() ? 1 : RtCore::Gated() ? 5 : !CoreReady() ? 2 : 3;	// (2026-11-15: 5 the RT master switches)
 		if (state != reported && (state != 0 || reported > 0)) {
-			const char* text[] = { "off", "on but the Vegas Shaders DXVK passes are off ([Main.Main.Performance] NvrDxvkPasses): Vegas Shaders' AO runs",
-				"on but the RT core is not running (see its log line: no NvrRtHelper, no fork 0028, or a GPU without ray tracing): Vegas Shaders' AO runs",
-				"running (ray-traced occlusion in place of the screen estimate)",
-				"on but not at RenderScale below 1 (FSR / DLSS with LowResEffects: frames drawn small, not supported yet): Vegas Shaders' AO runs",
-				"on but ray tracing is off in this kind of space ([Main.Main.RayTracing] RTInteriors / RTExteriors): Vegas Shaders' AO runs" };
-			Logger::Log("UNOFFICIAL RT AO: %s.", text[state]);
+			const char* text[] = { "off", "on but the Vegas Shaders DXVK passes are off ([Main.Main.Performance] NvrDxvkPasses): Vegas Shaders' own passes run",
+				"on but the RT core is not running (see its log line: no NvrRtHelper, no fork 0028, or a GPU without ray tracing): Vegas Shaders' own passes run",
+				"running",
+				"on but not at RenderScale below 1 (FSR / DLSS with LowResEffects: frames drawn small, not supported yet): Vegas Shaders' own passes run",
+				"on but ray tracing is off in this kind of space ([Main.Main.RayTracing] RTInteriors / RTExteriors): Vegas Shaders' own passes run" };
+			Logger::Log("UNOFFICIAL RT AO/GI: %s.", text[state]);
 		}
 		reported = state;
 		return state == 3;
 	}
-	inline bool SkyReady() { return Current.Sky && Ready(); }
+	inline bool AOReady() { const bool avail = CoreAvailable(Current.Enabled || Current.GI || Current.Sky); return Current.Enabled && avail; }
+	inline bool GIReady() { const bool avail = CoreAvailable(Current.Enabled || Current.GI || Current.Sky); return Current.GI && avail; }
+	inline bool SkyReady() { const bool avail = CoreAvailable(Current.Enabled || Current.GI || Current.Sky); return Current.Sky && avail; }
+	inline bool Ready() { return AOReady(); }
 }

@@ -69,8 +69,9 @@ bool rtSunFoliageSoftPass(uint instance, uint primitive, vec2 bary, float frame)
 // tHit: the solid hit's distance (any hit, not always the nearest, as the plain shadow query), else the nearest leaf gone through,
 // else 0. passHidden: the ray starts within reach of the eye (rtHiddenNear) and passes over the hidden first-person body.
 // leafT 0 = leaves are solid (then only `soft` differs from the plain query).
-float rtSunFoliageTrace(vec3 origin, vec3 dir, float tMax, uint mask, bool passHidden, float leafT, bool soft, bool nearest, float frame, out float tHit) {
+float rtSunFoliageTrace(vec3 origin, vec3 dir, float tMax, uint mask, bool passHidden, float leafT, bool soft, bool nearest, float frame, out float tHit, out uint hitCustom) {
 	tHit = 0.0;
+	hitCustom = 0u;
 	const uint termFlag = nearest ? 0u : gl_RayFlagsTerminateOnFirstHitEXT;
 	// UNOFFICIAL 2026-11-19: two-phase opaque-first traversal when !passHidden. Every decal, glass pane, and alpha-tested plant lives
 	// under mask 0x10; testing opaque geometry (mask & ~0x10) with gl_RayFlagsOpaqueEXT runs 100% in fixed-function RT hardware with
@@ -84,6 +85,7 @@ float rtSunFoliageTrace(vec3 origin, vec3 dir, float tMax, uint mask, bool passH
 			while (rayQueryProceedEXT(qO)) {}
 			if (rayQueryGetIntersectionTypeEXT(qO, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
 				tHit = rayQueryGetIntersectionTEXT(qO, true);
+				hitCustom = rayQueryGetIntersectionInstanceCustomIndexEXT(qO, true);
 				return 0.0;
 			}
 		}
@@ -110,9 +112,17 @@ float rtSunFoliageTrace(vec3 origin, vec3 dir, float tMax, uint mask, bool passH
 		nearLeaf = min(nearLeaf, rayQueryGetIntersectionTEXT(q, false));
 		if (through < kRtSunFoliageFloor) { dense = true; rayQueryTerminateEXT(q); break; }
 	}
-	if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT) { tHit = rayQueryGetIntersectionTEXT(q, true); return 0.0; }
+	if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+		tHit = rayQueryGetIntersectionTEXT(q, true);
+		hitCustom = rayQueryGetIntersectionInstanceCustomIndexEXT(q, true);
+		return 0.0;
+	}
 	if (through < 1.0) tHit = nearLeaf;
 	return dense ? 0.0 : through;
+}
+float rtSunFoliageTrace(vec3 origin, vec3 dir, float tMax, uint mask, bool passHidden, float leafT, bool soft, bool nearest, float frame, out float tHit) {
+	uint ci;
+	return rtSunFoliageTrace(origin, dir, tMax, mask, passHidden, leafT, soft, nearest, frame, tHit, ci);
 }
 
 #endif

@@ -529,8 +529,16 @@ vec3 GlassShadow(uint instance, uint prim, mat3 toScene, vec3 dir, vec2 bary) {
 // the last Visible ray (1 when it met none; Direct multiplies the sun and the lamp by it). A pane's triangle reported twice (the API allows
 // a duplicate any-hit) counts once (the last two crossings are remembered).
 vec3 gShadowTint = vec3(1.0);
+// UNOFFICIAL 2026-11-20: committed shadow blocker info (zero extra rays) + primary-hit actor-blocker flag & decoupled sun output
+uint gShadowHitCustom = 0u;
+float gShadowHitT = 0.0;
+bool gFirstActorShadow = false;
+vec3 gFirstSunDiff = vec3(0.0);
+float gFirstSunVis = 1.0, gFirstSunHitT = 0.0;
 bool Visible(vec3 from, vec3 dir, float tMax) {
 	gShadowTint = vec3(1.0);
+	gShadowHitCustom = 0u;
+	gShadowHitT = 0.0;
 	if (!(tMax > 0.0)) return true;   // UNOFFICIAL 2026-11-19: skip zero/negative-length shadow rays
 #ifndef RT_NO_REAL_TEXTURES
 	rtConeWidth = 0.0;   // UNOFFICIAL 2026-11-19: shadow rays must not inherit prior hit's cone width (OMM / sharp cutout alpha)
@@ -570,7 +578,11 @@ bool Visible(vec3 from, vec3 dir, float tMax) {
 			if ((near && !AlphaTest()) || rtAlphaPassShadow(ci, instance, prim, rayQueryGetIntersectionBarycentricsEXT(s, false)))
 				rayQueryConfirmIntersectionEXT(s);
 		}
-		if (rayQueryGetIntersectionTypeEXT(s, true) == gl_RayQueryCommittedIntersectionTriangleEXT) return false;
+		if (rayQueryGetIntersectionTypeEXT(s, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+			gShadowHitT = rayQueryGetIntersectionTEXT(s, true);
+			gShadowHitCustom = rayQueryGetIntersectionInstanceCustomIndexEXT(s, true);
+			return false;
+		}
 	}
 	return true;
 }
@@ -1046,8 +1058,8 @@ const int kEmissiveRow = 50;   // RtEmissiveRow.h kRow (after the frame row)
 // pixel: its cache's first entries lay under the second reservoir set, each pass writing over the other's words.)
 const uint kEmMax = 128u, kEmTriangles = 65536u, kEmWords = 128u * 32u + 65536u;   // RtEmissiveRow.h kMax, kTrianglesMax, kScratchWords
 const int kSplitBaseTexel = 300;   // UNOFFICIAL 2026-11-19 (Phase 3B): 3-pass PT split scratch base (4096-word pages)
-bool gScratchRestir = false, gScratchCache = false, gScratchSplit = false;
-uint gCacheBase = 0u, gCacheMask = 0u, gEmBase = 0u, gSplitTempBase = 0u, gSplitPayloadBase = 0u;
+bool gScratchRestir = false, gScratchCache = false, gScratchSplit = false, gScratchSunSplit = false;
+uint gCacheBase = 0u, gCacheMask = 0u, gEmBase = 0u, gSplitTempBase = 0u, gSplitPayloadBase = 0u, gSunSplitBase = 0u;
 int gEmCount = 0;
 void LoadScratchLayout() {
 	if (!LampImage()) return;
@@ -1081,6 +1093,23 @@ void LoadScratchLayout() {
 			gSplitPayloadBase = base + 6u * pixels;
 		}
 	}
+	// UNOFFICIAL 2026-11-20: decoupled direct sun shadow buffer in scratch (3 words/px: vis+signedHitT, sunDiffDemod.rgb)
+	if (s300.y > 0.5 && s300.y <= pages) {
+		const uint base = uint(s300.y + 0.5) * 4096u;
+		const uint need = 3u * pixels;
+		if (base >= reservoirs && base + need <= total) {
+			gScratchSunSplit = true;
+			gSunSplitBase = base;
+		}
+	}
+}
+void StoreSunSplit(ivec2 px, vec3 albedo) {
+	if (!gScratchSunSplit) return;
+	const uint at = gSunSplitBase + 3u * (uint(px.y) * uint(p.size.x) + uint(px.x));
+	const vec3 sunDemod = min(max(gFirstSunDiff, vec3(0.0)) / max(albedo, vec3(0.02)), vec3(gDenoiseCeil));
+	scratch.words[at + 0u] = packHalf2x16(vec2(clamp(gFirstSunVis, 0.0, 1.0), clamp(gFirstSunHitT, -60000.0, 60000.0)));
+	scratch.words[at + 1u] = packHalf2x16(sunDemod.rg);
+	scratch.words[at + 2u] = packHalf2x16(vec2(sunDemod.b, 0.0));
 }
 int EmCount() { return gEmCount; }   // (hangfix: was the frame row's texel 22 .x, unchecked)
 uint EmBlock(int e) { return gEmBase + uint(e) * 32u; }
@@ -1336,6 +1365,7 @@ const uint kSplitFlagPane       = 1u << 9u;
 const uint kSplitFlagVisChecked = 1u << 10u;
 const uint kSplitFlagViewModel  = 1u << 11u;
 const uint kSplitFlagEmRestir   = 1u << 12u;
+const uint kSplitFlagActorShadow = 1u << 31u;   // UNOFFICIAL 2026-11-20: primary direct shadow ray blocked by NVR_RT_CUSTOM_ACTOR
 
 uint TempResWord(ivec2 px) { return gSplitTempBase + 6u * (uint(px.y) * uint(p.size.x) + uint(px.x)); }
 uint PayloadWord(ivec2 px) { return gSplitPayloadBase + 16u * (uint(px.y) * uint(p.size.x) + uint(px.x)); }
@@ -1520,7 +1550,10 @@ vec3 RestirDirect(vec3 hit, vec3 lift, vec3 n, vec3 v, Surface s, int k0, float 
 	if (canonOne && Valid(y)) {   // (perf-ptcost / RTXDI 2-ray) Ray 1: the canonical winner's initial visibility ray
 		const vec3 l = yPos - lift;
 		const float dist = length(l);
-		if (!(dist > 1.0e-4) || !Visible(lift, l / dist, LightGap(y, dist))) y = NoSample();
+		if (!(dist > 1.0e-4) || !Visible(lift, l / dist, LightGap(y, dist))) {
+			if (dist > 1.0e-4 && (gShadowHitCustom & NVR_RT_CUSTOM_ACTOR) != 0u) gFirstActorShadow = true;
+			y = NoSample();
+		}
 		else { yVisChecked = true; yVisTint = gShadowTint; }
 	}
 	if (Valid(y)) W = wSum / yTarget;
@@ -1688,7 +1721,10 @@ vec3 RestirDirect(vec3 hit, vec3 lift, vec3 n, vec3 v, Surface s, int k0, float 
 		const float dist = length(l);
 		seen = dist > 1.0e-4 && Visible(lift, l / dist, LightGap(y, dist));
 		tint = gShadowTint;
-		if (!seen) { storeW = 0.0; M = min(M, 1.0); }
+		if (!seen) {
+			if (dist > 1.0e-4 && (gShadowHitCustom & NVR_RT_CUSTOM_ACTOR) != 0u) gFirstActorShadow = true;
+			storeW = 0.0; M = min(M, 1.0);
+		}
 	}
 	gRestirVis = true;
 	// the surface as next frame rebuilds it: the distance along this pixel's CENTRE ray (no jitter) to the hit's tangent plane, so the
@@ -1950,10 +1986,38 @@ vec3 Direct(vec3 hit, vec3 n, float t, vec3 v, Surface s) {
 		if (le > 0.0 && le < bound) cE[2] = Rand() * bound < le ? cE[2] * (bound / le) : vec3(0.0);
 	}
 #endif
+#ifndef PT_RESTIR_GI
+	// UNOFFICIAL 2026-11-20: decouple primary front-side direct sun diffuse so RtShadowDenoise (SIGMA + actor anti-lag) denoises it separately from 32-frame GI
+	const bool decoupleSunHere = gScratchSunSplit && gBounce == 0 && !gBackSide && !gFlashOnly && p.sunDir.w > 0.5 &&
+		(uint(p.accum.w) & 512u) != 0u && int(p.misc.w + 0.5) == 0;
+#else
+	const bool decoupleSunHere = false;
+#endif
 	for (int k = 0; k < 3; k++) {
 		if (pickOne && k != chosenC) continue;
 		if (!(dot(cE[k], vec3(1.0)) > 0.0)) continue;
-		if (!Visible(lift, cDir[k], cDist[k])) continue;
+		if (k == 0 && decoupleSunHere) {
+			const bool sunFree = Visible(lift, cDir[0], cDist[0]);
+			const float contact = sunFree ? PtContact(cDir[0], 30000.0) : 0.0;
+			const vec3 tint = sunFree ? gShadowTint : vec3(1.0);
+			const bool actor = !sunFree && (gShadowHitCustom & NVR_RT_CUSTOM_ACTOR) != 0u;
+			if (actor) gFirstActorShadow = true;
+			const float hitD = sunFree ? (contact < 1.0 ? 1.0 : 0.0) : max(gShadowHitT, 1.0);
+			gFirstSunVis = contact;
+			gFirstSunHitT = actor ? -hitD : hitD;
+			const vec3 sunSpec = Split() ? cE[0] * cSpec[0] : vec3(0.0);
+			gFirstSunDiff = max(cE[0] - sunSpec, vec3(0.0)) * tint;
+			if (sunFree && dot(sunSpec, vec3(1.0)) > 0.0) {
+				const vec3 addSpec = sunSpec * contact * tint;
+				e += addSpec;
+				if (gSplitTake) gSplitSpec += addSpec;
+			}
+			continue;
+		}
+		if (!Visible(lift, cDir[k], cDist[k])) {
+			if (gBounce == 0 && (gShadowHitCustom & NVR_RT_CUSTOM_ACTOR) != 0u) gFirstActorShadow = true;
+			continue;
+		}
 		// the sun and the lamp: the contact march (2026-11-07 1b) and the panes' tint (ptaaa: through glass); the emissive point: neither
 		vec3 add = cE[k] * (pickOne ? 1.0 / P[k] : 1.0);
 		if (k == 0) add *= PtContact(cDir[0], 30000.0) * gShadowTint;
@@ -2677,8 +2741,9 @@ vec3 Path(vec3 dir) {
 			if (gSplitVisChecked) fl |= kSplitFlagVisChecked;
 			if (viewModel) fl |= kSplitFlagViewModel;
 			if (emRestir) fl |= kSplitFlagEmRestir;
+			if (gFirstActorShadow) fl |= kSplitFlagActorShadow;
 			fl |= (PackVisTint(gSplitVisTint) << 13u);
-			fl |= (min(gRayCount, 127u) << 25u);
+			fl |= (min(gRayCount, 63u) << 25u);
 			scratch.words[at + 15u] = fl;
 			gSplitWrotePayload = true;
 			break;
@@ -2960,12 +3025,16 @@ void RunSplitSpatial(ivec2 pixel) {
 	vec3 tint = yVisChecked ? yVisTint : vec3(1.0);
 	float storeW = W;
 	bool seen = true;
+	bool actorShadowSpatial = false;
 	if (!gRestirVis && !yVisChecked && Valid(y) && W > 0.0) {
 		const vec3 l = yPos - lift;
 		const float ldist = length(l);
 		seen = ldist > 1.0e-4 && Visible(lift, l / ldist, LightGap(y, ldist));
 		tint = gShadowTint;
-		if (!seen) { storeW = 0.0; M = min(M, 1.0); }
+		if (!seen) {
+			if (ldist > 1.0e-4 && (gShadowHitCustom & NVR_RT_CUSTOM_ACTOR) != 0u) actorShadowSpatial = true;
+			storeW = 0.0; M = min(M, 1.0);
+		}
 	}
 	gRestirVis = true;
 	const vec2 cuv = (vec2(pixel) + 0.5) * p.size.zw;
@@ -2989,9 +3058,13 @@ void RunSplitSpatial(ivec2 pixel) {
 		scratch.words[pAt + 7u] = packHalf2x16(vec2(rad0.b, spec0.r));
 		scratch.words[pAt + 8u] = packHalf2x16(spec0.gb);
 	}
-	if (gCountRays) {
-		const uint prevRays = (fl >> 25u) & 127u;
-		scratch.words[pAt + 15u] = (fl & ~(127u << 25u)) | (min(prevRays + gRayCount, 127u) << 25u);
+	if (actorShadowSpatial || gCountRays) {
+		uint outFl = fl | (actorShadowSpatial ? kSplitFlagActorShadow : 0u);
+		if (gCountRays) {
+			const uint prevRays = (outFl >> 25u) & 63u;
+			outFl = (outFl & ~(63u << 25u)) | (min(prevRays + gRayCount, 63u) << 25u);
+		}
+		scratch.words[pAt + 15u] = outFl;
 	}
 }
 #endif   // PT_SPLIT_SPATIAL
@@ -3025,7 +3098,8 @@ void RunSplitBounce(ivec2 pixel) {
 	const bool glowMark = (fl & kSplitFlagGlowMark) != 0u;
 	const bool isPane = (fl & kSplitFlagPane) != 0u;
 	const bool viewModel = (fl & kSplitFlagViewModel) != 0u;
-	const uint prevRays = (fl >> 25u) & 127u;
+	const bool actorShadow = (fl & kSplitFlagActorShadow) != 0u;
+	const uint prevRays = (fl >> 25u) & 63u;
 	const bool split = Split() && (uint(p.accum.w) & 512u) != 0u;
 
 	vec3 n0 = OctDecode(unpackSnorm2x16(scratch.words[pAt + 4u]));
@@ -3265,7 +3339,8 @@ void RunSplitBounce(ivec2 pixel) {
 
 	const float firstViewZ = (gEarlyLook > 0.5 && p.forward.w > 0.0 && t0 > 0.0) ? t0 * dot(viewModel ? normalize(hit0) : camDir, p.forward.xyz) / p.forward.w : 0.0;
 	const float earlyZ = glowMark ? -1.0 : (isnan(firstViewZ) || isinf(firstViewZ) ? 0.0 : firstViewZ);
-	const float displayA = gCountRays ? 1.0 + float(prevRays + gRayCount) : gEarlyLook > 0.5 ? earlyZ : bumped ? 2.0 + gBumpDetail : 1.0;
+	const float displayABase = gCountRays ? 1.0 + float(prevRays + gRayCount) : gEarlyLook > 0.5 ? earlyZ : bumped ? 2.0 + gBumpDetail : 1.0;
+	const float displayA = (actorShadow && !gCountRays && !(gEarlyLook > 0.5)) ? -displayABase : displayABase;
 	const vec3 albedo = max(firstAlbedo, vec3(0.02));
 
 	if (split) {
@@ -3328,8 +3403,10 @@ void main() {
 		gSplitTake = false; gSplitSpec = vec3(0.0); gSplitRad0 = vec3(0.0); gSplitRatio = vec3(0.0); gSplitHitT = 0.0; gSplitSpecLobe = 0.0;
 		gReflAlbedo = vec3(1.0);
 		gFirstViewZ = 0.0; gFirstGlowMark = false; gFirstBump = false;
+		gFirstActorShadow = false; gFirstSunDiff = vec3(0.0); gFirstSunVis = 1.0; gFirstSunHitT = 0.0;
 		gSplitVisChecked = false; gSplitVisTint = vec3(1.0); gSplitWrotePayload = false;
 		vec3 c = Path(dir);
+		StoreSunSplit(pixel, gFirstAlbedo);
 		if (!gSplitWrotePayload) {
 			if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
 			const uint at = PayloadWord(pixel);
@@ -3344,7 +3421,8 @@ void main() {
 			uint fl = 0u;
 			if (gFirstBump) fl |= kSplitFlagFirstBump;
 			if (gFirstGlowMark) fl |= kSplitFlagGlowMark;
-			fl |= (min(gRayCount, 127u) << 25u);
+			if (gFirstActorShadow) fl |= kSplitFlagActorShadow;
+			fl |= (min(gRayCount, 63u) << 25u);
 			scratch.words[at + 15u] = fl;
 		}
 		return;
@@ -3380,6 +3458,7 @@ void main() {
 	bool specMirror = false;   // (2026-11-09 pt-mirrors) PTDenoiseMirrorSurface: the first path's reflected thing stands in for the surface
 	float earlyZ = 0.0;   // (2026-11-11 PTEarlyLook slice 2) the first path's first hit: view z / farZ, 0 a miss, -1 a glow the game draws
 	bool bumped = false;   // (2026-11-12 ptbump) the first path's first hit was lit with its bumped normal (PTBumpNormals)
+	bool actorShadow = false;   // UNOFFICIAL 2026-11-20: any path's primary direct shadow hit a moving actor (NVR_RT_CUSTOM_ACTOR)
 	for (int s = 0; s < paths; s++) {
 		const vec2 uv = CameraUV(pixel, vec2(Rand(), Rand()));   // (2026-11-10 early kick: texel 23.x; the random numbers drawn either way)
 		const vec3 dir = normalize(p.forward.xyz + p.right.xyz * (2.0 * uv.x - 1.0) - p.up.xyz * (2.0 * uv.y - 1.0));
@@ -3393,7 +3472,10 @@ void main() {
 		gSplitTake = false; gSplitSpec = vec3(0.0); gSplitRad0 = vec3(0.0); gSplitRatio = vec3(0.0); gSplitHitT = 0.0; gSplitSpecLobe = 0.0;
 		gReflAlbedo = vec3(1.0);   // (pt-mirrors)
 		gFirstViewZ = 0.0; gFirstGlowMark = false;   // (2026-11-11 PTEarlyLook)
+		gFirstActorShadow = false;
+		if (s == 0) { gFirstSunDiff = vec3(0.0); gFirstSunVis = 1.0; gFirstSunHitT = 0.0; }
 		vec3 c = Path(dir);
+		actorShadow = actorShadow || gFirstActorShadow;
 		if (s == 0) earlyZ = gFirstGlowMark ? -1.0 : (isnan(gFirstViewZ) || isinf(gFirstViewZ) ? 0.0 : gFirstViewZ);
 		if (s == 0) bumped = gFirstBump;   // (2026-11-12 ptbump)
 		const bool bad = any(isnan(c)) || any(isinf(c));
@@ -3439,13 +3521,15 @@ void main() {
 	// the display's alpha: the RT host's count mode first (perf-ptcost), then PTEarlyLook's depth (2026-11-11), else 1 as before
 	// (2026-11-12 ptbump) ... or 2 + PTBumpDetail where the first hit's light already holds its bumps: RtPathTraceShow.frag keeps that
 	// share of PTDetail there, less the fine contrast the traced light has itself (2 <= a <= 3; a = 1: PTDetail as before)
-	const float displayA = gCountRays ? 1.0 + float(gRayCount) : gEarlyLook > 0.5 ? earlyZ : bumped ? 2.0 + gBumpDetail : 1.0;
+	const float displayABase = gCountRays ? 1.0 + float(gRayCount) : gEarlyLook > 0.5 ? earlyZ : bumped ? 2.0 + gBumpDetail : 1.0;
+	const float displayA = (actorShadow && !gCountRays && !(gEarlyLook > 0.5)) ? -displayABase : displayABase;
 	if ((uint(p.accum.w) & 512u) != 0u) {   // (2026-11-03) demodulated for the denoiser
 		// (2026-11-04 c FIX) the colour stored is the one divided by (with its 0.02 floor): RtPathTraceShow.frag multiplies it back, and with
 		// the raw colour every surface darker than 0.02 in a channel came out darker by colour / 0.02 (rtdenoise-int: PTDenoise 0.87-0.90x
 		// the converged mean overall, dark tiles down to 0.57x)
 		const vec3 albedo = max(albedoSum / float(paths), vec3(0.02));
 #ifndef PT_RESTIR_GI
+		StoreSunSplit(pixel, albedo);
 		if (split) {   // (ptaaa-denoiser) the two signals, each divided by its own albedo (fp16-safe), and the specular albedo itself
 			const vec3 specMean = specSum / float(paths);
 			const vec3 specAlbedo = surfaceSum > 0.0 ? max(specAlbedoSum / float(paths), vec3(0.01)) : vec3(0.0);

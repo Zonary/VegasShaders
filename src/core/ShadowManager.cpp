@@ -1,4 +1,6 @@
 #include "SkinBones.h"	// 2026-11-18: a skin's bone slots may be stale
+#include "ClothWind.h"	// UNOFFICIAL 2026-11-21: sync c248 tracking across ViewModelShadowMap constant restore
+#include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-21: static/dynamic split during DeferredFade
 #include "ShadowFaceCull.h"
 #include "../effects/Puddles/PuddleMap.h"	// 2026-11-12 Puddles map mode
 #include "PointShadowSchedule.h"
@@ -736,7 +738,7 @@ static bool LayerTreesMoving = true;
 // SunLayers: a reference that can move by itself (or be moved): anything not on the still list -- doors, actors, items the physics
 // moves, projectiles, moveable statics, an unknown kind -- and a still kind whose model is animated (a controller on its root: flags,
 // fans, animated activators and lights).
-static bool RefMovesByKind(TESObjectREFR* Ref, NiNode* Node) {
+static bool RefMovesByKind(TESObjectREFR* Ref, NiNode* Node, bool treesMoving) {
 	switch (Ref->baseForm->formType) {
 	case TESForm::FormType::kFormType_Stat:
 	case TESForm::FormType::kFormType_StaticCollection:
@@ -752,13 +754,14 @@ static bool RefMovesByKind(TESObjectREFR* Ref, NiNode* Node) {
 	case TESForm::FormType::kFormType_Light:
 		break;
 	case TESForm::FormType::kFormType_Tree:
-		if (LayerTreesMoving) return true;
+		if (treesMoving) return true;
 		break;
 	default:
 		return true;
 	}
 	return Node->m_controller != nullptr;
 }
+static bool RefMovesByKind(TESObjectREFR* Ref, NiNode* Node) { return RefMovesByKind(Ref, Node, LayerTreesMoving); }
 
 // Hands one geometry to the pass that draws its kind (skinned, tree, LOD land, alpha tested, opaque).
 // UNOFFICIAL 2026-11-20 (exterior ~24m dark circle with Forms.Actors = true): weapon animation mods (e.g. MMP TOZ-34 / TOZ-66)
@@ -1127,7 +1130,7 @@ static inline unsigned ForEachSunCascade(unsigned mask, unsigned& bit) {	// lowe
 // pixels that cascade answers for, so it is left out of this one. Only the cascades RenderShadowMaps marks (drawn fresh every
 // frame: a kept cascade would show what was left out as the camera turns). Returns the cascades of mask the caster still goes to.
 unsigned ShadowManager::SunCastMask(const NiBound* Bound, unsigned mask) {
-	if (!(mask & SunCastAny) || !Bound) return mask;
+	if (!(mask & SunCastAny) || !Bound || Bound->Radius <= 0.0f) return mask;
 	const D3DXVECTOR3 start(Bound->Center.x - TheRenderManager->CameraPosition.x, Bound->Center.y - TheRenderManager->CameraPosition.y,
 		Bound->Center.z - TheRenderManager->CameraPosition.z);
 	const float r = Bound->Radius;
@@ -1165,6 +1168,7 @@ unsigned ShadowManager::SunCastMask(const NiBound* Bound, unsigned mask) {
 
 void ShadowManager::WalkSunCascades(unsigned mask) {
 	for (int c = 0; c < 4; c++) SunCasters[c].clear();
+	WalkSunDynamic = false;
 	if (!mask) return;
 
 	// The LOD sections are walked only when some cascade in the mask uses LOD forms.
@@ -1216,7 +1220,9 @@ void ShadowManager::WalkSunCell(TESObjectCELL* Cell, unsigned mask) {
 #if NVR_TEST_TOOLS
 		OrthoProbe::CurrentRef = entry->item;
 #endif
+		WalkSunDynamic = entry->item && entry->item->baseForm ? RefMovesByKind(entry->item, refNode, false) : false;
 		WalkSunChildren(refNode, inMask, false, false);
+		WalkSunDynamic = false;
 #if NVR_TEST_TOOLS
 		OrthoProbe::CurrentRef = nullptr;
 #endif
@@ -1290,7 +1296,7 @@ void ShadowManager::WalkSunChildren(NiAVObject* Root, unsigned mask, bool isLand
 				cm = in;
 			}
 			if (!cm) continue;
-			cm = SunCastMask(child->GetWorldBound(), cm);	// UNOFFICIAL 2026-11-04 CasterCulling: its shadow cannot reach the view
+			if (!isLOD) cm = SunCastMask(child->GetWorldBound(), cm);	// UNOFFICIAL 2026-11-04 CasterCulling: skip LOD chunks (distant ridges taller than CasterDrop cast into Near/Middle at low sun)
 			if (!cm) continue;
 
 			if (child->IsFadeNode() && static_cast<BSFadeNode*>(child)->FadeAlpha < TheShaderManager->Effects.ShadowsExteriors->Settings.ShadowMaps.CasterFadeMin) { FrameJournal::FadeDrops++; continue; } // stop rendering fadenodes below a certain opacity (UNOFFICIAL 2026-10-28: CasterFadeMin, 0.75 = as before)
@@ -1309,12 +1315,13 @@ void ShadowManager::WalkSunObject(NiAVObject* Object, unsigned mask, bool isLODL
 #if NVR_TEST_TOOLS
 	OrthoProbe::NoteGeometry(geo);
 #endif
-	auto add = [this](unsigned m, NiGeometry* g, UInt8 pass) {
-		for (unsigned c; m; ) { m = ForEachSunCascade(m, c); SunCasters[c].push_back({ g, pass }); }
+	auto add = [this](unsigned m, NiGeometry* g, UInt8 pass, UInt8 dyn) {
+		for (unsigned c; m; ) { m = ForEachSunCascade(m, c); SunCasters[c].push_back({ g, pass, dyn }); }
 	};
 	const int skinned = skinnedGeoPass->TestObject(geo);
-	if (skinned) { if (skinned == 1) add(mask, geo, kSunSkinned); return; }
-	if (speedTreePass->TestObject(geo)) { add(mask, geo, kSunTree); return; }
+	const UInt8 dyn = (WalkSunDynamic || skinned == 1) ? 1 : 0;
+	if (skinned) { if (skinned == 1) add(mask, geo, kSunSkinned, 1); return; }
+	if (speedTreePass->TestObject(geo)) { add(mask, geo, kSunTree, dyn); return; }
 
 	int lodLand = -1, alpha = -1, opaque = -1;	// -1: not tested yet
 	unsigned lodMask = 0, alphaMask = 0, opaqueMask = 0;
@@ -1338,9 +1345,9 @@ void ShadowManager::WalkSunObject(NiAVObject* Object, unsigned mask, bool isLODL
 	for (unsigned m = mask, c; m; ) {
 		m = ForEachSunCascade(m, c);
 		const unsigned bit = 1u << c;
-		if (lodMask & bit) SunCasters[c].push_back({ geo, kSunLodLand });
-		else if (alphaMask & bit) SunCasters[c].push_back({ geo, kSunAlpha });
-		else if (opaqueMask & bit) SunCasters[c].push_back({ geo, opaquePass });
+		if (lodMask & bit) SunCasters[c].push_back({ geo, kSunLodLand, 0 });
+		else if (alphaMask & bit) SunCasters[c].push_back({ geo, kSunAlpha, dyn });
+		else if (opaqueMask & bit) SunCasters[c].push_back({ geo, opaquePass, dyn });
 	}
 	if (opaqueMask && AccumulatingLand && RenderPass::LandDrop > 0.0f) RenderPass::LandSet.insert(geo);
 }
@@ -1356,8 +1363,12 @@ RenderPass* ShadowManager::SunPassOf(UInt8 pass) {
 	}
 }
 
-void ShadowManager::PushSunCasters(int cascade) {
-	for (const SunCaster& caster : SunCasters[cascade]) SunPassOf(caster.pass)->GeometryList.push(caster.geometry);
+void ShadowManager::PushSunCasters(int cascade, int dynamicFilter) {
+	for (const SunCaster& caster : SunCasters[cascade]) {
+		if (dynamicFilter == 0 && caster.dynamic) continue;
+		if (dynamicFilter == 1 && !caster.dynamic) continue;
+		SunPassOf(caster.pass)->GeometryList.push(caster.geometry);
+	}
 }
 
 // UNOFFICIAL 2026-10-21 (sunshadow) SunCascadeSkipFlat: the cascade's projection maps every point onto one line (or one point): the
@@ -2452,6 +2463,12 @@ void ShadowManager::RenderShadowMaps() {
 	const FlashlightEffect* torch = TheShaderManager->Effects.Flashlight;
 	const bool flashlightMapOn = torch && torch->Enabled && torch->spotLightActive && torch->WantsShadowMap() && nearSpots[0];
 	fx->CharacterNpcLive = 0;	// UNOFFICIAL 2026-11-08 CharacterShadowMapNpcs: no NPC maps on a frame without sun shadows
+	fx->Constants.DynamicData = D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);
+	if (!sunShadowsOn || !ShadowShadersLoaded) {
+		SunFadeDeferred::Fading = false;
+		fx->DeferredFading = fx->DeferredHolding = fx->DeferredCapturePending = fx->DeferredCaptureReady = false;
+		fx->Constants.CrossFade.x = 0.0f;
+	}
 	// early out in case shadow rendering is not required
 	if (!sunShadowsOn && !lampShadowsOn && !flashlightMapOn && !TheShaderManager->orthoRequired && !TheShaderManager->orthoSkyRequired || !ShadowShadersLoaded) {
 		return;
@@ -2689,8 +2706,10 @@ void ShadowManager::RenderShadowMaps() {
 			const unsigned cacheMaxAge = (unsigned)max(TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunCacheMaxAge"), 1);
 			const float cacheMoveShare = max(TheSettingManager->GetSettingF("Main.Main.ReducedQuality", "SunCacheMoveShare"), 0.0f);
 			const bool cachedDistant = (TheSettingManager->SettingsMain.Main.CachedDistantShadows || byChange) && !staggered;
+			const bool captureStaticOld = fx->DeferredCapturePending && !fx->ShadowAtlasSurfaceMSAA && fx->ShadowAtlasOldSurface;
+			if (captureStaticOld) ForceAllCascades = true;
 			// UNOFFICIAL 2026-10-31 SunLayers (DrawSunLayer above): the middle and far cascades from a kept static layer + a per-frame overlay
-			const bool sunLayers = TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunLayers") != 0 && !staggered;
+			const bool sunLayers = TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunLayers") != 0 && !staggered && !captureStaticOld;
 			const int layerMargin = std::clamp(TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunLayersMargin"), 8, 512);
 			const unsigned layerMaxAge = (unsigned)max(TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunLayersMaxAge"), 1);
 			LayerTreesMoving = TheSettingManager->GetSettingI("Main.Main.ReducedQuality", "SunLayersTreesMoving") != 0;
@@ -2698,7 +2717,7 @@ void ShadowManager::RenderShadowMaps() {
 			// UNOFFICIAL 2026-10-21 (sunshadow): SunCascadeOneWalk schedules every cascade first (the schedule of one does not depend
 			// on another's draw), walks once for all that redraw, then draws them in the same order. Without it each cascade is
 			// scheduled, walked and drawn in turn, as before. SunCascadeSkipFlat: a flat cascade is cleared, not walked or drawn.
-			const bool oneWalk = fx->Settings.Exteriors.SunOneWalk;
+			const bool oneWalk = fx->Settings.Exteriors.SunOneWalk || captureStaticOld || SunFadeDeferred::Fading;
 			const bool skipFlat = fx->Settings.Exteriors.SunSkipFlat;
 			const bool leanDraws = fx->Settings.Exteriors.SunLeanDraws;	// RenderPass::Lean around the new path's draws
 #if NVR_TEST_TOOLS
@@ -2712,7 +2731,7 @@ void ShadowManager::RenderShadowMaps() {
 			float cascadeInner[4] = {};
 			unsigned flatCascades = 0;
 			const char* cascadeWhy[4] = { "kept", "kept", "kept", "kept" };	// UNOFFICIAL 2026-11-01 frame journal: why each cascade was drawn
-			auto drawCascade = [&](int i) {
+			auto drawCascade = [&](int i, int dynamicFilter = -1) {
 				static const char* const cascadeNames[] = { "Sun cascade 0 (near)", "Sun cascade 1 (middle)", "Sun cascade 2 (far)", "Sun cascade 3 (lod)" };
 				GpuDebug::LabelScope label(i >= 0 && i < 4 ? cascadeNames[i] : "Sun cascade");	// UNOFFICIAL 2026-10-26 GpuDebugLabels
 				ShadowsExteriorEffect::ShadowMapSettings* sm = &fx->ShadowMaps[i];
@@ -2780,7 +2799,7 @@ void ShadowManager::RenderShadowMaps() {
 					SunVerify.casters += newOrder.size();
 				}
 #endif
-				if (oneWalk) PushSunCasters(i);
+				if (oneWalk) PushSunCasters(i, dynamicFilter);
 				else if (!flat) WalkShadowMap(sm);
 				RenderPass::Lean = leanDraws;
 				DrawShadowMap(sm, oneWalk);
@@ -2910,6 +2929,7 @@ void ShadowManager::RenderShadowMaps() {
 					SunCastView = SunCastAny = 0;
 					for (int c = 0; c < 4; c++) {
 						SunCoveringCount[c] = 0;
+						if (captureStaticOld) continue;	// 360-degree unculled static snapshot so turning the camera during fade never reveals culled shadows
 						const unsigned bit = 1u << c;
 						if (!(walked & bit) || !(freshCascades & bit)) continue;
 						SunCastSphere[c] = fx->ShadowMaps[c].ShadowMapCascadeCenterRadius;
@@ -2942,7 +2962,31 @@ void ShadowManager::RenderShadowMaps() {
 #endif
 				RenderPass::LandDrop = 0.0f;
 				SunLandDropScale = 0.0f;
-				for (int i = MapNear; i < MapOrtho; i++) if (updatedCascades & ~layeredCascades & (1u << i)) drawCascade(i);
+				if (captureStaticOld) {
+					// Draw static casters first, capture ShadowAtlasOld cleanly without actors/movers, then overlay dynamic casters onto the live atlas.
+					for (int i = MapNear; i < MapOrtho; i++) if (updatedCascades & ~layeredCascades & (1u << i)) drawCascade(i, 0);
+					fx->CaptureDeferredOldAtlas();
+					const unsigned walked = updatedCascades & ~layeredCascades & ~flatCascades;
+					const bool twoSided = TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.Main", "TwoSidedCasters") != 0;
+					for (int i = MapNear; i <= MapFar; i++) {
+						if (!(walked & (1u << i))) continue;
+						bool hasDynamic = false;
+						for (const SunCaster& c : SunCasters[i]) if (c.dynamic) { hasDynamic = true; break; }
+						if (!hasDynamic) continue;
+						ShadowsExteriorEffect::ShadowMapSettings* sm = &fx->ShadowMaps[i];
+						fx->Constants.ShadowViewProj = cascadeViewProj[i];
+						dev->SetViewport(&sm->ShadowMapViewPort);
+						PushSunCasters(i, 1);
+						RenderPass::TwoSided = twoSided;
+						RenderPass::Lean = leanDraws;
+						this->RenderAccums();
+						RenderPass::Lean = false;
+						RenderPass::TwoSided = false;
+					}
+				}
+				else {
+					for (int i = MapNear; i < MapOrtho; i++) if (updatedCascades & ~layeredCascades & (1u << i)) drawCascade(i, -1);
+				}
 				RenderPass::LandSet.clear();
 			}
 #if NVR_TEST_TOOLS
@@ -2958,6 +3002,40 @@ void ShadowManager::RenderShadowMaps() {
 			if (ForceAllCascades) SunAtlasDrawn = true;	// UNOFFICIAL SkipWhenFaded: every cascade was drawn this frame
 			ForceAllCascades = false;
 			DisplaceShadows::EndCascades();	// UNOFFICIAL 2026-10-27
+			if (SunFadeDeferred::Fading && oneWalk && fx->ShadowDynamicSurface && fx->ShadowDynamicSize >= 512 && !fx->ShadowAtlasSurfaceMSAA) {
+				// UNOFFICIAL 2026-11-21: half-res dynamic-caster overlay so active fades preserve full live actor shadows without ghosting from ShadowAtlasOld.
+				const float zWas = dataConst->z;
+				dataConst->z = 1.0f;
+				dev->SetRenderTarget(0, fx->ShadowDynamicSurface);
+				dev->SetDepthStencilSurface(fx->ShadowAtlasDepthSurface);
+				rs->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE, RenderStateArgs);
+				rs->SetRenderState(D3DRS_ZWRITEENABLE, TRUE, RenderStateArgs);
+				rs->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE, RenderStateArgs);
+				rs->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE, RenderStateArgs);
+				const DWORD dynCascade = fx->ShadowDynamicSize / 2;
+				const D3DXCOLOR farWhite(1.0f, 1.0f, 1.0f, 1.0f);
+				const unsigned walked = updatedCascades & ~layeredCascades & ~flatCascades;
+				const bool twoSided = TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.Main", "TwoSidedCasters") != 0;
+				for (int i = MapNear; i <= MapFar; i++) {
+					D3DVIEWPORT9 vp = { (DWORD)(i % 2) * dynCascade, (DWORD)(i / 2) * dynCascade, dynCascade, dynCascade, 0.0f, 1.0f };
+					dev->SetViewport(&vp);
+					dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, farWhite, 1.0f, 0);
+					if (!(walked & (1u << i))) continue;
+					bool hasDynamic = false;
+					for (const SunCaster& c : SunCasters[i]) if (c.dynamic) { hasDynamic = true; break; }
+					if (!hasDynamic) continue;
+					fx->Constants.ShadowViewProj = cascadeViewProj[i];
+					PushSunCasters(i, 1);
+					RenderPass::TwoSided = twoSided;
+					RenderPass::Lean = leanDraws;
+					this->RenderAccums();
+					RenderPass::Lean = false;
+					RenderPass::TwoSided = false;
+				}
+				dataConst->z = zWas;
+				dev->SetRenderTarget(0, fx->ShadowAtlasSurface);
+				fx->Constants.DynamicData = D3DXVECTOR4(1.0f / (float)fx->ShadowDynamicSize, 1.0f, 0.0f, 0.0f);
+			}
 			LogSunShadowStats(cachedDistant);
 #if NVR_TEST_TOOLS
 			if (SunShadowStats::Mode) SunShadowStats::EndFrame(SunShadowStats::Now() - statsLoopStart);
@@ -3934,6 +4012,7 @@ bool ShadowManager::RenderViewModelShadowMap(NiCamera* FirstPersonCamera) {
 	}
 	Device->GetVertexShaderConstantF(0, &savedVSConst[0][0], 256);
 	Device->GetPixelShaderConstantF(0, &savedPSConst[0][0], 224);
+	const bool savedClothNonZero = ClothWind::NonZeroSent, savedClothGrass = ClothWind::GrassInC248;
 	const D3DXVECTOR4 savedData = Shadows->Constants.Data;
 	const D3DXMATRIX savedViewProj = Shadows->Constants.ShadowViewProj;
 	ShadowsExteriorEffect::ShadowMapSettings& map = Shadows->CharacterMap;
@@ -4074,7 +4153,9 @@ bool ShadowManager::RenderViewModelShadowMap(NiCamera* FirstPersonCamera) {
 	map.CustomClearRequired = false;
 	BeginShadowMap(&map, &viewProj);
 	AccumChildren(Player->firstPersonNiNode, &map.Forms, false, false, nullptr);
+	RenderPass::FirstPerson = true;
 	DrawShadowMap(&map);
+	RenderPass::FirstPerson = false;
 
 	for (int i = 0; i < _countof(kStates); i++) {
 		RenderState->SetRenderState(kStates[i], saved[i], RenderStateArgs);
@@ -4106,6 +4187,7 @@ bool ShadowManager::RenderViewModelShadowMap(NiCamera* FirstPersonCamera) {
 		}
 	}
 	Device->SetVertexShaderConstantF(0, &savedVSConst[0][0], 256);
+	ClothWind::OnVSConstantsRestored(savedVSConst[248], savedClothNonZero, savedClothGrass);
 	Device->SetPixelShaderConstantF(0, &savedPSConst[0][0], 224);
 	if (savedVS) savedVS->Release();
 	if (savedPS) savedPS->Release();

@@ -653,10 +653,18 @@ void main() {
 
     // Reconstruct exact surface position (unpushed for lighting, pushed for shadow lookup)
     float useViewZ = storedViewZ;
-    if (cb.dlShadow.w > 0.5 && HasFlag(kFlagDepthIsLinear) && abs(rawDepth - storedViewZ) <= storedViewZ * (1.0 / 512.0) + 0.5) {
-        useViewZ = rawDepth;
+    if (cb.dlShadow.w > 0.5) {
+        float sceneViewZ = rawDepth;
+        if (!HasFlag(kFlagDepthIsLinear)) {
+            float den = rawDepth - cb.dlDepth.x;
+            if (abs(den) < 1.0e-12) den = cb.dlDepth.y < 0.0 ? -1.0e-12 : 1.0e-12;
+            sceneViewZ = cb.dlDepth.y / den;
+        }
+        if (abs(sceneViewZ - storedViewZ) <= storedViewZ * (1.0 / 512.0) + 0.5) {
+            useViewZ = sceneViewZ;
+        }
     }
-    const vec3 surfacePos = (cb.dlShadow.w > 0.5 && HasFlag(kFlagDepthIsLinear)) ? (view * useViewZ) : (ray * norm4.b);
+    const vec3 surfacePos = (cb.dlShadow.w > 0.5) ? (view * useViewZ) : (ray * norm4.b);
     const vec3 smoothN = ShadowDecodeNormal(norm4.rg);
     const vec3 smoothFacingN = ShadowFacingNormal(smoothN, surfacePos);
     const vec3 shadowPos = surfacePos + smoothFacingN * (norm4.b * cb.dlShadow.z);

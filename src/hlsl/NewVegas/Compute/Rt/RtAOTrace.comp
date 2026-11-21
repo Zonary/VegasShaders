@@ -268,15 +268,12 @@ vec4 ScreenLight(vec3 hit) {
 }
 #endif
 
-// (2026-10-29) One bounce sample's light, chroma-preserving rational soft-knee (knee = 0.75 * m, asymptote = 2.0 * m): a ray that lands
-// on a lamp's glow or a lit sign rolls off smoothly without harsh hue clipping or fireflies.
+// (2026-10-29) One bounce sample's light, its luminance capped at m (keeps the hue): a ray that lands on a lamp's glow or a
+// lit sign gives one pixel a value hundreds of times its neighbours', which the blurs and the history cannot average away (fireflies).
 float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 vec3 Clamped(vec3 c, float m) {
     float l = Luma(c);
-    if (m <= 0.0 || l <= 0.75 * m) return c;
-    float k = 0.75 * m, span = 1.25 * m, ex = l - k;
-    float lOut = k + (span * ex) / (span + ex);
-    return c * (lOut / l);
+    return m > 0.0 && l > m ? c * (m / l) : c;
 }
 vec3 Clamped(vec3 c) { return Clamped(c, cb.gi2.z); }
 
@@ -330,7 +327,8 @@ vec3 ShadingNormal(uint instance, uint prim, vec2 bary, vec3 n, mat4x3 toScene, 
 // 4 GIScreenAmbientOut. CacheW() is w without the test and GIScreenAmbientOut (the strength + 16 x off screen): with neither, the old value exactly.
 int SlotFlags() { return int(floor(CACHE_B.w * (1.0 / 16.0))); }
 int GiTest() { return (SlotFlags() >> 1) & 1; }
-float CacheW() { return CACHE_B.w - 32.0 * float(GiTest()) - ((SlotFlags() & 4) != 0 ? 64.0 : 0.0); }
+bool GiScreenAmbientOut() { return (SlotFlags() & 4) != 0; }
+float CacheW() { return CACHE_B.w - 32.0 * float(GiTest()) - (GiScreenAmbientOut() ? 64.0 : 0.0); }
 #define CACHE_STRENGTH (CacheW() >= 16.0 ? CacheW() - 16.0 : CacheW())
 // UNOFFICIAL 2026-11-03 (rtspec) a lamp's falloff at x = distance / reach. GIGameLamps (the C++ gives the reach NEGATIVE): the game's own,
 // (1 - x^2)^2.2 (Pointlights.hlsl vanillaAtt decoded by LinFalloff), as the deferred lamp pass lights them; else (1 - x)^2, as before.
@@ -460,7 +458,7 @@ vec3 CacheIrradiance(vec3 p, vec3 n) {
 // (2026-11-15, port of mrfury97's GIHitMips) sunDir.w = the sun term (0 off, 1 + GILeafTransmission on) + 4 while GIHitMips is on: SunW() is the sun term
 float SunW() { return mod(cb.sunDir.w, 4.0); }
 vec3 DirectLight(vec3 hit, vec3 lift, vec3 n, float xi) {
-    vec3 e = vec3(0.0);   // pure direct bounce (no unshadowed sky/ambient fill at bounce hits)
+    vec3 e = cb.ambient.rgb * (cb.gi.w * (0.5 + 0.5 * n.z));   // GIAmbient (default 0: the game's ambient is already the indirect light)
     float sunCos = dot(n, cb.sunDir.xyz);
     // UNOFFICIAL 2026-11-12 GILeafTransmission: sunDir.w = 1 + the key while the sun lights (0 = exactly 1: the old test, Visible). Above 0 the
     // ray toward the sun goes through plant cut-outs (leaf cards, grass, "plant" class meshes): each covered one leaves the key's share of the
@@ -542,8 +540,23 @@ vec3 Shade(uint instance, uint prim, vec2 bary, vec3 hit, vec3 ng, vec3 n, float
 }
 
 // One bounce (rt-ao-gi): a cosine-weighted ray from the pixel; at its closest hit the light that surface sends back toward the pixel:
-// the game's lit frame where the screen saw it (ScreenLight, minus the hit surface's estimated game ambient share so game ambient is not
-// re-bounced), else Shade. Misses return 0: primary pixels keep their full-res game ambient modulated by RT AO + RT Skylighting.
+// the game's lit frame where the screen saw it (ScreenLight, GI v2), else Shade. Misses return 0 unless GISky / AmbientReplace is active.
+// UNOFFICIAL 2026-11-12 (sungi p3, F6) SkyMissSH: gi.y + 10 = the directional sky is on (order-2 SH radiance in lampImage row 1).
+vec3 SkyRadianceSH(vec3 d) {
+    float c[28];
+    for (int k = 0; k < 14; k++) { vec2 v = imageLoad(lampImage, ivec2(k, 1)).rg; c[2 * k] = v.x; c[2 * k + 1] = v.y; }
+    const float basis[9] = float[9](1.0, d.y, d.z, d.x, d.x * d.y, d.y * d.z, 3.0 * d.z * d.z - 1.0, d.x * d.z, d.x * d.x - d.y * d.y);
+    vec3 r = vec3(0.0);
+    for (int i = 0; i < 9; i++) r += vec3(c[3 * i], c[3 * i + 1], c[3 * i + 2]) * basis[i];
+    return max(r, vec3(0.0));
+}
+vec3 SkyMiss(vec3 d) {
+    const bool directional = cb.gi.y > 5.0;
+    float s = (directional ? cb.gi.y - 10.0 : cb.gi.y) - 1.0;
+    if (s <= 0.0) return vec3(0.0);
+    if (directional) return Clamped(SkyRadianceSH(d) * (s * clamp(1.0 + 10.0 * d.z, 0.0, 1.0)));
+    return Clamped(cb.ambient.rgb * (s * clamp(0.5 + 2.0 * d.z, 0.0, 1.0)));
+}
 float HitCone(float t) { return cb.sunDir.w > 3.5 ? 0.5 * t : 0.0; }
 #ifndef RT_CACHE_PASS
 // (2026-11-07 ptaaa-firstperson) a committed hit into Bounce's locals (a rayQueryEXT cannot be copied)
@@ -586,25 +599,21 @@ vec4 Bounce(vec3 origP, vec3 origN, vec3 start, vec3 d, float tMin, float xi, bo
             Proceed(q);
             AO_TAKE_HIT(q);
         }
-        if (!found) {
-            if (cb.gi.y > 1.0001) {   // host scene `gisky` (in-game AmbientOcclusion passes gi.y = 1.0 -> pure 0 miss)
-                vec3 sky = cb.ambient.rgb * ((cb.gi.y - 1.0) * clamp(0.5 + 2.0 * d.z, 0.0, 1.0));
-                float ls = Luma(sky);
-                return vec4(cb.gi2.z > 0.0 && ls > cb.gi2.z ? sky * (cb.gi2.z / ls) : sky, 1.0);
-            }
-            return vec4(0.0, 0.0, 0.0, 1.0);
-        }
+        if (!found) return vec4(SkyMiss(d), 1.0);
         ng = HitNormal(instance, prim, toWorld, d);
         hit = start + d * t;
         gBounceT = t;
         gBounceN = ng;
         vec4 seen = ScreenLight(hit);
         if (seen.a > 0.5 && CacheW() < 16.0) {   // (DebugView 7: Shade everywhere)
-            rtConeWidth = HitCone(t);
-            const vec3 hitAlbedo = clamp(rtHitAlbedo(instance, prim, bary), 0.0, 1.0);
-            rtConeWidth = 0.0;
-            const vec3 cached = CACHE_STRENGTH > 0.0 ? CacheIrradiance(hit, ng) * CACHE_STRENGTH : vec3(0.0);
-            seen.rgb = max(seen.rgb - hitAlbedo * cb.ambient.rgb, vec3(0.0)) + hitAlbedo * cached;
+            // UNOFFICIAL 2026-11-13 (rtgi-review B6, R5) GIScreenAmbientOut (+ 64 on slot 7 w, only while AmbientReplace is on)
+            if (GiScreenAmbientOut()) {
+                rtConeWidth = HitCone(t);
+                const vec3 hitAlbedo = clamp(rtHitAlbedo(instance, prim, bary), 0.0, 1.0);
+                rtConeWidth = 0.0;
+                const vec3 cached = CACHE_STRENGTH > 0.0 ? CacheIrradiance(hit, ng) * CACHE_STRENGTH : vec3(0.0);
+                seen.rgb = max(seen.rgb - hitAlbedo * cb.ambient.rgb, vec3(0.0)) + hitAlbedo * cached;
+            }
             return vec4(Clamped(seen.rgb), t / cb.gi.x);
         }
         rtConeWidth = HitCone(t);   // (2026-11-13 R19: for ShadingNormal's and Shade's texture reads; Shade puts it back to 0)
@@ -1286,6 +1295,7 @@ void main() {
     // UNOFFICIAL 2026-11-12 (sungi p3, F8) per axis bin (+x -x +y -y +z -z): the rays' weights and the weighed distance and its square (cell sizes)
     float binW[6], binD[6], binD2[6];
     for (int k = 0; k < 6; k++) { binW[k] = 0.0; binD[k] = 0.0; binD2[k] = 0.0; }
+    const bool skyMisses = cb.gi.y > 5.0;   // SkyMissSH (gi.y + 10): a ray that finds nothing brings the sky's radiance in its direction
     for (int i = 0; i < rays; i++) {
         float z = 1.0 - 2.0 * fract((float(i) + turn.x) / float(rays));
         float phi = 6.2831853 * fract(float(i) * 0.618034 + turn.y);
@@ -1303,7 +1313,15 @@ void main() {
             binW[by] += wd.y; binD[by] += wd.y * dn; binD2[by] += wd.y * dn * dn;
             binW[bz] += wd.z; binD[bz] += wd.z * dn; binD2[bz] += wd.z * dn * dn;
         }
-        if (!found) continue;
+        if (!found) {
+            if (skyMisses) {
+                vec3 sky = SkyMiss(d);
+                r += sky.r * vec4(1.0, d);
+                g += sky.g * vec4(1.0, d);
+                b += sky.b * vec4(1.0, d);
+            }
+            continue;
+        }
         float th = rayQueryGetIntersectionTEXT(q, true);
         nearest = min(nearest, th);
         if (!rayQueryGetIntersectionFrontFaceEXT(q, true)) { inside += 1.0; continue; }

@@ -200,6 +200,7 @@ public:	// (the RT core user in Reflections.cpp reads the images)
 	void				RtRideBeforeFrame(IDirect3DDevice9* Device, IDirect3DSurface9* GameTarget);
 	std::string			RtStatusText() const;	// UNOFFICIAL 2026-11-01: the RT trace's state as of its last frame, for the REPORT block
 	bool				NothingReflects() const { return nothingReflects; }	// UNOFFICIAL 2026-11-05: ShouldRender found no reflecting surface (the Ray tracing page)
+	bool				RtWeaponActive() const { return Enabled && Settings.RtEnabled && Settings.RtWeapon > 0.0f && RtWanted(); }	// UNOFFICIAL 2026-11-20: only replace forward env map on 1st-person when RT weapon reflections are actually active
 private:
 	bool				nothingReflects = false;	// dry, GroundSheen / InteriorFloors 0, no material reflections (ShouldRender, last asked)
 	bool				PuddlesActive = false;	// 2026-11-08 Puddles: standing water left outdoors (the passes run for it after the rain)

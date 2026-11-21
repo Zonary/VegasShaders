@@ -702,6 +702,10 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Main.Main.Quality",                    "DeferredSkin",       RestartRule::Changed },
 	{ "Main.Main.Quality",                    "DeferredHair",       RestartRule::Changed },
 	{ "Main.Main.Quality",                    "DeferredTransparents", RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredFirstPerson", RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredFoliageLamps", RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredRtSunFirst", RestartRule::Changed },
+	{ "Main.Main.Quality",                    "DeferredADFog",      RestartRule::Changed },
 	{ "Main.Main.Quality",                    "CapturedBumpNormals", RestartRule::Changed },
 	{ "Main.Main.Misc",                       "ForceMSAA",          RestartRule::Changed },
 	{ "Main.Main.Misc",                       "PresetOldDefaults",  RestartRule::Changed },
@@ -944,6 +948,26 @@ static const char* InactiveReason(const char* section, const char* key) {
 		if ((sec == "Main.Main.Quality" && is({ "DeferredRenderer" })) ||
 			((sec == "Shaders.TAA.FSR" || sec == "Shaders.TAA.DLSS") && is({ "Enabled", "RenderScale" })))
 			return "Not used while ForceMSAA (Main > Misc) is on: MSAA disables deferred rendering and upscalers.";
+	}
+
+	// Deferred renderer sub-features & GearWeather
+	if (sec == "Main.Main.Quality") {
+		const bool defOff = NumericSetting("Main.Main.Quality", "DeferredRenderer") < 1.0f || NumericSetting("Main.Main.Misc", "ForceMSAA") != 0.0f;
+		if (is({ "DeferredSkin", "DeferredSkinSSS", "DeferredSkinBlur", "DeferredHair", "DeferredTransparents",
+			"DeferredBumpedNormals", "DeferredFirstPerson", "DeferredFoliageLamps", "DeferredReflections",
+			"DeferredALAlbedo", "DeferredALAlbedoGain", "DeferredRRGuides", "DeferredRtSunFirst",
+			"DeferredTiledLight", "DeferredADFog", "GBufferView" }) && defOff)
+			return "Only used while DeferredRenderer is on (and ForceMSAA is off).";
+		if (is({ "DeferredSkinSSS", "DeferredSkinBlur" }) && NumericSetting("Main.Main.Quality", "DeferredSkin") == 0.0f)
+			return "Only used while DeferredSkin is on.";
+		if (is({ "DeferredALAlbedoGain" }) && NumericSetting("Main.Main.Quality", "DeferredALAlbedo") == 0.0f)
+			return "Only used while DeferredALAlbedo is on.";
+		if (!strncmp(key, "GearWeather", 11)) {
+			if (defOff || NumericSetting("Main.Main.Quality", "DeferredFirstPerson") == 0.0f)
+				return "Requires DeferredRenderer and DeferredFirstPerson to be enabled (restart).";
+			if (strcmp(key, "GearWeather") != 0 && NumericSetting("Main.Main.Quality", "GearWeather") == 0.0f)
+				return "Only used while GearWeather is on.";
+		}
 	}
 
 	// Skin: ScreenSpace blur takes over from per-pixel Scattering; Main/Scattering apply outdoors, Interiors applies indoors
@@ -1347,6 +1371,7 @@ static const char* const kOffOnRestart[] = { "0 - Off", "1 - On (needs a restart
 static const char* const kFsrVersions[] = { "0 - FSR 2.2.1", "1 - FSR 3.1" };	// UNOFFICIAL 2026-10-28 (core/UpscalerFsr31.cpp)
 static const char* const kPtLevels[] = { "0 - Quality", "1 - Balanced", "2 - Performance" };	// UNOFFICIAL 2026-11-11 PTRealtimeLevel
 static const char* const kDeferredModes[] = { "0 - Off (vanilla forward)", "1 - Indoors only", "2 - Full (outdoors + indoors)" };
+static const char* const kDeferredSkinSSSModes[] = { "0 - Off", "1 - Classic blur", "2 - Burley SSS (sharp highlights)" };
 static const char* const kSmokeTests[] = {
 	"0 - Normal", "1 - Smoke in green", "2 - No muzzle flash light", "3 - Smoke not drawn", "4 - Nothing drawn at all",
 };
@@ -1373,6 +1398,7 @@ static const Choices* ChoicesFor(const char* section, const char* key) {
 		{ "Shaders.TAA.FSR.Version", NAMES(kFsrVersions) },
 		{ "Main.Main.RayTracing.PTRealtimeLevel", NAMES(kPtLevels) },	// UNOFFICIAL 2026-11-11 (the Advanced view's row; the simple view: "Path tracing preset")
 		{ "Main.Main.Quality.DeferredRenderer", NAMES(kDeferredModes) },
+		{ "Main.Main.Quality.DeferredSkinSSS", NAMES(kDeferredSkinSSSModes) },
 	};
 	#undef NAMES
 	const auto found = kBySetting.find(std::string(section) + "." + key);
@@ -1410,13 +1436,15 @@ static bool SettingOn(const char* section, const char* key) { return TheSettingM
 static bool EffectOn(const char* name) { return TheSettingManager->GetMenuShaderEnabled(name); }
 static bool AnyRtOn() {
 	return SettingOn("Shaders.ShadowsExteriors.RT", "Enabled") || SettingOn("Shaders.ShadowsInteriors.RT", "Enabled") ||
-		SettingOn("Shaders.AmbientOcclusion.RT", "Enabled") || SettingOn("Shaders.Reflections.RT", "Enabled");
+		SettingOn("Shaders.AmbientOcclusion.RT", "Enabled") || SettingOn("Shaders.AmbientOcclusion.RT", "GI") ||
+		(SettingOn("Shaders.AmbientOcclusion.Skylighting", "Enabled") && SettingOn("Shaders.AmbientOcclusion.RT", "Sky")) ||
+		SettingOn("Shaders.Reflections.RT", "Enabled");
 }
 static bool CloudsCastShadows() { return EffectOn("VolumetricClouds") && TheSettingManager->GetSettingF("Shaders.VolumetricClouds.Main", "Shadows") > 0.0f; }
 
 static const ConflictRule kConflictRules[] = {
 	{ "Shaders.AmbientLight.Main", "ComputeGI", "true",
-		[]() { return SettingOn("Shaders.AmbientOcclusion.RT", "GI") && SettingOn("Shaders.AmbientOcclusion.RT", "Enabled"); },
+		[]() { return SettingOn("Shaders.AmbientOcclusion.RT", "GI"); },
 		"Screen-space bounce light replaces your ray-traced bounce light: the ray-traced one does nothing while this is on." },
 	{ "Shaders.AmbientOcclusion.RT", "GI", "true",
 		[]() { return EffectOn("AmbientLight") && SettingOn("Shaders.AmbientLight.Main", "ComputeGI"); },
@@ -1741,24 +1769,28 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.PBR.Main", "LightingScale", "Sun and lamp light strength", nullptr, "How strong the sun and lamp light is on objects." },
 	{ "Shaders.PBR.Main", "Saturation", "Colour saturation", nullptr, "How vivid the colours of lit objects are." },
 	{ "Shaders.PBR.Main", "SkylightingScale", "Sky colour in shade", nullptr, "Adds the colour of the sky to shaded areas. 0 turns it off." },
+	{ "Shaders.PBR.Main", "SkylightingSaturation", "Sky colour strength in shade", nullptr, "How vivid the sky colour in shaded areas is. 0 is grey, 1 matches the sky." },
 	// PBR (Rain)
 	{ "Shaders.PBR.Rain", "Roughness", "Surface roughness", nullptr, "Lower gives small bright highlights and clear reflections; higher gives a broad faint sheen." },
 	{ "Shaders.PBR.Rain", "AmbientScale", "Ambient light strength", nullptr, "How bright the general ambient light is on objects." },
 	{ "Shaders.PBR.Rain", "LightingScale", "Sun and lamp light strength", nullptr, "How strong the sun and lamp light is on objects." },
 	{ "Shaders.PBR.Rain", "Saturation", "Colour saturation", nullptr, "How vivid the colours of lit objects are." },
 	{ "Shaders.PBR.Rain", "SkylightingScale", "Sky colour in shade", nullptr, "Adds the colour of the sky to shaded areas. 0 turns it off." },
+	{ "Shaders.PBR.Rain", "SkylightingSaturation", "Sky colour strength in shade", nullptr, "How vivid the sky colour in shaded areas is. 0 is grey, 1 matches the sky." },
 	// PBR (Night)
 	{ "Shaders.PBR.Night", "Roughness", "Surface roughness", nullptr, "Lower gives small bright highlights and clear reflections; higher gives a broad faint sheen." },
 	{ "Shaders.PBR.Night", "AmbientScale", "Ambient light strength", nullptr, "How bright the general ambient light is on objects." },
 	{ "Shaders.PBR.Night", "LightingScale", "Sun and lamp light strength", nullptr, "How strong the sun and lamp light is on objects." },
 	{ "Shaders.PBR.Night", "Saturation", "Colour saturation", nullptr, "How vivid the colours of lit objects are." },
 	{ "Shaders.PBR.Night", "SkylightingScale", "Sky colour in shade", nullptr, "Adds the colour of the sky to shaded areas. 0 turns it off." },
+	{ "Shaders.PBR.Night", "SkylightingSaturation", "Sky colour strength in shade", nullptr, "How vivid the sky colour in shaded areas is. 0 is grey, 1 matches the sky." },
 	// PBR (NightRain)
 	{ "Shaders.PBR.NightRain", "Roughness", "Surface roughness", nullptr, "Lower gives small bright highlights and clear reflections; higher gives a broad faint sheen." },
 	{ "Shaders.PBR.NightRain", "AmbientScale", "Ambient light strength", nullptr, "How bright the general ambient light is on objects." },
 	{ "Shaders.PBR.NightRain", "LightingScale", "Sun and lamp light strength", nullptr, "How strong the sun and lamp light is on objects." },
 	{ "Shaders.PBR.NightRain", "Saturation", "Colour saturation", nullptr, "How vivid the colours of lit objects are." },
 	{ "Shaders.PBR.NightRain", "SkylightingScale", "Sky colour in shade", nullptr, "Adds the colour of the sky to shaded areas. 0 turns it off." },
+	{ "Shaders.PBR.NightRain", "SkylightingSaturation", "Sky colour strength in shade", nullptr, "How vivid the sky colour in shaded areas is. 0 is grey, 1 matches the sky." },
 	// PBR (Interiors)
 	{ "Shaders.PBR.Interiors", "Roughness", "Surface roughness", nullptr, "Lower gives small bright highlights and clear reflections; higher gives a broad faint sheen." },
 	{ "Shaders.PBR.Interiors", "AmbientScale", "Ambient light strength", nullptr, "How bright the general ambient light is on objects." },
@@ -2099,6 +2131,7 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Terrain.Main", "Metallicness", "Ground metallic sheen", nullptr, "Adds a metal-like sheen to the ground." },
 	{ "Shaders.Terrain.Main", "AmbientScale", "Ambient light on the ground", nullptr, "Brightens or darkens the soft background light on the ground." },
 	{ "Shaders.Terrain.Main", "SkylightingScale", "Sky colour on the ground", nullptr, "Adds sky colour to shaded ground. Zero turns it off." },
+	{ "Shaders.Terrain.Main", "SkylightingSaturation", "Sky colour strength on ground", nullptr, "How vivid the sky colour on shaded ground is. 0 is grey, 1 matches the sky." },
 	{ "Shaders.Terrain.Main", "LightingScale", "Sun and lamp light on the ground", nullptr, "Brightens or darkens the ground where sun or lamps hit it." },
 	{ "Shaders.Terrain.Main", "TerrainSaturation", "Ground colour strength", nullptr, "Higher gives richer ground colours; lower fades them toward grey." },
 	// Terrain (Rain)
@@ -2106,6 +2139,7 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Terrain.Rain", "Metallicness", "Ground metallic sheen", nullptr, "Adds a metal-like sheen to the ground." },
 	{ "Shaders.Terrain.Rain", "AmbientScale", "Ambient light on the ground", nullptr, "Brightens or darkens the soft background light on the ground." },
 	{ "Shaders.Terrain.Rain", "SkylightingScale", "Sky colour on the ground", nullptr, "Adds sky colour to shaded ground. Zero turns it off." },
+	{ "Shaders.Terrain.Rain", "SkylightingSaturation", "Sky colour strength on ground", nullptr, "How vivid the sky colour on shaded ground is. 0 is grey, 1 matches the sky." },
 	{ "Shaders.Terrain.Rain", "LightingScale", "Sun and lamp light on the ground", nullptr, "Brightens or darkens the ground where sun or lamps hit it." },
 	{ "Shaders.Terrain.Rain", "TerrainSaturation", "Ground colour strength", nullptr, "Higher gives richer ground colours; lower fades them toward grey." },
 	// Terrain (Night)
@@ -2113,6 +2147,7 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Terrain.Night", "Metallicness", "Ground metallic sheen", nullptr, "Adds a metal-like sheen to the ground." },
 	{ "Shaders.Terrain.Night", "AmbientScale", "Ambient light on the ground", nullptr, "Brightens or darkens the soft background light on the ground." },
 	{ "Shaders.Terrain.Night", "SkylightingScale", "Sky colour on the ground", nullptr, "Adds sky colour to shaded ground. Zero turns it off." },
+	{ "Shaders.Terrain.Night", "SkylightingSaturation", "Sky colour strength on ground", nullptr, "How vivid the sky colour on shaded ground is. 0 is grey, 1 matches the sky." },
 	{ "Shaders.Terrain.Night", "LightingScale", "Sun and lamp light on the ground", nullptr, "Brightens or darkens the ground where sun or lamps hit it." },
 	{ "Shaders.Terrain.Night", "TerrainSaturation", "Ground colour strength", nullptr, "Higher gives richer ground colours; lower fades them toward grey." },
 	// Terrain (NightRain)
@@ -2120,6 +2155,7 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Terrain.NightRain", "Metallicness", "Ground metallic sheen", nullptr, "Adds a metal-like sheen to the ground." },
 	{ "Shaders.Terrain.NightRain", "AmbientScale", "Ambient light on the ground", nullptr, "Brightens or darkens the soft background light on the ground." },
 	{ "Shaders.Terrain.NightRain", "SkylightingScale", "Sky colour on the ground", nullptr, "Adds sky colour to shaded ground. Zero turns it off." },
+	{ "Shaders.Terrain.NightRain", "SkylightingSaturation", "Sky colour strength on ground", nullptr, "How vivid the sky colour on shaded ground is. 0 is grey, 1 matches the sky." },
 	{ "Shaders.Terrain.NightRain", "LightingScale", "Sun and lamp light on the ground", nullptr, "Brightens or darkens the ground where sun or lamps hit it." },
 	{ "Shaders.Terrain.NightRain", "TerrainSaturation", "Ground colour strength", nullptr, "Higher gives richer ground colours; lower fades them toward grey." },
 	// Terrain (Parallax)
@@ -2949,7 +2985,7 @@ static float TrailingWidth(const SettingRow& row, bool isShader) {
 	return width;
 }
 
-static void RenderSetting(SettingManager::Configuration::ConfigNode& stored, bool isShader = false) {
+static void RenderSetting(SettingManager::Configuration::ConfigNode& stored, bool isShader = false, const char* labelOverride = nullptr) {
 	using NodeType = SettingManager::Configuration::NodeType;
 	ImGui::PushID(stored.Key);
 
@@ -2987,7 +3023,7 @@ static void RenderSetting(SettingManager::Configuration::ConfigNode& stored, boo
 		tints++;
 	}
 
-	row.controlW = MenuWidgets::RowBegin(MenuKeyLabel(node.Section, node.Key), TrailingWidth(row, isShader));
+	row.controlW = MenuWidgets::RowBegin(labelOverride ? labelOverride : MenuKeyLabel(node.Section, node.Key), TrailingWidth(row, isShader));
 	// A forced row is disabled after its name, so hovering the name still shows the note (ImGui does not hover disabled items)
 	if (row.forced) ImGui::BeginDisabled();
 	bool overControl;
@@ -3913,7 +3949,7 @@ static const MenuGroup kMenuGroups[] = {
 	{ "Shaders.AmbientOcclusion.RT", "Sky visibility", "Sky, SkyRays, SkyDistance",
 		FogType::None, false, "How much of the sky each spot sees, from rays instead of a top-down map.", nullptr },
 	{ "Shaders.AmbientOcclusion.RT", "Bounce light",
-		"GI, GIDistance, GIStrength, GIOffscreen, GIScreenLight, GIGameLamps, GIClamp, GIStrengthNight, GIStrengthInterior, GIClampInterior, GIDistanceInterior, GlowGIInterior, GlowDirectInterior, GISpatial, GIReuse, GIInterleave, GIMovingHistory, GlowGI, GlowDirect",
+		"GI, GIDistance, GIStrength, GIOffscreen, GIScreenLight, GIGameLamps, GIClamp, GIAmbient, GISky, SkyMissSH, GIStrengthNight, GISkyNight, SkyMissNightAmbient, GIScreenAmbientOut, GIDenoiseSunGI, GIDenoiseRoomGI, RoomGIGlow, LegacyTilt, GIStrengthInterior, GIAmbientInterior, GIClampInterior, GIDistanceInterior, GlowGIInterior, GlowDirectInterior, LegacyTiltInterior, GISpatial, GIReuse, GIInterleave, GIMovingHistory, GlowGI, GlowDirect",
 		FogType::None, true, "One bounce of light from walls and floors, and glowing signs and windows lighting what is near them.", nullptr },
 	{ "Shaders.AmbientOcclusion.RT", "Light that bounces more than once",
 		"RadianceCache, CacheStrength, CacheCellSize, CacheRays, CacheFrames, CacheExteriors, CacheSpread, CacheRaysExterior, CacheSpreadExterior",
@@ -4502,9 +4538,13 @@ static const MenuMove kMenuMoves[] = {
 	{ "DustMotes", "VolumetricFog", "Dust motes" },	// 2026-11-04 (user: "make motes live under vol fog")
 	{ "LocalExposure", "Exposure", "Local exposure" },	// 2026-11-04 (it works with the exposure)
 };
+static const char* const kDeferredTabId = "@DeferredRenderer";
+static const char* const kDebugTabId = "@DebugSettings";
+
 // Test shots (gMenu.revealPage): whether this node leads to the page shown, so the shot's sidebar shows it.
 static bool LeadsToSelected(const std::string& path) {
 	if (gMenu.page.compare(0, path.size() + 1, path + ".") == 0) return true;
+	if ((gMenu.page == kDeferredTabId || gMenu.page == kDebugTabId) && (path == "Main" || path == "Main.Main")) return true;
 	for (const MenuMove& m : kMenuMoves)
 		if (gMenu.page == std::string("Shaders.") + m.name + ".Main" && (path == "Shaders" || path == std::string("Shaders.") + m.under)) return true;
 	return false;
@@ -4653,13 +4693,28 @@ static RtStatusLine RtGILine() {
 	const char* s = "Shaders.AmbientOcclusion.RT";
 	const std::string detail = AmbientOcclusionEffect::RtStatusText();
 	if (!RtOn(s, "GI")) return { RtState::Off, "off (GI)", detail };
-	if (!RtOn(s, "Enabled")) return { RtState::Blocked, "GI is on, but it needs the RT ambient occlusion on (Enabled)", detail };
 	if (!RtCore::Running()) return RtNotRunningLine(detail);
+	if (!RtAmbient::PassesWanted()) return { RtState::Blocked, "on, but the Vulkan passes are off ([Main.Main.Performance] NvrDxvkPasses)", detail };
 	if (!TheSettingManager->GetMenuShaderEnabled("AmbientLight")) return { RtState::Blocked, "on, but Ambient light is off: the bounce light is added there", detail };
 	if (RtComputeGIInWay()) return { RtState::Blocked, "on, but Ambient light's ComputeGI is on: it replaces the RT bounce light", detail };
 	if (RtPathTrace::Replacing())	// UNOFFICIAL 2026-11-13
 		return { RtState::Blocked, "not shown while path tracing is on: the path tracer has its own bounce light. Switch path tracing off to see it", detail };
 	return { RtState::Running, RtOn(s, "RadianceCache") ? "running (more than one bounce: RadianceCache)" : "running (one bounce)", detail };
+}
+
+static RtStatusLine RtSkyLine() {
+	const std::string detail = AmbientOcclusionEffect::RtStatusText();
+	if (!RtOn("Shaders.AmbientOcclusion.Skylighting", "Enabled") || !RtOn("Shaders.AmbientOcclusion.RT", "Sky"))
+		return { RtState::Off, "off", detail };
+	if (!TheSettingManager->GetMenuShaderEnabled("AmbientLight") && !TheSettingManager->GetMenuShaderEnabled("AmbientOcclusion"))
+		return { RtState::Blocked, "on, but both Ambient light and Ambient occlusion are off", detail };
+	if (!TheShaderManager->GameState.isExterior)
+		return { RtState::Off, "indoors: sky occlusion runs outdoors only", detail };
+	if (!RtCore::Running()) return RtNotRunningLine(detail);
+	if (!RtAmbient::PassesWanted()) return { RtState::Blocked, "on, but the Vulkan passes are off ([Main.Main.Performance] NvrDxvkPasses)", detail };
+	if (RtPathTrace::Replacing())
+		return { RtState::Blocked, "not shown while path tracing is on: the path tracer traces its own sky light", detail };
+	return { RtState::Running, "running", detail };
 }
 
 static RtStatusLine RtReflectionsLine() {
@@ -4724,6 +4779,8 @@ static const RtMasterKey kRtMasterKeys[] = {
 	{ "Shaders.ShadowsExteriors.RT", "Enabled", true },
 	{ "Shaders.ShadowsInteriors.RT", "Live", true },
 	{ "Shaders.AmbientOcclusion.RT", "Enabled", true },
+	{ "Shaders.AmbientOcclusion.RT", "Sky", false },
+	{ "Shaders.AmbientOcclusion.RT", "GI", false },
 	{ "Shaders.Reflections.RT", "Enabled", true },
 	{ "Main.Main.RayTracing", "PTRealtime", false },
 	{ "Main.Main.RayTracing", "ReferencePT", false },
@@ -4847,6 +4904,7 @@ static void RenderRayTracingPage() {
 		DrawRtStatusLine("Sun shadows", RtSunLine());
 		DrawRtStatusLine("Lamp shadows", RtLampLine());
 		DrawRtStatusLine("Occlusion", RtAOLine());
+		DrawRtStatusLine("Sky occlusion", RtSkyLine());
 		DrawRtStatusLine("Bounce light", RtGILine());
 		DrawRtStatusLine("Reflections", RtReflectionsLine());
 		DrawRtStatusLine("Light shafts", RtShaftsLine());	// UNOFFICIAL 2026-11-13
@@ -5226,6 +5284,20 @@ static const DebugViewKey kDebugViews[] = {
 	{ "Shaders.WetnessEffects.HudRaindrops", "DebugView", "Raindrops on screen" },
 	{ "Shaders.WetnessEffects.Reflections", "DebugView", "Wet reflections" },
 	{ "Main.Main.Quality", "MsaaEdgeDebugView", "MSAA edge fix" },
+	{ "Main.Main.Quality", "GBufferView", "G-buffer" },
+	{ "Main.Main.Quality", "FirstPersonNativeDebug", "First-person native scale" },
+	{ "Main.Main.Quality", "GearWeatherDebug", "Gear weather" },
+	{ "Shaders.ShadowsExteriors.Deferred", "DebugView", "Deferred sun" },
+	{ "Shaders.ShadowsExteriors.ScreenSpace", "BendDebug", "Bend contact shadows" },
+	{ "Shaders.Skin.SSS", "DebugView", "Skin SSS" },
+	{ "Shaders.Puddles.Debug", "DebugView", "Puddles" },
+	{ "Shaders.WetnessEffects.Debug", "ShowCover", "Wetness cover" },
+	{ "Shaders.Debug.Main", "ClipView", "Clip view" },
+	{ "Shaders.HDR.Main", "ShowHudMask", "HDR HUD mask" },
+	{ "Shaders.ShadowsExteriors.RT", "DenoiserDebugView", "RT sun denoiser" },
+	{ "Shaders.ShadowsInteriors.RT", "DenoiserDebugView", "RT lamp denoiser" },
+	{ "Shaders.Reflections.RT", "DenoiserDebugView", "RT reflections denoiser" },
+	{ "Shaders.VolumetricLight.RT", "DebugView", "RT light shafts" },
 };
 
 static float SettingF(const char* section, const char* key) { return TheSettingManager->GetSettingF(section, key); }
@@ -5382,14 +5454,14 @@ static int DetectAoMode() {
 
 static int DetectSkyOcclusionMode() {
 	if (!RtOn("Shaders.AmbientOcclusion.Skylighting", "Enabled")) return 0;
-	if (RtOn("Shaders.AmbientOcclusion.RT", "Enabled") && RtOn("Shaders.AmbientOcclusion.RT", "Sky")) return 2;
+	if (RtOn("Shaders.AmbientOcclusion.RT", "Sky")) return 2;
 	return 1;
 }
 
 static int DetectBounceLightMode() {
 	const bool al = EffectOn("AmbientLight");
 	if (al && RtOn("Shaders.AmbientLight.Main", "ComputeGI")) return 1;
-	if (al && RtOn("Shaders.AmbientOcclusion.RT", "Enabled") && RtOn("Shaders.AmbientOcclusion.RT", "GI")) return 2;
+	if (al && RtOn("Shaders.AmbientOcclusion.RT", "GI")) return 2;
 	if (al && (SettingF("Shaders.AmbientLight.Main", "GridBounce") > 0.0f || SettingF("Shaders.AmbientLight.Main", "GridLamps") > 0.0f)) return 3;
 	if (!al && EffectOn("BounceLight")) return 4;
 	return 0;
@@ -5436,14 +5508,12 @@ static void DrawIndirectLightingPickers() {
 			SetShaderEnabled("AmbientLight", false);
 			SetShaderEnabled("AmbientOcclusion", false);
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
-			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
 		}
 		else if (pickedAo == 1) {
 			SetShaderEnabled("AmbientLight", true);
 			SetShaderEnabled("AmbientOcclusion", false);
-			if (!RtOn("Shaders.AmbientOcclusion.RT", "GI") && !RtOn("Shaders.AmbientOcclusion.RT", "Sky"))
-				TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
-			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "OcclusionOnD3D9", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
+			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "OcclusionOnD3D9", true);
 		}
 		else if (pickedAo == 2 || pickedAo == 3) {
 			SetShaderEnabled("AmbientLight", false);
@@ -5452,7 +5522,6 @@ static void DrawIndirectLightingPickers() {
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Interiors", "Enabled", true);
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.GTAO", "Enabled", pickedAo == 2);
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", false);
-			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", false);
 		}
 		else if (pickedAo == 4) {
 			SetShaderEnabled("AmbientLight", true);
@@ -5485,7 +5554,6 @@ static void DrawIndirectLightingPickers() {
 		}
 		else if (pickedSky == 2) {
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.Skylighting", "Enabled", true);
-			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", true);
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Sky", true);
 			if (!EffectOn("AmbientLight") && !EffectOn("AmbientOcclusion")) SetShaderEnabled("AmbientLight", true);
 		}
@@ -5522,7 +5590,6 @@ static void DrawIndirectLightingPickers() {
 			SetShaderEnabled("AmbientLight", true);
 			SetShaderEnabled("BounceLight", false);
 			TheSettingManager->SetSetting("Shaders.AmbientLight.Main", "ComputeGI", false);
-			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "Enabled", true);
 			TheSettingManager->SetSetting("Shaders.AmbientOcclusion.RT", "GI", true);
 		}
 		else if (pickedGi == 3) {
@@ -5573,6 +5640,7 @@ static void RenderIndirectLightingPage() {
 		DrawRtStatusLine("Ray tracing", RtCoreLine());
 	}
 	if (giMode == 2) DrawRtStatusLine("RT Bounce", RtGILine());
+	if (skyMode == 2) DrawRtStatusLine("RT Sky", RtSkyLine());
 	if (aoMode == 4) DrawRtStatusLine("RT AO", RtAOLine());
 
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
@@ -5583,17 +5651,21 @@ static void RenderIndirectLightingPage() {
 	if (ImGui::BeginTable("##il_tuning", cols, ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_PadOuterX)) {
 		ImGui::TableNextColumn();
 		if (aoMode == 1 && MenuWidgets::SubHeader("Ambient occlusion tuning (Ambient Light)###il_ao_al", true)) {
-			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance, DarkestOcclusion", nullptr }, false);
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance, DarkestOcclusion, BrightnessFade", nullptr }, false);
 		}
 		else if ((aoMode == 2 || aoMode == 3) && MenuWidgets::SubHeader("Ambient occlusion tuning (Standalone)###il_ao_sa", true)) {
-			DrawVisualItem({ "Shaders.AmbientOcclusion.Exteriors", "Enabled, StrengthMultiplier, Range, ClampStrength", "Outdoors" }, true);
-			DrawVisualItem({ "Shaders.AmbientOcclusion.Interiors", "Enabled, StrengthMultiplier, Range, ClampStrength", "Indoors" }, true);
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Exteriors", "Enabled, StrengthMultiplier, Range, ClampStrength, LumThreshold", "Outdoors" }, true);
+			DrawVisualItem({ "Shaders.AmbientOcclusion.Interiors", "Enabled, StrengthMultiplier, Range, ClampStrength, LumThreshold", "Indoors" }, true);
 			if (aoMode == 2) DrawVisualItem({ "Shaders.AmbientOcclusion.GTAO", "Enabled, MaxRadius", "GTAO" }, true);
 		}
 		else if (aoMode == 4 && MenuWidgets::SubHeader("Ambient occlusion tuning (Ray-traced)###il_ao_rt", true)) {
 			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "RayCount, Distance, OcclusionOnD3D9", nullptr }, false);
 			if (EffectOn("AmbientLight"))
-				DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius", "Strength" }, true);
+				DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DarkestOcclusion, BrightnessFade", "Strength & darkness" }, true);
+			else if (EffectOn("AmbientOcclusion")) {
+				DrawVisualItem({ "Shaders.AmbientOcclusion.Exteriors", "StrengthMultiplier, ClampStrength, LumThreshold", "Outdoors" }, true);
+				DrawVisualItem({ "Shaders.AmbientOcclusion.Interiors", "StrengthMultiplier, ClampStrength, LumThreshold", "Indoors" }, true);
+			}
 		}
 
 		if (skyMode > 0 && MenuWidgets::SubHeader("Sky occlusion tuning###il_sky", true)) {
@@ -5606,7 +5678,8 @@ static void RenderIndirectLightingPage() {
 			DrawVisualItem({ "Shaders.AmbientLight.Main", "ComputeGIStrength, ComputeGIQuality, ComputeGIThickness, ComputeGIThinOcclusion", nullptr }, false);
 		}
 		else if (giMode == 2 && MenuWidgets::SubHeader("Bounce light tuning (Ray-traced GI)###il_gi_rt", true)) {
-			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, RadianceCache, CacheExteriors, GIStrengthNight, GIStrengthInterior, GlowGI, GlowDirect", nullptr }, false);
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "SunGI, RoomGI, AmbientReplace, AmbientFloor, AmbientReplaceInterior, AmbientFloorInterior", "Ambient replacement" }, false);
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, GISky, SkyMissSH, GIAmbient, RadianceCache, CacheExteriors, GIStrengthNight, GIStrengthInterior, GlowGI, GlowDirect", "Ray-traced bounce" }, true);
 		}
 		else if (giMode == 3 && MenuWidgets::SubHeader("Bounce light tuning (3D Light Grid)###il_gi_grid", true)) {
 			DrawVisualItem({ "Shaders.AmbientLight.Main", "GridBounce, GridLamps, GridSpread, GridColour", nullptr }, false);
@@ -5622,6 +5695,332 @@ static void RenderIndirectLightingPage() {
 
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
 	ImGui::TextDisabled("Tip: Turn on Advanced (top right) to access every fine-tuning parameter in AmbientLight / AmbientOcclusion / BounceLight.");
+}
+
+// ---- Dedicated Deferred Renderer & Unified Debug Views pages --------------------------------------------------------------
+static bool IsDeferredQualityKey(const char* key) {
+	if (!strncmp(key, "GearWeather", 11)) return true;
+	static const char* const kDeferredKeys[] = {
+		"DeferredRenderer", "DeferredRendererLive", "DeferredStandalone", "DeferredRendererOnePass",
+		"DeferredTransparents", "DeferredFoliage", "DeferredFoliageLamps",
+		"DeferredSkin", "DeferredSkinLive", "DeferredSkinBlur", "DeferredSkinSSS",
+		"DeferredHair", "DeferredHairLive", "DeferredFirstPerson", "DeferredFirstPersonLive",
+		"DeferredDistant", "DeferredReflections", "DeferredBumpedNormals",
+		"DeferredALAlbedo", "DeferredALAlbedoGain", "DeferredRRGuides",
+		"DeferredRtSunFirst", "DeferredTiledLight", "DeferredADFog",
+		"DeferredDepth", "DeferredDepthProbe", "GBufferV2", "GBufferView"
+	};
+	for (const char* k : kDeferredKeys) if (!strcmp(key, k)) return true;
+	return false;
+}
+
+static void DrawSettingKey(const char* section, const char* key, bool skipInternal = true, const char* labelOverride = nullptr) {
+	if (skipInternal && InternalHidden(section, key)) return;
+	SettingManager::Configuration::ConfigNode node;
+	if (!TheSettingManager->Config.FillNode(&node, section, key)) return;
+	ImGui::PushID(section);
+	RenderSetting(node, strncmp(section, "Shaders.", 8) == 0, labelOverride);
+	ImGui::PopID();
+}
+
+static void RenderDeferredRendererPage() {
+	PageTitle("Deferred renderer", "Unified screen-space sun and lamp lighting, G-buffer materials, skin/hair/glass deferred paths, and developer controls.");
+
+	const int defMode = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredRenderer");
+	const int bootMode = SettingForce::Mode();
+	const bool msaa = RtOn("Main.Main.Misc", "ForceMSAA");
+	const ImVec4 green(0.45f, 0.85f, 0.45f, 1.0f);
+	const ImVec4 amber(1.0f, 0.75f, 0.2f, 1.0f);
+
+	ImGui::TextUnformatted("Active state:");
+	ImGui::SameLine();
+	if (msaa) ImGui::TextColored(amber, "Forward + MSAA (ForceMSAA overrides Deferred)");
+	else if (bootMode >= 2) ImGui::TextColored(green, "Deferred (Full: outdoors + indoors)");
+	else if (bootMode == 1) ImGui::TextColored(green, "Deferred (Indoors only)");
+	else ImGui::TextDisabled("Forward (Off)");
+
+	if (defMode != bootMode) {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(kRestartOrange, "Mode changed since launch - press Save and restart the game to apply.");
+		ImGui::PopTextWrapPos();
+	}
+
+	DrawSettingKey("Main.Main.Quality", "DeferredRenderer");
+	if (ImGui::Button("Apply recommended settings##def_recommended")) {
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredRenderer", 2);
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredSkin", true);
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredSkinSSS", 2);
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredHair", true);
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredTransparents", 1);
+		TheSettingManager->SetSetting("Main.Main.Quality", "DeferredBumpedNormals", true);
+		TheSettingManager->LoadSettings();
+	}
+	if (ImGui::IsItemHovered())
+		WrappedTooltip("Sets DeferredRenderer to Full (2) and enables the recommended sub-features (Skin, Burley SSS, Hair, Transparents, Bumped Normals). Press Save and restart if startup settings changed.");
+
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	if (MenuWidgets::SubHeader("Deferred features###def_features", true)) {
+		static const char* const kFeatures[] = {
+			"DeferredSkin", "DeferredSkinSSS", "DeferredHair", "DeferredTransparents", "DeferredBumpedNormals"
+		};
+		for (const char* k : kFeatures) DrawSettingKey("Main.Main.Quality", k);
+	}
+
+	if (!DevOptionsShown()) {
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled("First-person deferred, experimental switches, and forced prerequisites are hidden (View > Developer options).");
+		ImGui::PopTextWrapPos();
+		return;
+	}
+
+	if (MenuWidgets::SubHeader("First-person & GearWeather (Dev)###def_fp", false)) {
+		static const char* const kFpKeys[] = {
+			"DeferredFirstPerson", "GearWeather", "GearWeatherStrength", "GearWeatherWet",
+			"GearWeatherFrost", "GearWeatherSand", "GearWeatherMud", "GearWeatherSpeed",
+			"GearWeatherSkin", "GearWeatherScale"
+		};
+		for (const char* k : kFpKeys) DrawSettingKey("Main.Main.Quality", k);
+	}
+
+	if (MenuWidgets::SubHeader("Experimental & tuning (Dev)###def_exp", false)) {
+		static const char* const kExpKeys[] = {
+			"DeferredFoliageLamps", "DeferredReflections", "DeferredALAlbedo", "DeferredALAlbedoGain",
+			"DeferredRRGuides", "DeferredRtSunFirst", "DeferredTiledLight", "DeferredADFog",
+			"DeferredSkinBlur", "GBufferView"
+		};
+		for (const char* k : kExpKeys) DrawSettingKey("Main.Main.Quality", k);
+
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.25f));
+		ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.4f));
+		ImGui::TextUnformatted("Deferred sun pass (Shaders.ShadowsExteriors.Deferred)");
+		ImGui::PopStyleColor();
+		static const char* const kSunKeys[] = {
+			"MatchSunDisc", "CanopyShadow", "ParallaxShadow", "LandCrackShadow",
+			"MicroShadow", "AuthoredHighlight", "HighlightFade", "Shadows"
+		};
+		for (const char* k : kSunKeys) DrawSettingKey("Shaders.ShadowsExteriors.Deferred", k);
+	}
+
+	if (MenuWidgets::SubHeader("Managed automatically by DeferredRenderer (Dev)###def_forced", false)) {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled("Forced by SettingForce while DeferredRenderer is active (mode 1 or 2). Shown read-only for visibility.");
+		ImGui::PopTextWrapPos();
+		static const char* const kForcedKeys[] = {
+			"GBufferV2", "DeferredDepth", "DeferredFoliage", "DeferredDistant"
+		};
+		for (const char* k : kForcedKeys) DrawSettingKey("Main.Main.Quality", k);
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextDisabled("Also forced across other sections: CapturedNormals, MaterialBuffer, AlbedoBuffer, Shaders.PBR.Linear (Enabled/LinearScene), Main.Main.Misc (FoldFog, LampTableStandalone/Fast), ShadowsInteriors (Forward/Atlas/Deferred), ShadowsExteriors.Deferred (mode 2), Terrain.Blending.Smooth = 0 (mode 2).");
+		ImGui::PopTextWrapPos();
+	}
+}
+
+static bool ContainsNoCase(const char* haystack, const char* needle) {
+	if (!needle || !*needle) return true;
+	if (!haystack) return false;
+	for (const char* h = haystack; *h; h++) {
+		const char* a = h, *b = needle;
+		while (*a && *b && tolower((unsigned char)*a) == tolower((unsigned char)*b)) { a++; b++; }
+		if (!*b) return true;
+	}
+	return false;
+}
+
+static void RenderDebugSettingsPage() {
+	PageTitle("Debug views & diagnostics", "All shader and renderer debug views in one place (including internal debug views).");
+
+	enum class DbgKind { IntZero, BoolFalse, FloatZero, FloatNegOne, FloatOne, PixelCoord, EffectDebug };
+	struct DbgItem { const char* Section; const char* Key; const char* Label; DbgKind Kind; };
+	struct DbgGroup { const char* Title; const DbgItem* Items; size_t Count; };
+
+	static const DbgItem kDbgDeferred[] = {
+		{ "Main.Main.Quality", "GBufferView", "G-buffer (GBufferView)", DbgKind::IntZero },
+		{ "Main.Main.Quality", "MsaaEdgeDebugView", "MSAA edge fix (MsaaEdgeDebugView)", DbgKind::IntZero },
+		{ "Main.Main.Quality", "FirstPersonNativeDebug", "1st-person native (FirstPersonNativeDebug)", DbgKind::IntZero },
+		{ "Main.Main.Quality", "GearWeatherDebug", "Gear weather (GearWeatherDebug)", DbgKind::IntZero },
+		{ "Main.Main.ReducedQuality", "SunLayersDebug", "Sun layers (SunLayersDebug)", DbgKind::IntZero },
+		{ "Main.Main.Misc", "PassFamilyView", "Pass family (PassFamilyView)", DbgKind::IntZero },
+	};
+	static const DbgItem kDbgLighting[] = {
+		{ "Shaders.AmbientLight.Main", "DebugView", "Ambient light (DebugView)", DbgKind::IntZero },
+		{ "Shaders.AmbientLight.Main", "DebugGIExposure", "Ambient light GI exposure (DebugGIExposure)", DbgKind::FloatOne },
+		{ "Shaders.AmbientOcclusion.Skylighting", "DebugView", "Skylighting (DebugView)", DbgKind::IntZero },
+		{ "Shaders.AmbientOcclusion.RT", "DebugView", "RT AO / GI (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Flashlight.Deferred", "DebugView", "Flashlight (DebugView)", DbgKind::IntZero },
+		{ "Shaders.LocalExposure.Main", "DebugView", "Local exposure (DebugView)", DbgKind::IntZero },
+		{ "Shaders.DustMotes.Main", "DebugView", "Dust motes (DebugView)", DbgKind::IntZero },
+	};
+	static const DbgItem kDbgShadows[] = {
+		{ "Shaders.ShadowsExteriors.Deferred", "DebugView", "Deferred sun (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.Main", "FitToDepthDebug", "Sun fit-to-depth (FitToDepthDebug)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.ShadowMaps", "CharacterShadowMapDebug", "Character shadow map (CharacterShadowMapDebug)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.ScreenSpace", "BendDebug", "Bend contact shadows (BendDebug)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.TerrainShadows", "DebugView", "Terrain shadows (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.RT", "DebugView", "RT sun shadows (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsExteriors.RT", "DenoiserDebugView", "RT sun denoiser (DenoiserDebugView)", DbgKind::IntZero },
+		{ "Shaders.CloudShadows.Main", "DebugView", "Cloud shadows (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.Forward", "DebugView", "Lamp shadows forward (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.Deferred", "DebugView", "Lamp shadows deferred (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.RT", "DebugView", "RT lamp shadows (DebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.RT", "DenoiserDebugView", "RT lamp denoiser (DenoiserDebugView)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.RT", "ExteriorDebug", "RT lamp exteriors (ExteriorDebug)", DbgKind::IntZero },
+		{ "Shaders.ShadowsInteriors.RT", "DebugLamp", "RT debug lamp slot (DebugLamp)", DbgKind::IntZero },
+		{ "Shaders.VolumetricClouds.Main", "ShadowDebug", "Volumetric clouds shadow (ShadowDebug)", DbgKind::BoolFalse },
+		{ "Shaders.VolumetricClouds.Main", "ReflectionDebug", "Volumetric clouds refl. (ReflectionDebug)", DbgKind::IntZero },
+		{ "Shaders.VolumetricLight.RT", "DebugView", "RT light shafts (DebugView)", DbgKind::IntZero },
+	};
+	static const DbgItem kDbgReflPbr[] = {
+		{ "Shaders.Reflections.Main", "DebugView", "Reflections SSR (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Reflections.RT", "DebugView", "RT reflections (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Reflections.RT", "DenoiserDebugView", "RT reflections denoiser (DenoiserDebugView)", DbgKind::IntZero },
+		{ "Shaders.PBR.Metal", "DebugView", "PBR metal (DebugView)", DbgKind::IntZero },
+		{ "Shaders.PBR.MaterialRules", "DebugView", "PBR material rules (DebugView)", DbgKind::BoolFalse },
+		{ "Shaders.PBR.Rmaos", "DebugView", "PBR RMAOS maps (DebugView)", DbgKind::IntZero },
+		{ "Shaders.POM.Displacement", "DebugView", "Object displacement (DebugView)", DbgKind::IntZero },
+	};
+	static const DbgItem kDbgRt[] = {
+		{ "Main.Main.RayTracing", "PTDebugView", "Path tracing (PTDebugView)", DbgKind::IntZero },
+		{ "Main.Develop.Main", "DebugMode", "Develop DebugMode", DbgKind::BoolFalse },
+		{ "Main.Develop.Main", "GpuDebugLabels", "GPU debug labels (GpuDebugLabels)", DbgKind::BoolFalse },
+		{ "Main.Develop.Main", "DebugVar1", "Develop DebugVar1", DbgKind::FloatZero },
+		{ "Main.Develop.Main", "DebugVar2", "Develop DebugVar2", DbgKind::FloatZero },
+		{ "Main.Develop.Main", "DebugVar3", "Develop DebugVar3", DbgKind::FloatZero },
+		{ "Main.Develop.Main", "DebugVar4", "Develop DebugVar4", DbgKind::FloatZero },
+		{ "Main.Develop.PixelInspector", "Enabled", "Pixel inspector Enabled", DbgKind::BoolFalse },
+		{ "Main.Develop.PixelInspector", "X", "Pixel inspector X", DbgKind::PixelCoord },
+		{ "Main.Develop.PixelInspector", "Y", "Pixel inspector Y", DbgKind::PixelCoord },
+		{ "Main.Develop.PixelInspector", "LogEvery", "Pixel inspector LogEvery", DbgKind::IntZero },
+		{ "Shaders.Debug.Main", "ClipView", "Clip view (ClipView)", DbgKind::IntZero },
+		{ "@effect", "Debug", "Debug overlay", DbgKind::EffectDebug },
+	};
+	static const DbgItem kDbgTerrain[] = {
+		{ "Shaders.Terrain.Blending", "DebugView", "Terrain blending (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Terrain.Displacement", "DebugView", "Terrain displacement (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Grass.GPUGrass", "DebugView", "GPU grass (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Grass.Interaction", "Debug", "Grass interaction (Debug)", DbgKind::BoolFalse },
+		{ "Shaders.SnowAccumulation.Main", "CapturedNormalsDebugView", "Snow normals (CapturedNormalsDebugView)", DbgKind::IntZero },
+		{ "Shaders.WetWorld.Main", "PersistentDebugView", "Wet world persistent (PersistentDebugView)", DbgKind::IntZero },
+		{ "Shaders.WetnessEffects.Debug", "ShowCover", "Wetness cover (ShowCover)", DbgKind::BoolFalse },
+		{ "Shaders.WetnessEffects.Debug", "WetnessOverride", "Wetness override", DbgKind::FloatNegOne },
+		{ "Shaders.WetnessEffects.Debug", "PuddleOverride", "Puddle override", DbgKind::FloatNegOne },
+		{ "Shaders.WetnessEffects.Debug", "RainOverride", "Rain override", DbgKind::FloatNegOne },
+		{ "Shaders.WetnessEffects.HudRaindrops", "DebugView", "HUD raindrops (DebugView)", DbgKind::IntZero },
+		{ "Shaders.WetnessEffects.Reflections", "DebugView", "Wetness reflections (DebugView)", DbgKind::BoolFalse },
+		{ "Shaders.Puddles.Debug", "DebugView", "Puddles (DebugView)", DbgKind::IntZero },
+	};
+	static const DbgItem kDbgMisc[] = {
+		{ "Shaders.Skin.Debug", "DebugView", "Skin (DebugView)", DbgKind::IntZero },
+		{ "Shaders.Skin.SSS", "DebugView", "Skin SSS (DebugView)", DbgKind::IntZero },
+		{ "Shaders.HandBlood.Main", "DebugView", "Hand blood (DebugView)", DbgKind::IntZero },
+		{ "Shaders.TAA.Main", "DebugView", "TAA (DebugView)", DbgKind::IntZero },
+		{ "Shaders.TAA.FSR", "DebugView", "FSR (DebugView)", DbgKind::IntZero },
+		{ "Shaders.TAA.FSR", "ReactiveDebug", "FSR reactive mask (ReactiveDebug)", DbgKind::BoolFalse },
+		{ "Shaders.DitherBuster.Main", "DebugView", "Dither buster (DebugView)", DbgKind::IntZero },
+		{ "Shaders.HDR.Main", "ShowHudMask", "HDR HUD mask (ShowHudMask)", DbgKind::BoolFalse },
+		{ "Main.GunFX.Volume", "Debug", "GunFX volume smoke (Debug)", DbgKind::BoolFalse },
+	};
+	static const DbgGroup kDbgGroups[] = {
+		{ "Deferred & G-Buffer", kDbgDeferred, _countof(kDbgDeferred) },
+		{ "Lighting, AO & GI", kDbgLighting, _countof(kDbgLighting) },
+		{ "Shadows (Sun, Lamps & Clouds)", kDbgShadows, _countof(kDbgShadows) },
+		{ "Reflections, PBR & Materials", kDbgReflPbr, _countof(kDbgReflPbr) },
+		{ "Ray Tracing & Path Tracing", kDbgRt, _countof(kDbgRt) },
+		{ "Terrain, Grass & Weather", kDbgTerrain, _countof(kDbgTerrain) },
+		{ "Characters, AA, HDR & Misc", kDbgMisc, _countof(kDbgMisc) },
+	};
+
+	auto isActive = [](const DbgItem& item, bool countOnly) -> bool {
+		switch (item.Kind) {
+		case DbgKind::IntZero:
+		case DbgKind::BoolFalse:
+			return TheSettingManager->GetSettingI(item.Section, item.Key) != 0;
+		case DbgKind::FloatZero:
+			return fabsf(TheSettingManager->GetSettingF(item.Section, item.Key)) > 1e-4f;
+		case DbgKind::FloatNegOne:
+			return TheSettingManager->GetSettingF(item.Section, item.Key) >= 0.0f;
+		case DbgKind::FloatOne:
+			return fabsf(TheSettingManager->GetSettingF(item.Section, item.Key) - 1.0f) > 1e-3f;
+		case DbgKind::PixelCoord:
+			return !countOnly && TheSettingManager->GetSettingI("Main.Develop.PixelInspector", "Enabled") != 0;
+		case DbgKind::EffectDebug:
+			return EffectOn("Debug");
+		}
+		return false;
+	};
+
+	int activeCount = 0;
+	for (const DbgGroup& g : kDbgGroups) {
+		for (size_t i = 0; i < g.Count; i++) {
+			const DbgItem& e = g.Items[i];
+			if (strcmp(e.Section, "@effect") != 0 && ShelvedEffects::Section(e.Section)) continue;
+			if (isActive(e, true)) activeCount++;
+		}
+	}
+
+	static char dbgFilter[64] = "";
+	static bool dbgActiveOnly = false;
+	ImGui::SetNextItemWidth(ImMin(ImGui::GetFontSize() * 16.0f, ImGui::GetContentRegionAvail().x * 0.45f));
+	ImGui::InputTextWithHint("##dbgfilter", "Filter debug views...", dbgFilter, sizeof(dbgFilter));
+	ImGui::SameLine();
+	ImGui::Checkbox("Active only##dbgactive", &dbgActiveOnly);
+	ImGui::SameLine();
+	if (ImGui::Button("Reset all debug views##dbgreset")) {
+		for (const DbgGroup& g : kDbgGroups) {
+			for (size_t i = 0; i < g.Count; i++) {
+				const DbgItem& e = g.Items[i];
+				if (strcmp(e.Section, "@effect") != 0 && ShelvedEffects::Section(e.Section)) continue;
+				switch (e.Kind) {
+				case DbgKind::IntZero:     TheSettingManager->SetSetting(e.Section, e.Key, 0); break;
+				case DbgKind::BoolFalse:   TheSettingManager->SetSetting(e.Section, e.Key, false); break;
+				case DbgKind::FloatZero:   TheSettingManager->SetSetting(e.Section, e.Key, 0.0f); break;
+				case DbgKind::FloatNegOne: TheSettingManager->SetSetting(e.Section, e.Key, -1.0f); break;
+				case DbgKind::FloatOne:    TheSettingManager->SetSetting(e.Section, e.Key, 1.0f); break;
+				case DbgKind::EffectDebug: SetShaderEnabled("Debug", false); break;
+				case DbgKind::PixelCoord:  break;
+				}
+			}
+		}
+		TheSettingManager->LoadSettings();
+	}
+	if (activeCount > 0) {
+		ImGui::SameLine();
+		ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "(%d active)", activeCount);
+	}
+	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+
+	const bool filtering = dbgFilter[0] != '\0' || dbgActiveOnly;
+	int shownGroups = 0;
+	for (const DbgGroup& g : kDbgGroups) {
+		std::vector<const DbgItem*> matched;
+		bool hasActive = false;
+		for (size_t i = 0; i < g.Count; i++) {
+			const DbgItem& e = g.Items[i];
+			if (strcmp(e.Section, "@effect") != 0 && ShelvedEffects::Section(e.Section)) continue;
+			const bool active = isActive(e, false);
+			if (active) hasActive = true;
+			if (dbgActiveOnly && !active) continue;
+			if (dbgFilter[0] && !ContainsNoCase(e.Label, dbgFilter) && !ContainsNoCase(e.Section, dbgFilter) &&
+				!ContainsNoCase(e.Key, dbgFilter) && !ContainsNoCase(g.Title, dbgFilter))
+				continue;
+			matched.push_back(&e);
+		}
+		if (matched.empty()) continue;
+		shownGroups++;
+		const std::string header = std::string(g.Title) + "###dbggrp_" + g.Title;
+		if (!MenuWidgets::SubHeader(header.c_str(), filtering || hasActive)) continue;
+		ImGui::PushID(g.Title);
+		for (const DbgItem* e : matched) {
+			if (!strcmp(e->Section, "@effect")) {
+				DrawVisualEffectSwitch(e->Key, e->Label);
+				continue;
+			}
+			DrawSettingKey(e->Section, e->Key, false, e->Label);
+		}
+		ImGui::PopID();
+	}
+	if (shownGroups == 0)
+		ImGui::TextDisabled(dbgActiveOnly ? "No debug views are currently active." : "No debug views match the current filter.");
 }
 
 // ---- Quick Settings & Status landing page --------------------------------------------------------------------------------
@@ -5692,6 +6091,7 @@ static void RenderQuickSettingsPage() {
 			WrappedTooltip("Master switch: turns all Vegas Shaders effects on or off at once (hotkey: modifier + menu key).");
 
 		DrawVisualItem({ "Main.Main.Quality", "DeferredRenderer", nullptr }, false);
+		if (ImGui::Button("Open Deferred Renderer...##qs_jump_deferred")) gMenu.page = kDeferredTabId;
 
 		static const char* const kAaNames[] = {
 			"Off",
@@ -5873,10 +6273,11 @@ static void RenderCatLighting() {
 	// Competing mode pickers across the top
 	if (MenuWidgets::SubHeader("Ambient occlusion, sky occlusion & bounce light###cat_il_modes", true)) {
 		DrawIndirectLightingPickers();
-		const int aoMode = DetectAoMode(), giMode = DetectBounceLightMode();
+		const int aoMode = DetectAoMode(), skyMode = DetectSkyOcclusionMode(), giMode = DetectBounceLightMode();
 		if (giMode == 1 && !DxvkCompute::Available())
 			ImGui::TextColored(kRestartOrange, "Screen-space GI (ComputeGI) needs the DXVK fork's d3d9.dll (not loaded in this session).");
 		if (giMode == 2) DrawRtStatusLine("RT Bounce", RtGILine());
+		if (skyMode == 2) DrawRtStatusLine("RT Sky", RtSkyLine());
 		if (aoMode == 4) DrawRtStatusLine("RT AO", RtAOLine());
 		if (ImGui::Button("Open full AO & Bounce Light tuning...##cat_jump_ao")) gMenu.page = kAoTabId;
 		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
@@ -5891,11 +6292,24 @@ static void RenderCatLighting() {
 			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
 			MenuWidgets::Title("Ambient Light tuning", 1.08f);
 			ImGui::PopStyleColor(); ImGui::Separator();
-			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance", nullptr }, false);
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, Radius, DrawDistance, DarkestOcclusion, BrightnessFade", nullptr }, false);
 			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
 		}
 		else if (aoMode == 2 || aoMode == 3) {
 			DrawSimpleEffectCard("AmbientOcclusion", "Ambient occlusion", { "Exteriors", "Interiors", "GTAO" });
+		}
+		else if (aoMode == 4) {
+			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+			MenuWidgets::Title("Ray-traced Ambient Occlusion", 1.08f);
+			ImGui::PopStyleColor(); ImGui::Separator();
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "RayCount, Distance", nullptr }, false);
+			if (EffectOn("AmbientLight"))
+				DrawVisualItem({ "Shaders.AmbientLight.Main", "OcclusionStrength, DarkestOcclusion, BrightnessFade", nullptr }, false);
+			else if (EffectOn("AmbientOcclusion")) {
+				DrawVisualItem({ "Shaders.AmbientOcclusion.Exteriors", "ClampStrength, LumThreshold", "Outdoors" }, false);
+				DrawVisualItem({ "Shaders.AmbientOcclusion.Interiors", "ClampStrength, LumThreshold", "Indoors" }, false);
+			}
+			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
 		}
 		if (skyMode > 0) {
 			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
@@ -5915,7 +6329,8 @@ static void RenderCatLighting() {
 			ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
 			MenuWidgets::Title("Ray-traced bounce light (GI)", 1.08f);
 			ImGui::PopStyleColor(); ImGui::Separator();
-			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, RadianceCache, GIStrengthInterior, GlowGI", nullptr }, false);
+			DrawVisualItem({ "Shaders.AmbientLight.Main", "SunGI, RoomGI, AmbientReplace, AmbientFloor", nullptr }, false);
+			DrawVisualItem({ "Shaders.AmbientOcclusion.RT", "GIStrength, GIDistance, GISky, SkyMissSH, RadianceCache, GIStrengthInterior, GlowGI", nullptr }, false);
 			ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
 		}
 		else if (giMode == 3) {
@@ -6405,6 +6820,8 @@ static void RenderContent() {
 	if (gMenu.page == kNewTabId) return RenderNewInPatch();
 	if (gMenu.page == kAoTabId) return RenderIndirectLightingPage();
 	if (gMenu.page == kRtTabId) return RenderRayTracingPage();
+	if (gMenu.page == kDeferredTabId) return RenderDeferredRendererPage();
+	if (gMenu.page == kDebugTabId) return RenderDebugSettingsPage();
 	if (RenderSimpleCategoryPage()) return;
 	if (gMenu.page.empty()) {
 		ImGui::TextDisabled("Select a section from the left panel.");
@@ -6421,6 +6838,17 @@ static void RenderContent() {
 	PageOrder(rows);
 	RenderPageHeader(gMenu.page);
 	RenderSectionHelp(gMenu.page);	// UNOFFICIAL 2026-11-01: what the page is for, in plain words (kSectionHelp)
+	if (gMenu.page == "Main.Main.Quality") {
+		SettingManager::Configuration::SettingList filtered;
+		filtered.reserve(rows.size());
+		for (const auto& r : rows)
+			if (!IsDeferredQualityKey(r.Key)) filtered.push_back(r);
+		rows.swap(filtered);
+		ImGui::TextDisabled("Deferred renderer settings have their own dedicated page.");
+		ImGui::SameLine();
+		if (ImGui::SmallButton("Open Deferred Renderer...##qual_jump_def")) gMenu.page = kDeferredTabId;
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	}
 	if (gMenu.page == "Shaders.LUT.Main") RenderLutPage();
 	RenderSettingsList(rows);
 	RenderAttachedSections(gMenu.page);	// 2026-11-05
@@ -6534,9 +6962,23 @@ static void DrawChildren(const std::string& path) {
 	TheSettingManager->FillMenuSections(&children, path.c_str());
 	const bool shaders = path == "Shaders";
 	if (shaders) return DrawEffectGroups(children);	// 2026-11-05: the effects in groups of their kind
-	for (const std::string& child : children)
+	bool addedMainTabs = false;
+	auto drawMainCustomTabs = [&]() {
+		if (addedMainTabs) return;
+		addedMainTabs = true;
+		ImGui::PushID(kDeferredTabId);
+		DrawLeafSection(kDeferredTabId, "Deferred renderer");
+		ImGui::PopID();
+		ImGui::PushID(kDebugTabId);
+		DrawLeafSection(kDebugTabId, "Debug views");
+		ImGui::PopID();
+	};
+	for (const std::string& child : children) {
 		if (!(shaders && IsMovedShaderEntry(child)))	// UNOFFICIAL 2026-10-25: drawn under the entry it belongs with
 			RenderSectionNode(path + "." + child, child, shaders);
+		if (path == "Main.Main" && child == "Quality") drawMainCustomTabs();
+	}
+	if (path == "Main.Main") drawMainCustomTabs();
 	DrawMovedPages(path);
 	for (const MenuNest& nest : kMenuNests)	// UNOFFICIAL 2026-10-27
 		if (path == std::string("Shaders.") + nest.under) RenderSectionNode(std::string("Shaders.") + nest.name, nest.name, true);
@@ -6705,9 +7147,12 @@ static void LayoutDeleteFolder(const std::string& name) {
 
 static void RtSwitchCount(int& on, int& switches) {
 	static const char* const kOnKeys[][2] = { { "Shaders.ShadowsExteriors.RT", "Enabled" }, { "Shaders.ShadowsInteriors.RT", "Enabled" },
-		{ "Shaders.AmbientOcclusion.RT", "Enabled" }, { "Shaders.Reflections.RT", "Enabled" }, { "Main.Main.RayTracing", "PTRealtime" } };
+		{ "Shaders.AmbientOcclusion.RT", "Enabled" }, { "Shaders.AmbientOcclusion.RT", "GI" },
+		{ "Shaders.Reflections.RT", "Enabled" }, { "Main.Main.RayTracing", "PTRealtime" } };
 	for (const auto& k : kOnKeys) if (RtOn(k[0], k[1]) || (!strcmp(k[1], "PTRealtime") && RtPathTrace::ReferenceOn())) on++;
 	switches += (int)_countof(kOnKeys);
+	if (RtOn("Shaders.AmbientOcclusion.Skylighting", "Enabled") && RtOn("Shaders.AmbientOcclusion.RT", "Sky")) on++;
+	switches++;
 }
 
 // One folder's row: its name and how many of its effects are on; open while a test shot shows one of its pages.

@@ -135,7 +135,7 @@ vec3 SkyTake(vec3 linearColor, float factor, float visibility, float cap, float 
 // ---- AmbientLight.fx.hlsl ----
 bool IsViewModel(texture2D viewModelTex, vec2 uv) {
     float d = pointLod(viewModelTex, uv).x;
-    return (cb.depthConstants.z == 0.0 && d < 0.9) || (cb.depthConstants.z > 0.0 && d > 0.01);
+    return (cb.depthConstants.z == 0.0 && d < 0.99999) || (cb.depthConstants.z > 0.0 && d > 0.0);
 }
 
 vec3 PositionFromLinear(vec2 uv, float linear01) {

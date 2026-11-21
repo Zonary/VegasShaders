@@ -50,6 +50,7 @@ namespace HdrOutput {
 		unsigned				RefusedRetries = 0;	// asked again every 600 frames, 6 times (UNOFFICIAL 2026-10-29)
 		bool					RetryNow = false;	// the display read HDR (e.g. alt-tabbed): ask a refused mode again now
 		bool					SwapSdr = false;	// on, but the fork says its swap chain is SDR (asked again: 3 timed attempts + alt-tab)
+		bool					SwapConfirmed = false;	// UNOFFICIAL 2026-11-21: fork swap chain confirmed HDR; skip redundant 600-frame GetHdrInfo WSI polls
 		UINT					ForkMode = NVR_EXT_HDR_OFF;	// the mode the fork holds (it can hold one while Active is false: SetOff sends OFF then too)
 		int						LastCurrent = -1;	// the display's current mode at the last check (RetryNow on SDR -> HDR only)
 		unsigned				SwapSdrRetries = 0;
@@ -358,7 +359,7 @@ namespace HdrOutput {
 		float maxNits = Reading.MaxNits;
 		WindowsHdr windows = Reading.Windows;
 		InterlockedExchange(&CheckState, 0);
-		if (monitor != S.LastMonitor) { S.LastMonitor = monitor; S.LastSetting = -1; S.SupportedSeen = false; }
+		if (monitor != S.LastMonitor) { S.LastMonitor = monitor; S.LastSetting = -1; S.SupportedSeen = false; S.SwapConfirmed = false; }
 		if (windows.Setting >= 0) S.LastSetting = windows.Setting;
 		else if (S.LastSetting >= 0) { windows.Setting = S.LastSetting; windows.From = "last reading"; }	// a failed read keeps the last answer
 		if (windows.Supported > 0) S.SupportedSeen = true;
@@ -373,7 +374,7 @@ namespace HdrOutput {
 		else if (windows.Supported == 0 && !S.SupportedSeen) hdr = 0;	// no setting found and Windows says the display cannot do HDR now
 		else hdr = now || seen ? 1 : 0;
 		if (hdr && S.DisplayHdr == 0) { S.Refused = false; S.RefusedRetries = 0; }	// Windows HDR just came on: ask the fork afresh
-		if (current && S.LastCurrent == 0 && (S.Refused || S.SwapSdr)) S.RetryNow = true;	// e.g. alt-tabbed: the desktop went HDR, the surface may offer it now
+		if (current && S.LastCurrent == 0 && (S.Refused || S.SwapSdr)) { S.RetryNow = true; S.SwapConfirmed = false; }	// e.g. alt-tabbed: the desktop went HDR, the surface may offer it now
 		S.LastCurrent = current;
 		if (maxNits <= 0.0f) maxNits = S.DisplayMaxNits;
 		// UNOFFICIAL 2026-11-01 (log privacy): the MonitorDataStore entry holds the monitor's EDID serial number after the PnP id
@@ -414,6 +415,7 @@ namespace HdrOutput {
 			Logger::Log("UNOFFICIAL HDR output: the fork answered %08lX in %lu ms", (unsigned long)hr, GetTickCount() - start);
 			S.SwitchFrame = S.Frame;
 			S.SwitchTime = GetTickCount();
+			S.SwapConfirmed = false;
 		}
 		else {
 			Logger::Log("UNOFFICIAL HDR output: parameter update answered %08lX in %lu ms", (unsigned long)hr, GetTickCount() - start);
@@ -430,6 +432,7 @@ namespace HdrOutput {
 		S.Active = false;
 		S.Applied = {};
 		S.SwapSdr = false;
+		S.SwapConfirmed = false;
 		S.SwapSdrRetries = 0;
 	}
 
@@ -472,10 +475,17 @@ namespace HdrOutput {
 
 		// UNOFFICIAL 2026-10-29: while on, the fork says at each check whether its swap chain really is HDR (ActiveMode is OFF when
 		// the driver gave it an SDR format; the fork then shows the SDR picture as before and logs it)
-		if (check && S.Active) {
+		// UNOFFICIAL 2026-11-21: only query GetHdrInfo() on the render thread until the HDR swap chain is confirmed
+		// (or while recovering from SDR), avoiding redundant WSI surface queries under D3D9DeviceLock every 600 frames.
+		if (check && S.Active && (!S.SwapConfirmed || S.SwapSdr)) {
 			NVR_EXT_HDR_INFO now = {};
-			if (SUCCEEDED(S.Hdr->GetHdrInfo(&now))) {
+			const DWORD t0 = GetTickCount();
+			const HRESULT hr = S.Hdr->GetHdrInfo(&now);
+			const DWORD dt = GetTickCount() - t0;
+			if (dt > 20) Logger::Log("UNOFFICIAL HDR output: GetHdrInfo took %lu ms (hr %08lX)", (unsigned long)dt, (unsigned long)hr);
+			if (SUCCEEDED(hr)) {
 				S.SwapSdr = now.ActiveMode == NVR_EXT_HDR_OFF;
+				if (!S.SwapSdr) S.SwapConfirmed = true;
 				if (S.SwapSdr) Reason("on, but the fork's swap chain is SDR (the driver did not give it an HDR format; DXVK's log says which): SDR picture");
 				else if (!strncmp(S.LastReason, "on, but", 7) || !strncmp(S.LastReason, "asked", 5)) Reason("on: the fork's swap chain is HDR");
 			}
@@ -530,6 +540,7 @@ namespace HdrOutput {
 				Send(off, false);
 				S.ForkMode = NVR_EXT_HDR_OFF;
 				S.SwapSdr = false;
+				S.SwapConfirmed = false;
 				S.SwapSdrRetries = 0;
 			}
 			if (S.Refused) S.Hdr->GetHdrInfo(&S.Info);	// the fork logs the surface formats again if they changed

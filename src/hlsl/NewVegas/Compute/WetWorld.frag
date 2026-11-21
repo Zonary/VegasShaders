@@ -283,8 +283,8 @@ vec3 TraceWetReflectionFixed(vec2 sourceUV, vec3 waterNormal, vec3 groundNormal)
             float hitDepth = textureLod(sampler2D(t_depth, NVR_SAMPLER(pc.sLin)), refinedUV, 0.0).x;
             float hitDelta = hitProbe.z * viewSign - hitDepth * farZ;
             float vmHitDepth = textureLod(sampler2D(t_depthVM, NVR_SAMPLER(pc.sLin)), refinedUV, 0.0).x;
-            bool hitViewModel = (c.depthConstants.z == 0.0 && vmHitDepth < 0.9)
-                || (c.depthConstants.z > 0.0 && vmHitDepth > 0.01);
+            bool hitViewModel = (c.depthConstants.z == 0.0 && vmHitDepth < 0.99999)
+                || (c.depthConstants.z > 0.0 && vmHitDepth > 0.0);
             vec2 pixelSeparation = (refinedUV - sourceUV) / c.reciprocalResolution.xy;
             bool validHitDepth = hitDepth > 0.0 && hitDepth < 0.99999;
             bool separatedHit = dot(pixelSeparation, pixelSeparation) >= 16.0;

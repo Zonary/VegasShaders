@@ -404,7 +404,7 @@ namespace CapturedNormals {
 				d->SetViewport(&vp);
 			}
 			for (unsigned i = 0; i < sizeof(kRS) / sizeof(kRS[0]); i++) d->SetRenderState(kRS[i], kWantRS[i]);
-			for (DWORD s = 0; s < 4; s++)
+			for (DWORD s = 0; s < 5; s++)
 				for (unsigned i = 0; i < sizeof(kSS) / sizeof(kSS[0]); i++) d->SetSamplerState(s, kSS[i], kWantSS[i]);
 			IDirect3DStateBlock9* sb = nullptr;
 			if (FAILED(d->EndStateBlock(&sb))) sb = nullptr;
@@ -427,11 +427,13 @@ namespace CapturedNormals {
 	// (src x srcBlend + dest x destBlend); everything it changes is put back.
 	inline void FullScreenPass(IDirect3DDevice9* d, IDirect3DSurface9* target, IDirect3DPixelShader9* psNew, IDirect3DBaseTexture9* source,
 		bool blendOn, DWORD srcBlend, DWORD destBlend, IDirect3DBaseTexture9* source2 = nullptr,	// source2: UNOFFICIAL 2026-10-31 AlbedoBuffer, on stage 1
-		IDirect3DBaseTexture9* source3 = nullptr, IDirect3DBaseTexture9* source4 = nullptr) {	// source3/4: UNOFFICIAL 2026-11-14/19 stages 2 & 3
+		IDirect3DBaseTexture9* source3 = nullptr, IDirect3DBaseTexture9* source4 = nullptr,	// source3/4: UNOFFICIAL 2026-11-14/19 stages 2 & 3
+		IDirect3DBaseTexture9* source5 = nullptr) {	// source5: UNOFFICIAL 2026-11-20 stage 4 (TESR_DepthBufferViewModel)
 		D3DSURFACE_DESC t = {};
 		if (!d || !target || !psNew || FAILED(target->GetDesc(&t))) return;
-		if (!source2) { source3 = nullptr; source4 = nullptr; }
-		else if (!source3) source4 = nullptr;
+		if (!source2) { source3 = nullptr; source4 = nullptr; source5 = nullptr; }
+		else if (!source3) { source4 = nullptr; source5 = nullptr; }
+		else if (!source4) source5 = nullptr;
 		const bool subRect = RenderRect::Active() && t.Width == TheRenderManager->width && t.Height == TheRenderManager->height;
 		const UINT drawW = subRect ? RenderRect::Width(t.Width) : t.Width;
 		const UINT drawH = subRect ? RenderRect::Height(t.Height) : t.Height;
@@ -458,7 +460,7 @@ namespace CapturedNormals {
 
 		IDirect3DVertexShader9* vs = nullptr; IDirect3DPixelShader9* ps = nullptr; IDirect3DVertexDeclaration9* decl = nullptr;
 		IDirect3DVertexBuffer9* vb = nullptr; UINT vbOffset = 0, vbStride = 0; DWORD fvf = 0;
-		IDirect3DBaseTexture9* tex[4] = {};
+		IDirect3DBaseTexture9* tex[5] = {};
 		d->GetVertexShader(&vs); d->GetPixelShader(&ps); d->GetVertexDeclaration(&decl);
 		if (!decl) d->GetFVF(&fvf);
 		d->GetStreamSource(0, &vb, &vbOffset, &vbStride);
@@ -466,6 +468,7 @@ namespace CapturedNormals {
 		if (source2) d->GetTexture(1, &tex[1]);
 		if (source3) d->GetTexture(2, &tex[2]);
 		if (source4) d->GetTexture(3, &tex[3]);
+		if (source5) d->GetTexture(4, &tex[4]);
 
 		static const D3DRENDERSTATETYPE kRS[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ALPHATESTENABLE, D3DRS_CULLMODE, D3DRS_STENCILENABLE,
 			D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_COLORWRITEENABLE, D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
@@ -475,8 +478,8 @@ namespace CapturedNormals {
 		DWORD saved[sizeof(kRS) / sizeof(kRS[0])];
 		static const D3DSAMPLERSTATETYPE kSS[] = { D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE };
 		const DWORD wantS[] = { D3DTEXF_POINT, D3DTEXF_POINT, D3DTEXF_NONE, D3DTADDRESS_CLAMP, D3DTADDRESS_CLAMP, FALSE };
-		const DWORD stages = source4 ? 4 : source3 ? 3 : source2 ? 2 : 1;
-		DWORD savedS[4][sizeof(kSS) / sizeof(kSS[0])];
+		const DWORD stages = source5 ? 5 : source4 ? 4 : source3 ? 3 : source2 ? 2 : 1;
+		DWORD savedS[5][sizeof(kSS) / sizeof(kSS[0])];
 
 		if (useSB) {
 			PassApplySB->Apply();
@@ -498,6 +501,7 @@ namespace CapturedNormals {
 		if (source2 && tex[1] != source2) d->SetTexture(1, source2);
 		if (source3 && tex[2] != source3) d->SetTexture(2, source3);
 		if (source4 && tex[3] != source4) d->SetTexture(3, source4);
+		if (source5 && tex[4] != source5) d->SetTexture(4, source5);
 		d->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
 		const float x1 = (float)drawW - 0.5f, y1 = (float)drawH - 0.5f;
 		const float u1 = subRect ? (float)drawW / (float)t.Width : 1.0f;
@@ -524,6 +528,7 @@ namespace CapturedNormals {
 		if (source2) { if (tex[1] != source2) d->SetTexture(1, tex[1]); if (tex[1]) tex[1]->Release(); }
 		if (source3) { if (tex[2] != source3) d->SetTexture(2, tex[2]); if (tex[2]) tex[2]->Release(); }
 		if (source4) { if (tex[3] != source4) d->SetTexture(3, tex[3]); if (tex[3]) tex[3]->Release(); }
+		if (source5) { if (tex[4] != source5) d->SetTexture(4, tex[4]); if (tex[4]) tex[4]->Release(); }
 		if (decl) { d->SetVertexDeclaration(decl); decl->Release(); } else if (fvf) d->SetFVF(fvf);
 		if (vb) { d->SetStreamSource(0, vb, vbOffset, vbStride); vb->Release(); }
 		if (vs) { d->SetVertexShader(vs); vs->Release(); }
@@ -596,23 +601,69 @@ namespace CapturedNormals {
 		AlbedoSkinFills++;
 		if (!SkinAlbedoLogged) { SkinAlbedoLogged = true; Logger::Log("AlbedoBuffer: skin albedo copied from the skin blur's target (gamma %.2f)", PassSums::Gamma); }
 	}
+	// UNOFFICIAL 2026-11-20: viewmodel FOV ratio (tan(world/2) / tan(firstPerson/2)), depth buffer & capture status for smooth/bumped 1st-person normals and reflections.
+	// UNOFFICIAL 2026-11-21: prefer actual captured 1st-person projection tangent from Do_SetCameraData so ADS zoom/camera transitions match exactly.
+	inline float VmTanX = 0.0f;
+	inline UInt32 VmTanFrame = 0xFFFFFFFFu;
+	inline void SetViewModelTanX(float tanX, UInt32 frame) {
+		if (_finite(tanX) && tanX > 1.0e-5f) { VmTanX = tanX; VmTanFrame = frame; }
+	}
+	inline void ClearViewModelTanX() { VmTanX = 0.0f; }
+
+	inline float ViewModelFovScale() {
+		if (TheRenderManager && TheFrameRateManager && VmTanFrame == TheFrameRateManager->FrameNumber && VmTanX > 1.0e-5f) {
+			const float worldTanX = fabsf(TheRenderManager->InvProjMatrix._11);
+			const float s = worldTanX / VmTanX;
+			if (_finite(s) && s > 0.05f && s < 20.0f) return s;
+		}
+		if (!Player) return 1.0f;
+		const float world = Player->worldFoV, first = Player->firstPersonFoV;
+		if (world <= 1.0f || world >= 179.0f || first <= 1.0f || first >= 179.0f) return 1.0f;
+		const float toRad = 3.14159265f / 360.0f;
+		const float s = tanf(world * toRad) / tanf(first * toRad);
+		return _finite(s) && s > 0.05f ? s : 1.0f;
+	}
+	inline IDirect3DBaseTexture9* ViewModelDepthTexture() {
+		static IDirect3DBaseTexture9** slot = nullptr;
+		if (!slot && TheTextureManager) {
+			std::string name = "TESR_DepthBufferViewModel";
+			slot = TheTextureManager->GetTextureSlotByName(name);
+		}
+		return slot ? *slot : nullptr;
+	}
+	inline bool DepthReversed() {
+		auto found = TheShaderManager->ConstantsTable.find("TESR_DepthConstants");
+		return found != TheShaderManager->ConstantsTable.end() && found->second ? found->second->z > 0.5f : true;
+	}
+	inline bool VmCapturedThisFrame(UInt32 frame) { return VmFrame == frame && Texture && Data.x > 0.5f; }
+
 	// UNOFFICIAL 2026-10-31 Reflections MaterialBufferRoughness, D3D9 effect: the reflections' own material copy (8 bits: r roughness,
 	// g metal, b 1 = an _rmaos map, alpha 1 there, 0 elsewhere) takes this buffer's roughness and metal where it has no map: b 0.5 there
 	// ("the game's shader's", read by the floor guess only). Blended INVDESTALPHA / DESTALPHA so the map's pixels stay as they are.
+	// UNOFFICIAL 2026-11-20: when the 1st-person viewmodel was not captured into the G-buffer this frame (e.g. MSAA / FirstPersonNativeScale),
+	// clip viewmodel pixels so stale world material behind the gun never overwrites the weapon in NVR_ReflectionsMaterial.
 	inline IDirect3DPixelShader9* ReflMergePS = nullptr;  inline bool ReflMergeFailed = false;
 	inline bool MergeIntoReflMaterial(IDirect3DDevice9* d, IDirect3DSurface9* target) {
 		if (ReflMergeFailed || !MaterialTexture || MaterialData.x < 0.5f || !target) return false;
 		if (!ReflMergePS) {
 			static const char* kPS =
-				"sampler2D M : register(s0);"
+				"sampler2D M : register(s0); sampler2D VM : register(s1); float4 Q : register(c0);"
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
+				"  if (Q.x > 0.5f) { float r = tex2Dlod(VM, float4(uv, 0.0f, 0.0f)).x; if (Q.y > 0.5f ? r > 0.0f : r < 0.99999f) clip(-1.0f); }"
 				"  float4 m = tex2D(M, uv); clip(m.r - 0.5);"
 				"  float b = m.b < -1.99 && m.b > -3.01 ? -2.0 - m.b : m.b; clip(b);"	// (2026-11-12 ptbump: a no-highlight record's roughness, as before the code)
 				"  return float4(saturate(b), saturate(frac(m.r) / 0.49), 0.5, 0.0); }";
 			ReflMergePS = FullScreenShader(d, kPS, "Reflections MaterialBufferRoughness", ReflMergeFailed);
 			if (!ReflMergePS) return false;
 		}
-		FullScreenPass(d, target, ReflMergePS, MaterialTexture, true, D3DBLEND_INVDESTALPHA, D3DBLEND_DESTALPHA);
+		IDirect3DBaseTexture9* vmDepth = ViewModelDepthTexture();
+		const bool clipVm = vmDepth && !VmCapturedThisFrame(TheFrameRateManager->FrameNumber);
+		float saved[4] = {};
+		d->GetPixelShaderConstantF(0, saved, 1);
+		const float q[4] = { clipVm ? 1.0f : 0.0f, DepthReversed() ? 1.0f : 0.0f, 0.0f, 0.0f };
+		d->SetPixelShaderConstantF(0, q, 1);
+		FullScreenPass(d, target, ReflMergePS, MaterialTexture, true, D3DBLEND_INVDESTALPHA, D3DBLEND_DESTALPHA, clipVm ? vmDepth : nullptr);
+		d->SetPixelShaderConstantF(0, saved, 1);
 		return true;
 	}
 
@@ -792,6 +843,44 @@ namespace CapturedNormals {
 	inline bool MergeFailed = false, MergeLogged = false;
 	inline UInt32 Merges = 0;
 
+	// UNOFFICIAL: parameters for inlining MergeIntoNormals into DepthNormals.frag / Normals.frag (Vulkan).
+	struct MergeParams {
+		D3DXVECTOR4 tol;	// x Data.y, y Data.z, z Data.w, w 1.0 when active
+		D3DXVECTOR4 view;	// x 1/P._11, y 1/P._22, z vmDepth ? 1/ViewModelFovScale() : 0, w DepthReversed() ? 1 : 0
+		D3DXVECTOR4 row0;	// xyz V._11.._13, w 1.0 when active
+		D3DXVECTOR4 row1;	// xyz V._21.._23, w grass ? 1 : 0
+		D3DXVECTOR4 row2;	// xyz V._31.._33, w V2Compiled ? (FoliageGrassRange ? 2 : 1) : 0
+		IDirect3DBaseTexture9* captured = nullptr;
+		IDirect3DBaseTexture9* material = nullptr;
+		IDirect3DBaseTexture9* vmDepth = nullptr;
+	};
+	inline bool FillMergeParams(MergeParams& out, bool allowMerge) {
+		out = {};
+		if (!allowMerge || Failed || Data.x <= 0.0f || !Texture) return false;
+		auto constant = [](const char* name) -> const D3DXVECTOR4* {
+			auto found = TheShaderManager->ConstantsTable.find(name);
+			return found == TheShaderManager->ConstantsTable.end() ? nullptr : found->second;
+		};
+		const D3DXMATRIX* view = (const D3DXMATRIX*)constant("TESR_ViewTransform");
+		const D3DXMATRIX* proj = (const D3DXMATRIX*)constant("TESR_ProjectionTransform");
+		if (!view || !proj) return false;
+		const bool grass = GrassMergeNow && MaterialTexture && MaterialData.x > 0.5f;
+		IDirect3DBaseTexture9* vm = VmCapturedThisFrame(TheFrameRateManager->FrameNumber) ? ViewModelDepthTexture() : nullptr;
+		out.tol = D3DXVECTOR4(Data.y, Data.z, Data.w, 1.0f);
+		out.view = D3DXVECTOR4(1.0f / proj->_11, 1.0f / proj->_22, vm ? 1.0f / ViewModelFovScale() : 0.0f, DepthReversed() ? 1.0f : 0.0f);
+		out.row0 = D3DXVECTOR4(view->_11, view->_12, view->_13, 1.0f);
+		out.row1 = D3DXVECTOR4(view->_21, view->_22, view->_23, grass ? 1.0f : 0.0f);
+		out.row2 = D3DXVECTOR4(view->_31, view->_32, view->_33, V2Compiled ? (FoliageGrassRange ? 2.0f : 1.0f) : 0.0f);
+		out.captured = Texture;
+		out.material = grass ? (IDirect3DBaseTexture9*)MaterialTexture : nullptr;
+		out.vmDepth = vm;
+		return true;
+	}
+	inline void NoteExternalMerge(UInt32 w, UInt32 h) {
+		if (!MergeLogged) { MergeLogged = true; Logger::Log("CapturedNormals: merged into the normals buffer (%ux%u, inline) for every effect that reads it", w, h); }
+		Merges++;
+	}
+
 	inline bool MergeIntoNormals(IDirect3DDevice9* d, IDirect3DSurface9* normals, IDirect3DBaseTexture9* depth) {
 		if (MergeFailed || Failed || Data.x <= 0.0f || !Texture || !normals || !depth) return false;
 		auto constant = [](const char* name) -> const D3DXVECTOR4* {
@@ -811,20 +900,24 @@ namespace CapturedNormals {
 			// facet test (a card's facet is level, the tuft's lighting normal about straight up: see GrassOwnBeam's comment, 1). c2.w 0:
 			// the same result as before on every pixel.
 			static const char* kPS =
-				"sampler2D C : register(s0); sampler2D D : register(s1); sampler2D M : register(s2);"
-				"float4 P : register(c0); float4 R : register(c1); float4 G : register(c2); row_major float4x4 V : register(c3);"
+				"sampler2D C : register(s0); sampler2D D : register(s1); sampler2D M : register(s2); sampler2D VM : register(s3);"
+				"float4 P : register(c0); float4 R : register(c1); float4 G : register(c2); row_major float4x4 V : register(c3); float4 Q : register(c7);"
 				"float4 main(float2 uv : TEXCOORD0) : COLOR0 {"
 				"  float4 c = tex2D(C, uv); float z = tex2D(D, uv).x * P.z;"
 				"  float grass = 0.0f;"
 				"  if (G.w > 0.5f) { float4 m = tex2Dlod(M, float4(uv, 0.0f, 0.0f)); grass = m.a > 0.5f && m.r > 0.5f && abs(m.g - 0.5f) < 0.1f ? 1.0f : 0.0f; }"
+				"  float vmRaw = Q.x > 0.0f ? tex2Dlod(VM, float4(uv, 0.0f, 0.0f)).x : (Q.y > 0.5f ? 0.0f : 1.0f);"
+				"  bool vm = Q.x > 0.0f && (Q.y > 0.5f ? vmRaw > 0.0f : vmRaw < 0.99999f);"
 				"  float2 s = uv * R.zw;"
 				"  float3 vp = float3((s.x * 2.0f - 1.0f) * P.x, (1.0f - s.y * 2.0f) * P.y, 1.0f) * z;"
+				"  if (vm) vp.xy *= Q.x;"
 				"  float3 fn = cross(ddy(vp), ddx(vp)); fn = normalize(fn + float3(0.0f, 0.0f, 1.0e-20f)); fn *= dot(fn, vp) > 0.0f ? -1.0f : 1.0f;"
 				"  float3 n = float3(c.rg, 1.0f - abs(c.r) - abs(c.g)); float t = saturate(-n.z);"
 				"  n.xy += float2(n.x >= 0.0f ? -t : t, n.y >= 0.0f ? -t : t); n = normalize(n);"
 				"  float3 nv = normalize(mul(n, (float3x3)V));"
 				"  float d = length(vp);"
-				"  clip(c.a > 0.99f && abs(c.b - d) <= d * G.x + G.y && (dot(nv, fn) > G.z || grass > 0.5f) && z < P.z * 0.99f ? 1.0f : -1.0f);"
+				"  float distTol = vm ? (d * max(G.x, 0.12f) + max(G.y, 4.0f)) : (d * G.x + G.y);"
+				"  clip(c.a > 0.99f && abs(c.b - d) <= distTol && (dot(nv, fn) > G.z || grass > 0.5f || vm) && z < P.z * 0.99f ? 1.0f : -1.0f);"
 				"  return float4(nv * 0.5f + 0.5f, 1.0f); }";
 			// UNOFFICIAL 2026-11-14 GBufferV2: there the grass's mark is g = 4.5 (kGrassMarkV2) and "written" is the class (r), a being a normal's y
 			std::string source = kPS;
@@ -850,17 +943,20 @@ namespace CapturedNormals {
 		// UNOFFICIAL 2026-11-12 CapturedGrass: the grass's own normal on its marked pixels (stage 2: the MaterialBuffer), only in a frame
 		// whose grass records are written and that holds the material buffer; otherwise two stages and c2.w 0, as before
 		const bool grass = GrassMergeNow && MaterialTexture && MaterialData.x > 0.5f;
-		float saved[7][4] = {};
-		d->GetPixelShaderConstantF(0, &saved[0][0], 7);
-		const float c[7][4] = {
+		IDirect3DBaseTexture9* vmDepth = VmCapturedThisFrame(TheFrameRateManager->FrameNumber) ? ViewModelDepthTexture() : nullptr;
+		float saved[8][4] = {};
+		d->GetPixelShaderConstantF(0, &saved[0][0], 8);
+		const float c[8][4] = {
 			{ 1.0f / proj->_11, 1.0f / proj->_22, camera->y, 0.0f },
 			{ scale ? scale->x : 1.0f, scale ? scale->y : 1.0f, scale ? scale->z : 1.0f, scale ? scale->w : 1.0f },
 			{ Data.y, Data.z, Data.w, grass ? 1.0f : 0.0f },	// (w: 2026-11-12 CapturedGrass, the marked grass pixels take their record's normal)
 			{ view->_11, view->_12, view->_13, view->_14 }, { view->_21, view->_22, view->_23, view->_24 },
-			{ view->_31, view->_32, view->_33, view->_34 }, { view->_41, view->_42, view->_43, view->_44 } };
-		d->SetPixelShaderConstantF(0, &c[0][0], 7);
-		FullScreenPass(d, normals, MergePS, Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO, depth, grass ? MaterialTexture : nullptr);
-		d->SetPixelShaderConstantF(0, &saved[0][0], 7);
+			{ view->_31, view->_32, view->_33, view->_34 }, { view->_41, view->_42, view->_43, view->_44 },
+			{ vmDepth ? 1.0f / ViewModelFovScale() : 0.0f, DepthReversed() ? 1.0f : 0.0f, 0.0f, 0.0f } };
+		d->SetPixelShaderConstantF(0, &c[0][0], 8);
+		FullScreenPass(d, normals, MergePS, Texture, false, D3DBLEND_ONE, D3DBLEND_ZERO, depth,
+			grass ? MaterialTexture : (vmDepth ? (IDirect3DBaseTexture9*)Texture : nullptr), vmDepth);
+		d->SetPixelShaderConstantF(0, &saved[0][0], 8);
 		if (!MergeLogged) { MergeLogged = true; Logger::Log("CapturedNormals: merged into the normals buffer (%ux%u) for every effect that reads it", t.Width, t.Height); }
 		Merges++;
 		return true;
@@ -1013,6 +1109,7 @@ namespace CapturedNormals {
 		case D3DRS_COLORWRITEENABLE2: T.colorWrite2 = v; break;
 		case D3DRS_COLORWRITEENABLE3: T.colorWrite3 = v; break;
 		case D3DRS_COLORWRITEENABLE1: T.colorWrite1 = v; break;	// UNOFFICIAL 2026-10-31 AlbedoBuffer
+		case D3DRS_ZWRITEENABLE: T.zWrite = v; break;
 		default: break;
 		}
 		return NextSetRS(d, st, v);
@@ -1030,6 +1127,7 @@ namespace CapturedNormals {
 		d->GetRenderState(D3DRS_SRCBLEND, &T.src); d->GetRenderState(D3DRS_DESTBLEND, &T.dst);
 		d->GetRenderState(D3DRS_COLORWRITEENABLE2, &T.colorWrite2); d->GetRenderState(D3DRS_COLORWRITEENABLE3, &T.colorWrite3);
 		d->GetRenderState(D3DRS_COLORWRITEENABLE1, &T.colorWrite1);	// UNOFFICIAL 2026-10-31 AlbedoBuffer
+		d->GetRenderState(D3DRS_ZWRITEENABLE, &T.zWrite);
 		Tracked = true;
 	}
 	inline void AfterStateBlock(IDirect3DDevice9* d) { if (InSpan && Tracked) Resync(d); }
@@ -1061,6 +1159,7 @@ namespace CapturedNormals {
 		case D3DRS_COLORWRITEENABLE2: T.colorWrite2 = v; break;
 		case D3DRS_COLORWRITEENABLE3: T.colorWrite3 = v; break;
 		case D3DRS_COLORWRITEENABLE1: T.colorWrite1 = v; break;
+		case D3DRS_ZWRITEENABLE: T.zWrite = v; break;
 		default: break;
 		}
 		return OrigBodySetRS(d, st, v);
@@ -1307,6 +1406,12 @@ namespace CapturedNormals {
 	}
 
 	inline void BeforeDraw(IDirect3DDevice9* d) {
+		if (SharedDrawState::WatchingDepth && !SharedDrawState::DepthWrittenSinceCopy) {
+			DWORD zw = TRUE;
+			if (Tracked) zw = T.zWrite;
+			else d->GetRenderState(D3DRS_ZWRITEENABLE, &zw);
+			if (zw != FALSE) SharedDrawState::DepthWrittenSinceCopy = true;
+		}
 		if (!InSpan) { if (GrassArmed) GrassLateDraw(d); return; }	// (2026-11-12 grass records after the main list)
 		if (BodyLean()) {	// UNOFFICIAL 2026-11-04 DrawStateTracking: a lost record read again; every CheckEvery-th draw compared
 			if (!Tracked) { Resync(d); BodyResyncs++; SharedDrawState::Valid = true; }
@@ -1353,6 +1458,13 @@ namespace CapturedNormals {
 			if (write && blend && BlendedAlphaOn) BlendedAlphaBegin(d, mask, coverage || foliage || (v2Mark && !LastCodeWriter));
 			// added (ONE / ONE): the alpha adds up across the lamp passes; any other added blend would scale it, so it is left out (counted)
 			if (!write && LastContrastWriter && ContrastLive() && (mask & 7) && blend && dst == D3DBLEND_ONE) {	// (2026-11-16 ContrastLive: item 23)
+				if (src == D3DBLEND_ONE) contrast = true; else ContrastOtherBlend++;
+			}
+		}
+		else if (LastContrastWriter && ContrastLive()) {
+			const DWORD mask = StateNow(d, D3DRS_COLORWRITEENABLE, 0xF), blend = StateNow(d, D3DRS_ALPHABLENDENABLE, FALSE);
+			const DWORD src = blend ? StateNow(d, D3DRS_SRCBLEND, D3DBLEND_ONE) : D3DBLEND_ONE, dst = blend ? StateNow(d, D3DRS_DESTBLEND, D3DBLEND_ZERO) : D3DBLEND_ZERO;
+			if ((mask & 7) && blend && dst == D3DBLEND_ONE) {
 				if (src == D3DBLEND_ONE) contrast = true; else ContrastOtherBlend++;
 			}
 		}
@@ -1580,6 +1692,7 @@ namespace CapturedNormals {
 		return r;
 	}
 	inline HRESULT STDMETHODCALLTYPE ClearHook(IDirect3DDevice9* d, DWORD count, CONST D3DRECT* rects, DWORD flags, D3DCOLOR color, float z, DWORD stencil) {
+		if (SharedDrawState::WatchingDepth && (flags & D3DCLEAR_ZBUFFER)) SharedDrawState::DepthWrittenSinceCopy = true;
 		if (InSpan) {	// D3D9's Clear clears every bound target; the next writing draw binds it again
 			IDirect3DSurface9* rt3 = nullptr;
 			if (SUCCEEDED(d->GetRenderTarget(3, &rt3)) && rt3) rt3->Release();
@@ -1897,7 +2010,11 @@ namespace CapturedNormals {
 		if (GrassLateBound) GrassLateEnd(d);	// UNOFFICIAL 2026-11-12 (the world's late grass is over)
 		GrassArmed = GrassLateOk = false;
 		GrassOwnOk = false;	// (PTGrassOwnPixel)
-		if (!(VmWanted || VmDeferred) || !Live || InSpan || Failed || Data.x <= 0.0f || AlbedoData.x <= 0.0f || !Texture || !AlbedoSurface || MsaaSurface || AlbedoMsaa) return;
+		// UNOFFICIAL 2026-11-20: capture the 1st-person viewmodel into the G-buffer whenever CapturedNormals is live (non-MSAA),
+		// so TESR_NormalsBuffer, FdIndirect::ShadingNormals, and Reflections get smooth/bumped viewmodel normals and material instead of
+		// faceted depth normals or stale background G-buffer texels.
+		if (!Live || InSpan || Failed || Data.x <= 0.0f || !Texture || MsaaSurface || AlbedoMsaa) return;
+		if ((VmWanted || VmDeferred) && (AlbedoData.x <= 0.0f || !AlbedoSurface)) return;
 		IDirect3DSurface9* rt0 = nullptr;
 		if (FAILED(d->GetRenderTarget(0, &rt0)) || !rt0) return;
 		D3DSURFACE_DESC t = {};
@@ -1907,22 +2024,24 @@ namespace CapturedNormals {
 			rt0->Release();
 			return;
 		}
-		if (VmSkinTex) {	// (the screen's size changed)
-			D3DSURFACE_DESC s = {};
-			if (FAILED(VmSkinTex->GetLevelDesc(0, &s)) || s.Width != t.Width || s.Height != t.Height) { VmSkinSurface->Release(); VmSkinSurface = nullptr; VmSkinTex->Release(); VmSkinTex = nullptr; VmClearedW = VmClearedH = 0; }
-		}
-		if (!VmSkinTex && (FAILED(d->CreateTexture(t.Width, t.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &VmSkinTex, NULL)) || !VmSkinTex ||
-			FAILED(VmSkinTex->GetSurfaceLevel(0, &VmSkinSurface)))) {
-			if (VmSkinTex) { VmSkinTex->Release(); VmSkinTex = nullptr; }
-			VmSkinSurface = nullptr;	// (the hands then keep the world's colour under them: VmSkinFill needs it; the gun is still captured)
-			VmClearedW = VmClearedH = 0;
-		}
-		if (VmSkinSurface) {
-			const UINT vmW = RenderRect::Active() ? RenderRect::Width(t.Width) : t.Width;
-			const UINT vmH = RenderRect::Active() ? RenderRect::Height(t.Height) : t.Height;
-			const bool vmForceFull = VmClearedW == 0 || vmW < VmClearedW || vmH < VmClearedH;
-			VmClearedW = vmW; VmClearedH = vmH;
-			ClearSurface(d, VmSkinSurface, t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), vmForceFull);
+		if (AlbedoSurface && AlbedoData.x > 0.0f) {
+			if (VmSkinTex) {	// (the screen's size changed)
+				D3DSURFACE_DESC s = {};
+				if (FAILED(VmSkinTex->GetLevelDesc(0, &s)) || s.Width != t.Width || s.Height != t.Height) { VmSkinSurface->Release(); VmSkinSurface = nullptr; VmSkinTex->Release(); VmSkinTex = nullptr; VmClearedW = VmClearedH = 0; }
+			}
+			if (!VmSkinTex && (FAILED(d->CreateTexture(t.Width, t.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &VmSkinTex, NULL)) || !VmSkinTex ||
+				FAILED(VmSkinTex->GetSurfaceLevel(0, &VmSkinSurface)))) {
+				if (VmSkinTex) { VmSkinTex->Release(); VmSkinTex = nullptr; }
+				VmSkinSurface = nullptr;	// (the hands then keep the world's colour under them: VmSkinFill needs it; the gun is still captured)
+				VmClearedW = VmClearedH = 0;
+			}
+			if (VmSkinSurface) {
+				const UINT vmW = RenderRect::Active() ? RenderRect::Width(t.Width) : t.Width;
+				const UINT vmH = RenderRect::Active() ? RenderRect::Height(t.Height) : t.Height;
+				const bool vmForceFull = VmClearedW == 0 || vmW < VmClearedW || vmH < VmClearedH;
+				VmClearedW = vmW; VmClearedH = vmH;
+				ClearSurface(d, VmSkinSurface, t.Width, t.Height, D3DCOLOR_ARGB(0, 0, 0, 0), vmForceFull);
+			}
 		}
 		EnsureHooked(d);
 		if (LeanWanted && DxvkCompute::Available()) { HookTracking(d); Resync(d); }

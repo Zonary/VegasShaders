@@ -7,6 +7,7 @@
 #include "../../core/DxvkCompute.h"	// UNOFFICIAL 2026-10-25 (NVR DXVK)
 #include "../../core/RenderRect.h"	// UNOFFICIAL 2026-10-27 RenderScale v2
 #include "../../core/ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion (Temporal's motion input)
+#include "../../core/ViewModelMotion.h"	// UNOFFICIAL 2026-11-21 ViewModelMotion (RtDenoiser weapon reprojection)
 #include "../../core/RtCoreClient.h"	// UNOFFICIAL 2026-10-28 (RT reflections)
 #include "../../core/CapturedNormals.h"	// UNOFFICIAL 2026-10-31 MaterialBufferRoughness (the D3D9 effect's material copy)
 #include "../../core/RtCore.h"
@@ -328,11 +329,7 @@ namespace {
 // the same eye with its own (narrower) FOV, so a weapon pixel's sideways view offset is the world projection's divided by this. 1 if
 // either is unknown.
 float ReflectionsEffect::WeaponFovScale() const {
-	if (!Player) return 1.0f;
-	const float world = Player->worldFoV, first = Player->firstPersonFoV;
-	if (world <= 1.0f || world >= 179.0f || first <= 1.0f || first >= 179.0f) return 1.0f;
-	const float toRad = 3.14159265f / 360.0f;
-	return tanf(world * toRad) / tanf(first * toRad);
+	return CapturedNormals::ViewModelFovScale();
 }
 
 // UNOFFICIAL 2026-11-08 (perf-reflfix4) one log line that says whether the installed shader files are this build's: the fixes of test 12's
@@ -354,8 +351,8 @@ static UInt32 ReflFileHash(const char* path, bool& found) {
 }
 static void LogReflShaderFiles() {
 	struct Want { const char* name; UInt32 hash; };
-	static const Want wants[] = {	// (perf-reflfix4 + 2026-11-19 rt-review-fixes: tools\nvr-dxvk\compile-compute.sh output)
-		{ "ReflectionsComposite", 0x39385D70u }, { "ReflectionsRTResolve", 0xBB7E6063u }, { "ReflectionsRayGen", 0x699A0791u }, { "ReflectionsTemporal", 0xC3EB115Du },
+	static const Want wants[] = {	// (perf-reflfix4 + 2026-11-20 1st-person viewmodel fixes: tools\nvr-dxvk\compile-compute.sh output)
+		{ "ReflectionsComposite", 0x01C60B00u }, { "ReflectionsRTResolve", 0xA93AF357u }, { "ReflectionsRayGen", 0x68A79B97u }, { "ReflectionsTemporal", 0x3CA35521u },
 		{ "RtReflDenoiseOursReproject", 0xF119DEBBu }, { "Rt\\ReflectionsRT", 0xA746E089u },
 		{ "Rt\\ReflectionsRTAlpha", 0x84E26AE6u }, { "Rt\\ReflectionsRTTex", 0xB3E8D775u }, { "Rt\\ReflectionsRTTexGlow", 0xFFB3D4DAu },
 		{ "Rt\\ReflectionsRTAlphaTex", 0x8ECA2AD7u }, { "Rt\\ReflectionsRTAlphaTexGlow", 0xFEF64466u },
@@ -1461,9 +1458,11 @@ bool ReflectionsEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* R
 		auto found = TheShaderManager->ConstantsTable.find("TESR_CloudsLayout");
 		if (found != TheShaderManager->ConstantsTable.end() && found->second) cloudBrightness = found->second->w;
 	}
-	// x: bit 1 the roughness the shaders lit with (MaterialBufferRoughness / WetFx / GBufferV2), bit 2 the puddle mask (2026-11-12)
+	// x: bit 1 the roughness the shaders lit with (MaterialBufferRoughness / WetFx / GBufferV2), bit 2 the puddle mask (2026-11-12),
+	// bit 4 (2026-11-20) the 1st-person viewmodel was captured into the G-buffer this frame (so weapon pixels hold own material/albedo, not stale background)
+	const bool vmCaptured = CapturedNormals::VmCapturedThisFrame(TheFrameRateManager->FrameNumber);
 	uniforms.material2 = D3DXVECTOR4((matbuf && (Settings.MaterialBufferRoughness || Constants.WetFx.x > 0.5f || CapturedNormals::V2Compiled) ? 1.0f : 0.0f) +
-		(matbuf && puddleMask ? 2.0f : 0.0f), cloudSky ? 1.0f : 0.0f, cloudBrightness, Settings.RtWeaponMetal);	// w: WeaponMetal (2026-10-30)
+		(matbuf && puddleMask ? 2.0f : 0.0f) + (vmCaptured ? 4.0f : 0.0f), cloudSky ? 1.0f : 0.0f, cloudBrightness, Settings.RtWeaponMetal);	// w: WeaponMetal (2026-10-30)
 	// UNOFFICIAL 2026-10-31 SkyPanorama: the passes after it this frame read the panorama on t_cloudSky (y 2); its own pass reads the probe.
 	IDirect3DBaseTexture9* skySlot = cloudSky;
 	if (panoReady && techniqueIndex != 10) { skySlot = pano[panoIndex]; uniforms.material2.y = 2.0f; }
@@ -1685,6 +1684,7 @@ bool ReflectionsEffect::RunRtDenoiser(IDirect3DDevice9* Device, IDirect3DTexture
 	}
 	f.mirrorJitterCode = mirrorJitterCode;
 	f.mirrorJitterRoughness = 0.03f;
+	f.weaponFovScale = WeaponFovScale();
 	RtReflDenoise::Settings s;
 	s.Core = Settings.RtDenoiserCore;
 	// (2026-11-07 perf-history) DenoiserHistory / DenoiserMirrorHistory are frames at 60 fps: the same seconds at this frame rate
@@ -1699,10 +1699,11 @@ bool ReflectionsEffect::RunRtDenoiser(IDirect3DDevice9* Device, IDirect3DTexture
 	s.ClipWeight = Settings.RtDenoiserClip;
 	s.DebugView = Settings.RtDenoiserDebugView;
 	IDirect3DBaseTexture9* motion = ObjectMotion::Ready() && ObjectMotion::Data.x > 0.0f && ObjectMotion::Texture ? (IDirect3DBaseTexture9*)ObjectMotion::Texture : nullptr;
+	IDirect3DBaseTexture9* vmMotion = ViewModelMotion::Ready() && ViewModelMotion::Texture ? (IDirect3DBaseTexture9*)ViewModelMotion::Texture : nullptr;
 	{
 		static GpuTimer timer("  Reflections RT denoiser");
 		GpuProfileScope gpu(timer, Device);
-		if (!RtDenoiser.Run(signal, Rt.Ray, Rt.Spread, normals, motion, f, s)) {
+		if (!RtDenoiser.Run(signal, Rt.Ray, Rt.Spread, normals, motion, f, s, vmMotion)) {
 			RtDenoiserFailed = true;
 			Logger::Log("UNOFFICIAL Reflections: the RT reflection denoiser's passes could not run (a shader file RtReflDenoise*.spv missing or refused); Temporal + Blur are used.");
 			return false;

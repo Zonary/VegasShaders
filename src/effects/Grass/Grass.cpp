@@ -400,18 +400,55 @@ namespace GrassNormalMaps {
 // GrassCameraRelative), so the chain runs first and, for NVR's VS, the two rows are put back after it.
 typedef int(__thiscall* GrassSetupFn)(void*, NiGeometry*, int, int, int, int, int, float*, int);
 static GrassSetupFn sGrassSetup = nullptr;
+typedef HRESULT(STDMETHODCALLTYPE* TstgDIPFn)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+static TstgDIPFn sTstgNextDIP = nullptr;
+static bool sTstgHooked = false;
+
+static HRESULT STDMETHODCALLTYPE TstgDIPHook(IDirect3DDevice9* device, D3DPRIMITIVETYPE type, INT base, UINT minIndex, UINT numVertices, UINT start, UINT count) {
+	if (GrassShaders::PendingTstgRestore && !NewGrass::InDraw && TheRenderManager) {
+		GrassShaders::PendingTstgRestore = false;
+		device->SetVertexShaderConstantF(248, (const float*)&TheRenderManager->InvProjMatrix, 2);
+	}
+	return sTstgNextDIP(device, type, base, minIndex, numVertices, start, count);
+}
+
+void GrassShaders::CheckTstg(IDirect3DDevice9* device) {
+	if (!TstgChecked) {
+		TstgChecked = true;
+		TstgDetected = GetModuleHandleA("ThereStandsTheGrass.dll") != nullptr;
+		if (TstgDetected)
+			Logger::Log("UNOFFICIAL Grass: ThereStandsTheGrass.dll detected - enabling per-draw c248-c249 InvProj restore guard (recommend disabling TSTG when using Vegas Shaders grass interaction).");
+	}
+	if (TstgDetected && !sTstgHooked && device) {
+		void** table = *(void***)device;
+		DWORD old = 0;
+		if (VirtualProtect(&table[82], sizeof(void*), PAGE_EXECUTE_READWRITE, &old)) {
+			sTstgNextDIP = (TstgDIPFn)table[82];
+			table[82] = (void*)&TstgDIPHook;
+			VirtualProtect(&table[82], sizeof(void*), old, &old);
+			sTstgHooked = true;
+		}
+	}
+}
 
 static int __fastcall GrassSetupHook(void* Shader, void*, NiGeometry* Geometry, int a3, int a4, int a5, int a6, int a7, float* Transform, int a9) {
 	const int result = sGrassSetup(Shader, Geometry, a3, a4, a5, a6, a7, Transform, a9);
 	if (GrassShaders* grass = TheShaderManager ? TheShaderManager->Shaders.Grass : nullptr) {
 		grass->OnGrassShape(Geometry);
-		if (grass->Enabled && GrassShaders::LastBindNVR)
+		if (grass->Enabled && GrassShaders::LastBindNVR) {
 			TheRenderManager->device->SetVertexShaderConstantF(248, (const float*)&TheRenderManager->InvProjMatrix, 2);
+			if (GrassShaders::TstgDetected) GrassShaders::PendingTstgRestore = true;
+		}
 	}
 	return result;
 }
 
 void GrassShaders::InstallHooks() {
+	if (!TstgChecked && GetModuleHandleA("ThereStandsTheGrass.dll")) {
+		TstgChecked = true;
+		TstgDetected = true;
+		Logger::Log("UNOFFICIAL Grass: ThereStandsTheGrass.dll detected - enabling per-draw c248-c249 InvProj restore guard (recommend disabling TSTG when using Vegas Shaders grass interaction).");
+	}
 	if (sGrassSetup) return;
 	void** slot = (void**)(0x10B8980 + 24 * 4);
 	DWORD old;
@@ -422,15 +459,24 @@ void GrassShaders::InstallHooks() {
 	Logger::Log("Grass: per-shape setup hooked (was %p)", sGrassSetup);
 }
 
+static const NiSourceTexture* GrassDiffuseTexture(NiGeometry* Geometry) {
+	if (!Geometry) return nullptr;
+	if (NiShadeProperty* shade = (NiShadeProperty*)Geometry->GetProperty(NiProperty::kType_Shade))
+		if (shade->m_eShaderType == NiShadeProperty::kProp_TallGrass)
+			return *(NiSourceTexture**)((UInt8*)shade + 0x84);
+	return nullptr;
+}
+
+bool GrassShaders::IsStaticGeometry(NiGeometry* Geometry) {
+	return IsStaticGrass(GrassDiffuseTexture(Geometry));
+}
+
 void GrassShaders::OnGrassShape(NiGeometry* Geometry) {
 	if (!Geometry) return;
 
 	// The shape's diffuse texture: TallGrassShaderProperty (shade type 4) keeps it (an NiSourceTexture) at +0x84 (its getter 0xBB36C0,
 	// which TallGrassShader's texture setup 0xBAC950 binds to s0).
-	const NiSourceTexture* diffuse = nullptr;
-	if (NiShadeProperty* shade = (NiShadeProperty*)Geometry->GetProperty(NiProperty::kType_Shade))
-		if (shade->m_eShaderType == NiShadeProperty::kProp_TallGrass)
-			diffuse = *(NiSourceTexture**)((UInt8*)shade + 0x84);
+	const NiSourceTexture* diffuse = GrassDiffuseTexture(Geometry);
 	SetBatchConstants(Geometry, IsStaticGrass(diffuse));
 
 	// Its normal map, from the diffuse texture's name. s1 goes through the render state cache, so the next shader using s1 gets its

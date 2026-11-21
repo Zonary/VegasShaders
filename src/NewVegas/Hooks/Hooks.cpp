@@ -229,6 +229,7 @@ void AttachHooks() {
 		{ Branch::Call, Jumpers::DetectorWindow::SetNodeName, (UInt32)&DetectorWindowSetNodeName },
 	});
 	kRenderInterfaceDetour.ReplaceCall(Jumpers::RenderInterface::Hook, RenderInterfaceHook);
+	InstallMenu3DGuardHook();
 	Patch({
 		{ Branch::Jump, 0x871290, (UInt32)&RenderShadowMapHook },
 		{ Branch::Jump, Jumpers::Shadows::LeavesNodeNameHook, (UInt32)&LeavesNodeNameHook },

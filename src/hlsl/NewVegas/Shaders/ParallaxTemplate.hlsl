@@ -1009,9 +1009,11 @@ PS_OUTPUT main(PS_INPUT pin)
         po.capturedPad2 = CapturedShadingNormal(po.capturedPad2, gbShadingNormal);	// UNOFFICIAL 2026-11-14 GBufferV2: g / a
     #endif
     // UNOFFICIAL 2026-10-28 CapturedNormals: the smooth vertex nmap, before the nmap map and the parallax offset. The displacement
-    // layout (NVR DXVK object tessellation) has no channel for it (uv.zw is the object nmap there): none, the depth-rebuilt nmap stays.
-    #if defined(DISPLACE_LAYOUT) || defined(DIFFUSE) || defined(ONLY_SPECULAR)
+    // layout (NVR DXVK object tessellation) has no channel for it (uv.zw is the object nmap there): record the geometric facing normal.
+    #if defined(DIFFUSE) || defined(ONLY_SPECULAR)
         po.capturedNormal = CAPTURED_NORMAL_INVALID;
+    #elif defined(DISPLACE_LAYOUT)
+        po.capturedNormal = shadowWorldPosValid > 0.0f ? CapturedNormalOut(sunShadowNormal, pin.shadowWorldPos.xyz) : CAPTURED_NORMAL_INVALID;
     #else
         po.capturedNormal = CapturedNormalOutTri(PAR_SMOOTH_NORMAL, pin.shadowWorldPos.xyz);
     #endif

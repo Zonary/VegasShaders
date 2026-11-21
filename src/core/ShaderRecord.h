@@ -149,9 +149,11 @@ inline bool GameShaderEyes = true;
 // UNOFFICIAL 2026-11-09 [Shaders.PBR.Main] EyeShaderOld (A/B, Render.cpp GameEyes): true = the eyes as before 11-09 (the game's own shaders
 // while LinearScene is off, the mod's ordinary object shader while it is on); false (default) = the eye variant (ObjectTemplate.hlsl NVR_EYE).
 inline bool EyeShaderOld = false;
-// UNOFFICIAL 2026-11-09 [Shaders.PBR.Main] GameShadersInMenus (SetShadersHook, Render.cpp): the character creation menu's head (hair, eyes,
-// teeth, clothes: everything but the skin, which has had this rule since 10-27) drawn with the game's own shaders.
+// UNOFFICIAL 2026-11-09 [Shaders.PBR.Main] GameShadersInMenus (SetShadersHook, Render.cpp): 3D menu views (casino tables, slots,
+// caravan, lockpick, character creation / surgery, etc.) drawn with the game's own shaders (Pip-Boy kept on PBR).
 inline bool GameShadersInMenus = true;
+// UNOFFICIAL 2026-11-21: TESMain::DrawWorldMenu3D call hook active (Render.cpp Menu3DGuard).
+inline bool Menu3DGuardInstalled = false;
 
 // 2026-11-03 (white env-mapped objects with Real Time Reflections, three testers): NVR keeps its own fields INSIDE the game's shader
 // objects (Enabled, ShaderProg[3], ShaderHandleBackup: GameNi.h NiD3DShaderProgram), filled in by the CreateVertexShader /

@@ -73,13 +73,77 @@ void main() {
     float rawHit = max(Fetch(t_hitDist, px).y, 0.0);
     o_moments = vec4(rawHit, 1.0, max(hit, 0.0), 0.0);
     if (s.z <= 0.0) { o_guide = vec4(0.0); o_accum = vec4(0.0); o_average = vec4(0.0); o_moments = vec4(0.0); return; }
-    if (IsMirror(s.roughness) || !HistoryValid) return;
+    if (IsMirror(s.roughness)) return;
 
-    // surface reprojection (with ObjectMotion; weapon pixels stay screen-locked without world parallax because they use weapon FOV)
+    // 3x3 same-surface neighborhood (un-premultiplied Tame color + alpha) for firefly clamping, anti-lag, and variance clip
+    const vec3 lumaW = vec3(0.2126, 0.7152, 0.0722);
+    const float minTameDenom = 1.0 / 17.0;
+    vec4 m1 = vec4(0.0), m2 = vec4(0.0);
+    float c = 0.0;
+    vec3 cM1 = vec3(0.0), cM2 = vec3(0.0);
+    float cCount = 0.0;
+    float nbrLin1 = 0.0, nbrLin2 = 0.0, nbrN = 0.0;
+    float aMin = signal.a, aMax = signal.a;
+    for (int y = -1; y <= 1; y++)
+        for (int x = -1; x <= 1; x++) {
+            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), max(ACTIVE_GRID - 1, ivec2(0)));
+            vec2 rq = Fetch(t_ray, q).xy;
+            if (rq.x <= 0.0) continue;
+            bool qw;
+            StripRoughness(rq.y, qw);
+            if (qw != s.weapon) continue;
+            vec4 v = Fetch(t_signal, q);
+            if (!Finite(v)) continue;
+            aMin = min(aMin, v.a);
+            aMax = max(aMax, v.a);
+            if (x == 0 && y == 0) continue;
+            m1 += v; m2 += v * v; c += 1.0;
+            if (v.a > 1.0e-4) {
+                vec3 tc = max(v.rgb / v.a, vec3(0.0));
+                cM1 += tc; cM2 += tc * tc; cCount += 1.0;
+                float tl = dot(tc / max(1.0 - dot(tc, lumaW), minTameDenom), lumaW);
+                nbrLin1 += tl; nbrLin2 += tl * tl; nbrN += 1.0;
+            }
+        }
+    if (pc.params3.z > 0.0 && signal.a > 1.0e-4 && nbrN >= 3.0) {
+        vec3 curC = max(signal.rgb / signal.a, vec3(0.0));
+        vec3 curLin = curC / max(1.0 - dot(curC, lumaW), minTameDenom);
+        float curLinL = dot(curLin, lumaW);
+        float meanL = nbrLin1 / nbrN;
+        float sigL = sqrt(max(nbrLin2 / nbrN - meanL * meanL, 0.0));
+        float capL = meanL + pc.params3.z * max(sigL, 0.25);
+        if (curLinL > capL) {
+            curLin *= capL / max(curLinL, 1.0e-4);
+            curC = curLin / (1.0 + dot(curLin, lumaW));
+            signal.rgb = curC * signal.a;
+        }
+    }
+    m1 += signal; m2 += signal * signal; c += 1.0;
+    if (signal.a > 1.0e-4) {
+        vec3 tc = max(signal.rgb / signal.a, vec3(0.0));
+        cM1 += tc; cM2 += tc * tc; cCount += 1.0;
+    }
+    o_accum = signal; o_average = signal;
+    if (!HistoryValid) return;
+
+    // surface reprojection (with ObjectMotion; weapon pixels use ViewModelMotionBuffer when available, else screen-locked)
     vec3 uvSurf;
     bool inSurf = true;
     if (s.weapon) {
-        uvSurf = vec3(rectUv, s.z);
+        if (pc.vmMotionValid != 0u) {
+            vec2 ruvFull = clamp(rectUv + pc.fullUv.xy, 0.5 * pc.size.zw, pc.rect.xy - 0.5 * pc.size.zw);
+            vec4 vmm = textureLod(sampler2D(t_vmMotion, POINT_S), ruvFull, 0.0);
+            if (vmm.b > 0.5) {
+                vec2 sCur = (rectUv + pc.fullUv.xy) / max(pc.rect.xy, vec2(1.0e-4));
+                vec2 sPrev = sCur + vmm.rg;
+                inSurf = all(greaterThanEqual(sPrev, vec2(0.0))) && all(lessThanEqual(sPrev, vec2(1.0)));
+                uvSurf = vec3(sPrev * pc.rect.zw - pc.fullUv.xy, s.z);
+            } else {
+                uvSurf = vec3(rectUv, s.z);
+            }
+        } else {
+            uvSurf = vec3(rectUv, s.z);
+        }
     } else {
         vec3 pSurf = PointAt(rectUv, s.z);
         uvSurf = ToLastWithMotion(pSurf, rectUv, inSurf);
@@ -105,25 +169,24 @@ void main() {
     vec4 history = mix(hs.value, hv.value, vShare);
     vec4 hm = mix(hs.moments, hv.moments, vShare);
 
-    // history length cap by roughness; anti-lag against this frame's 3 x 3 neighbourhood
+    // history length cap by roughness; un-premultiplied Tame history clamp + anti-lag against this frame's 3 x 3 neighbourhood
     float maxN = mix(pc.params3.y, pc.params.x, smoothstep(MirrorRoughness, 0.25, s.roughness));
     float n = min(hm.y + 1.0, maxN);
-    vec4 m1 = vec4(0.0), m2 = vec4(0.0);
-    float c = 0.0;
-    for (int y = -1; y <= 1; y++)
-        for (int x = -1; x <= 1; x++) {
-            ivec2 q = clamp(px + ivec2(x, y), ivec2(0), max(ACTIVE_GRID - 1, ivec2(0)));
-            if (Fetch(t_ray, q).x <= 0.0) continue;
-            vec4 v = Fetch(t_signal, q);
-            if (!Finite(v)) continue;
-            m1 += v; m2 += v * v; c += 1.0;
-        }
     m1 /= max(c, 1.0); m2 /= max(c, 1.0);
     vec4 sigma = sqrt(max(m2 - m1 * m1, vec4(0.0)));
-    // UNOFFICIAL 2026-11-08 (perf-reflfix4) MirrorJitter: a mirror pixel's history (only reached with MirrorJitter: MirrorRoughness 0) is
-    // clipped into this frame's 3 x 3 neighbourhood, mean +- 1.25 sigma (TAA's variance clip): the jittered samples' area average stays,
-    // what moved is cut at once (the RT test host's mirroraa scene: motion's extra error 0.0024 -> 0.0019, the stair-steps gone)
-    if (s.roughness < 0.03) history = clamp(history, m1 - 1.25 * sigma, m1 + 1.25 * sigma);
+    if (cCount > 0.5 && history.a > 1.0e-4) {
+        vec3 cMean = cM1 / cCount;
+        vec3 cSigma = sqrt(max(cM2 / cCount - cMean * cMean, vec3(0.0)));
+        vec3 histC = max(history.rgb / history.a, vec3(0.0));
+        if (s.roughness < 0.03) histC = clamp(histC, max(cMean - 1.25 * cSigma, vec3(0.0)), cMean + 1.25 * cSigma);
+        float hl = dot(histC, lumaW);
+        float maxTameL = 16.0 / 17.0;
+        if (hl > maxTameL) histC *= maxTameL / hl;
+        float histA = s.roughness < 0.03 ? clamp(history.a, aMin, aMax) : history.a;
+        history = vec4(histC * histA, histA);
+    } else {
+        history = vec4(0.0);
+    }
     float stray = luma(abs(history - m1).rgb), allowed = pc.params3.x * luma(sigma.rgb) + 0.05 * luma(m1.rgb) + 0.01;
     if (stray > allowed) n = max(1.0, n * allowed / stray);
     float a = 1.0 / n;

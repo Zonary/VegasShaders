@@ -148,7 +148,7 @@ void main() {
     float rtInstance = -1.0;
     bool rtOpen = false;   // a ray went the whole Distance without a hit
     if (abs(RtDebugView - 3.0) < 0.5) { sum = vec3(0.0); confidence = 0.0; }   // RT DebugView 3: the screen march's answer dropped
-    float rtFade = RtFade(roughness);
+    float rtFade = weaponRay ? 1.0 : RtFade(roughness);
     if (rayCast && hitData.x >= 0.0 && RtDebugView < 4.5) {
         float missing = (1.0 - confidence) * rtFade;
         if (hitData.x > 0.0) {

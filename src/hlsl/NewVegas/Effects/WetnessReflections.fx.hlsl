@@ -27,6 +27,8 @@ sampler2D TESR_NormalsBuffer : register(s2) = sampler_state { ADDRESSU = CLAMP; 
 // UNOFFICIAL 2026-11-18 DeferredBumpedNormals: no texture slot of its own; WetnessReflectionsEffect::BindShadingNormals sets it every frame
 // (the shading normals, or TESR_NormalsBuffer while the switch is off). s3 is the wetness include's ortho / puddle map.
 sampler2D NVR_WetShadingNormals : register(s4) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
+// UNOFFICIAL 2026-11-20: exclude the 1st-person viewmodel from standalone wetness SSR (both origin and hit).
+sampler2D TESR_DepthBufferViewModel : register(s5) = sampler_state { ADDRESSU = CLAMP; ADDRESSV = CLAMP; MAGFILTER = POINT; MINFILTER = POINT; MIPFILTER = NONE; };
 
 #include "Includes/Helpers.hlsl"
 #include "Includes/Depth.hlsl"
@@ -117,10 +119,17 @@ float2 RayUV(float3 q, out bool onScreen)
 	return screenToRect(s);
 }
 
+bool IsWeapon(float2 uv)
+{
+	float vm = tex2Dlod(TESR_DepthBufferViewModel, float4(uv, 0.0f, 0.0f)).x;
+	return TESR_DepthConstants.z == 0.0f ? vm < 0.99999f : vm > 0.0f;
+}
+
 float4 WetReflections(VSOUT IN) : COLOR0
 {
 	float2 uv = IN.UVCoord;
 	float4 scene = tex2Dlod(TESR_RenderedBuffer, float4(uv, 0.0f, 0.0f));
+	if (IsWeapon(uv)) return Result(scene, 0.0f, 0.0f);
 
 	// The surface: view-space position and normal, world-space (camera-relative) for the wetness.
 	float2 s01 = rectToScreen(uv);
@@ -204,8 +213,8 @@ float4 WetReflections(VSOUT IN) : COLOR0
 		prevT = t;
 	}
 	if (hitT < 0.0f) return Result(scene, gloss, 0.0f);
-	// A hit on the sky (nothing there) is the sky the forward shaders already reflected.
-	if (tex2Dlod(TESR_DepthBuffer, float4(hitUV, 0.0f, 0.0f)).x >= 0.999f) return Result(scene, gloss, 0.0f);
+	// A hit on the sky (nothing there) or the 1st-person viewmodel is not a valid world reflection.
+	if (tex2Dlod(TESR_DepthBuffer, float4(hitUV, 0.0f, 0.0f)).x >= 0.999f || IsWeapon(hitUV)) return Result(scene, gloss, 0.0f);
 
 	// Confidence: away from the screen's edges, over the ray's length, and the ray's facing.
 	float2 hitS = rectToScreen(hitUV);

@@ -57,6 +57,7 @@
 #include "../../core/GameShaderPairs.h"	// UNOFFICIAL 2026-11-13 GameShaderPairCheck / GameShaderPairRepair: a pixel shader drawn with a vertex shader that does not feed it
 #include "../../core/EnvLightFade.h"	// UNOFFICIAL 2026-11-04 the env-map light fade per pixel
 #include "../../core/ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion: what moved, noted as the main list draws it
+#include "../../core/ViewModelMotion.h"	// UNOFFICIAL 2026-11-21 ViewModelMotion: 1st-person sub-pixel jitter & UV motion vectors
 #include "../../core/FoldHighlights.h"	// UNOFFICIAL 2026-10-21 FoldHighlights: several-pass objects draw their highlights with their lamps' light
 #include "../../core/FoldFog.h"	// UNOFFICIAL 2026-10-27 FoldFog: env-mapped objects fog in their lit pass, no fog pass
 #include "../../core/NewGrass.h"	// UNOFFICIAL 2026-10-18 NewGrass: blade geometry in place of the early grass card draws (GrassFirst)
@@ -103,6 +104,52 @@ static void EndPreSceneTimer() {
 	if (!PreSceneTimerActive) return;
 	PreSceneTimer.End();
 	PreSceneTimerActive = false;
+}
+
+// UNOFFICIAL 2026-11-21: per-draw 3D menu isolation around TESMain::DrawWorldMenu3D (0x008703BC -> 0x00872940).
+static UInt32 gMenu3DTarget = 0;
+static UInt32 gMenu3DReturn = 0;
+static volatile LONG gMenu3DDepth = 0;
+
+static __declspec(naked) void DrawWorldMenu3DCallHook() {
+	__asm {
+		pop     dword ptr [gMenu3DReturn]
+		inc     dword ptr [gMenu3DDepth]
+		call    dword ptr [gMenu3DTarget]
+		dec     dword ptr [gMenu3DDepth]
+		jmp     dword ptr [gMenu3DReturn]
+	}
+}
+
+void InstallMenu3DGuardHook() {
+	constexpr UInt32 site = 0x008703BC;
+	constexpr UInt32 expected = 0x00872940;
+	const UInt8* code = (const UInt8*)site;
+	if (code[0] != 0xE8) {
+		Logger::Log("UNOFFICIAL Menu3DGuard: %08X is not a call instruction (byte %02X); fallback active", site, code[0]);
+		return;
+	}
+	const UInt32 target = site + 5 + *(const SInt32*)(site + 1);
+	if (target != expected) {
+		if (CpuSplit::InExe(target)) {
+			Logger::Log("UNOFFICIAL Menu3DGuard: %08X calls %08X inside the game (expected %08X); fallback active", site, target, expected);
+			return;
+		}
+		MEMORY_BASIC_INFORMATION mbi = {};
+		const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+		if (!VirtualQuery((LPCVOID)target, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || !(mbi.Protect & exec)) {
+			Logger::Log("UNOFFICIAL Menu3DGuard: %08X target %08X is not executable; fallback active", site, target);
+			return;
+		}
+		char mod[MAX_PATH];
+		CpuSplit::ModuleName(target, mod, sizeof(mod));
+		Logger::Log("UNOFFICIAL Menu3DGuard: chaining %08X via %s (%08X)", site, mod, target);
+	}
+	gMenu3DTarget = target;
+	ReplaceCall(site, (SIZE_T)&DrawWorldMenu3DCallHook);
+	FlushInstructionCache(GetCurrentProcess(), (LPCVOID)site, 5);
+	Menu3DGuardInstalled = true;
+	Logger::Log("UNOFFICIAL Menu3DGuard: hooked TESMain::DrawWorldMenu3D (%08X -> %08X)", site, target);
 }
 
 // ---- F10: the game's own draws split by shader family; first shader uses; shader-bind cost ----
@@ -802,6 +849,8 @@ void __fastcall RenderHook(Main* This, UInt32 edx, BSRenderedTexture* RenderedTe
 		if (MergeCopies::BeginFrame(TheRenderManager->device)) CapturedNormals::Hook(TheRenderManager->device);
 	}
 	ObjectMotion::BeginFrame();	// UNOFFICIAL 2026-10-29 ObjectMotion
+	ViewModelMotion::BeginFrame();	// UNOFFICIAL 2026-11-21 ViewModelMotion
+	GrassShaders::CheckTstg(TheRenderManager->device);	// UNOFFICIAL 2026-11-21 TSTG c248-c249 guard
 	// UNOFFICIAL 2026-10-30 [Main.Main.Performance] NvrDxvkMixCheck (core/MixCheck.h): the setup line at the first frame; with the check on
 	// (read at launch) its device hooks go in after LinearScene's and CapturedNormals' (theirs run inside them).
 	MixCheck::BeginFrame(TheRenderManager->device, TheShaderManager->Effects.ShadowsExteriors && TheShaderManager->Effects.ShadowsExteriors->Settings.ShadowMaps.MSAA);
@@ -2684,6 +2733,7 @@ namespace GrassFirst {
 	static const unsigned char kStageStates[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 22, 23, 24, 26, 27, 28, 32 };
 	struct Snapshot {
 		bool constants = false;
+		bool clothNonZero = false, clothGrass = false;
 		float vs[256][4], ps[224][4];
 		DWORD rs[sizeof(kRenderStates)];
 		DWORD ss[16][14];
@@ -2699,6 +2749,8 @@ namespace GrassFirst {
 		NiDX9RenderState* state = TheRenderManager->renderState;
 		Saved.constants = (RestoreMask & 1) && SUCCEEDED(device->GetVertexShaderConstantF(0, &Saved.vs[0][0], 256)) &&
 			SUCCEEDED(device->GetPixelShaderConstantF(0, &Saved.ps[0][0], 224));
+		Saved.clothNonZero = ClothWind::NonZeroSent;
+		Saved.clothGrass = ClothWind::GrassInC248;
 		if (RestoreMask & 2) for (unsigned i = 0; i < sizeof(kRenderStates); i++) Saved.rs[i] = state->GetRenderState((D3DRENDERSTATETYPE)kRenderStates[i]);
 		if (RestoreMask & 4) for (DWORD s = 0; s < 16; s++) for (DWORD t = 1; t < 14; t++) {
 			DWORD v = 0;
@@ -2715,6 +2767,7 @@ namespace GrassFirst {
 		NiDX9RenderState* state = TheRenderManager->renderState;
 		if (Saved.constants) {
 			device->SetVertexShaderConstantF(0, &Saved.vs[0][0], 256);
+			ClothWind::OnVSConstantsRestored(Saved.vs[248], Saved.clothNonZero, Saved.clothGrass);
 			device->SetPixelShaderConstantF(0, &Saved.ps[0][0], 224);
 		}
 		if (RestoreMask & 2) for (unsigned i = 0; i < sizeof(kRenderStates); i++) {
@@ -3077,7 +3130,7 @@ namespace GrassFirst {
 		// UNOFFICIAL 2026-10-31 DeferredLamps (core/DeferredLamps.h): declared between LinearSpan and the CaptureSpans, so its end runs after
 		// CapturedNormals::EndSpan (the G-buffer resolved) and before LinearScene::EndSpan (the encode): the lamps of the deferred pixels.
 		struct DeferredSpan { bool on; DeferredSpan() : on(ShaderSplit::CurrentContext == ShaderSplit::World) {}
-			~DeferredSpan() { if (on) { DeferredDepth::AtSpanEnd(TheRenderManager->device); DeferredRenderer::AtSpanEnd(TheRenderManager->device); DeferredSkin::BeforePasses(TheRenderManager->device); DeferredSun::Apply(TheRenderManager->device); DeferredLamps::Apply(TheRenderManager->device); FlashlightDeferred::Apply(TheRenderManager->device); DeferredSkin::AfterPasses(TheRenderManager->device); } } } deferredSpan;	// UNOFFICIAL 2026-11-04 + the deferred flashlight
+			~DeferredSpan() { if (on) { IDirect3DDevice9* dev = TheRenderManager->device; DeferredDepth::AtSpanEnd(dev); DeferredRenderer::AtSpanEnd(dev); DeferredSkin::BeforePasses(dev); DeferredSun::Apply(dev); DeferredLamps::Apply(dev); FlashlightDeferred::Apply(dev); DeferredSkin::AfterPasses(dev); if (DeferredDepth::SharedWithWorld && DeferredDepth::Ready() && CapturedNormals::Hooked) { SharedDrawState::DepthWrittenSinceCopy = false; SharedDrawState::WatchingDepth = true; } } } } deferredSpan;	// UNOFFICIAL 2026-11-04 + the deferred flashlight
 		ActiveAccumulator = nullptr;
 		// UNOFFICIAL 2026-10-28 CapturedNormals (core/CapturedNormals.h): the normal target bound around the game's own call only (the early
 		// grass part above it draws grass and the grass shadows, which write none).
@@ -3710,13 +3763,15 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 				VertexShader && VertexShader->Name ? VertexShader->Name : "?", PixelShader->Name);
 		}
 	}
-	// UNOFFICIAL 2026-11-09 [Shaders.PBR.Main] GameShadersInMenus (open report: "PBR Shader makes CharGen menu dark and eyes of default races black"):
-	// the rule above covers SKIN* only, so the menu's hair, eyes, teeth and clothes still drew with the mod's object shaders, which take the
-	// WORLD's data: the sun shadow at a position rebuilt with the world camera, the frame's lamp table (built from the world scene's lights:
-	// the menu's own lights are not in it, ManyLamps skips them), ambient and light scales made for a frame the tone chain finishes. While
-	// the character creation / face menu is open, everything it draws outside the world scene takes the game's own shaders, as a pair
-	// (as GameShadersInReflections above). Other 'Outside' pictures (a scope lens) keep the mod's.
-	if (GameShadersInMenus && ShaderSplit::NotAPass() && TheShaderManager->GameState.FaceMenuIsOn) {
+	// UNOFFICIAL 2026-11-09 [Shaders.PBR.Main] GameShadersInMenus (generalized 2026-11-21 across all 3D menus & minigames):
+	// 3D menus (Blackjack, Roulette, SlotMachine, Caravan, Lockpick, Surgery, RaceSex, CharGen, Terminals, etc.) draw with their
+	// own camera and menu-local lights outside the world scene (Menu3DGuard::Depth > 0 or Outside while in Menu Mode, Pip-Boy excluded).
+	// NVR's shaders use the world's lamp table, sun shadow and linear lighting, turning 3D menu meshes dark or black. Everything
+	// drawn in a 3D menu takes the game's own shaders as a pair, while the world behind live/transparent menus keeps full PBR/Deferred.
+	const bool inMenu3D = gMenu3DDepth > 0 ||
+		(ShaderSplit::CurrentContext == ShaderSplit::Outside && InterfaceManager &&
+		 InterfaceManager->currentMode != 1 && !InterfaceManager->IsPipBoyOpen());
+	if (GameShadersInMenus && inMenu3D) {
 		const bool nvrPixel = PixelShader && PixelShader->ShaderHandleBackup && PixelShader->ShaderHandle != PixelShader->ShaderHandleBackup;
 		const bool nvrVertex = VertexShader && VertexShader->ShaderHandleBackup && VertexShader->ShaderHandle != VertexShader->ShaderHandleBackup;
 		if (nvrPixel) PixelShader->ShaderHandle = (IDirect3DPixelShader9*)PixelShader->ShaderHandleBackup;
@@ -3724,8 +3779,9 @@ void __fastcall SetShadersHook(BSShader* This, UInt32 edx, UInt32 PassIndex) {
 		static bool announcedMenu = false;
 		if ((nvrPixel || nvrVertex) && !announcedMenu) {
 			announcedMenu = true;
-			Logger::Log("UNOFFICIAL GameShadersInMenus: the character creation menu's 3D view is drawn with the game's own shaders (first: %s + %s)",
-				VertexShader && VertexShader->Name ? VertexShader->Name : "?", PixelShader && PixelShader->Name ? PixelShader->Name : "?");
+			Logger::Log("UNOFFICIAL GameShadersInMenus: 3D menu view drawn with the game's own shaders (first: %s + %s, context %u, menu3D %ld, top menu 0x%X)",
+				VertexShader && VertexShader->Name ? VertexShader->Name : "?", PixelShader && PixelShader->Name ? PixelShader->Name : "?",
+				(unsigned)ShaderSplit::CurrentContext, (long)gMenu3DDepth, InterfaceManager ? (unsigned)InterfaceManager->menuStack[0] : 0u);
 		}
 	}
 	// UNOFFICIAL 2026-11-12 [Main.Main.Scope] KeepOverlayBlack (core/ScopeOverlay.h; user: "the game's base scope texture seems to get lightened by
@@ -4410,14 +4466,12 @@ static bool MaterialWFor(const void* Pass, float& w, bool inSpan) {
 static void ForwardShadowsForPass(void* Pass) {
 	// UNOFFICIAL 2026-11-04 the flashlight's game lamp for this draw (core/FlashlightLamp.h), first: everything below reads the lamps' dimmers
 	FlashlightLamp::ForPass(Pass, ShaderSplit::CurrentContext == ShaderSplit::World && CapturedNormals::InSpan);
-	EnvLightFade::ForPass(Pass);	// UNOFFICIAL 2026-11-04 (after it: the game reads that lamp's dimmer for the fade too)
+	EnvLightFade::ForPass(Pass, ShaderSplit::CurrentContext == ShaderSplit::FirstPerson);	// UNOFFICIAL 2026-11-04/20 (1st-person kLightingOffset + multi-lamp crossblend)
 	if (ShaderSplit::CurrentContext == ShaderSplit::FirstPerson) ShadowManager::ViewModelLogDraw(((const PointShadowForward::RenderPassView*)Pass)->geometry);	// UNOFFICIAL 2026-11-04 CharacterShadowMapLog
 	if (ShaderSplit::CurrentContext == ShaderSplit::World) MaterialForPass(Pass);	// UNOFFICIAL 2026-10-29 MaterialBuffer
-	// UNOFFICIAL 2026-11-12 (ptbump) the first-person model's records (PTViewModel's span) took whatever the last world draw had sent: with the
-	// no-highlight code in that value a gun could come out matte by chance. While the code is in use, its own class, radius and flag.
-	// (2026-11-15 DeferredFirstPerson) and always while the view model draws deferred records: their shading model in the G-buffer comes from this
-	// class (GBufferV2), and a world draw's left over (land, a plant) would send the gun through the wrong light model
-	else if (ShaderSplit::CurrentContext == ShaderSplit::FirstPerson && CapturedNormals::VmSpan && ((CapturedNormals::NoHighlightFlag && CapturedNormals::PtCodesCompiled) || CapturedNormals::VmDeferred)) MaterialForPass(Pass);
+	// UNOFFICIAL 2026-11-12/20: always send the 1st-person viewmodel's own material class whenever VmSpan is open so G-buffer v2 records
+	// never inherit the last world draw's class (e.g. land or plant) and Reflections / ShadingNormals read accurate weapon materials.
+	else if (ShaderSplit::CurrentContext == ShaderSplit::FirstPerson && CapturedNormals::VmSpan) MaterialForPass(Pass);
 	// UNOFFICIAL 2026-11-04 ForwardCloudShadows: this draw's strength (0 for plants with PlantShadows off; 2026-11-16 fast-restart: always sent,
 	// 0 while off, since every outdoor record has the lookup; the plant test only while on)
 	ForwardCloudShadows::ForPass(TheRenderManager->device, ForwardCloudShadows::Active && !ForwardCloudShadows::PlantShadows && PlantPass(((const PointShadowForward::RenderPassView*)Pass)->geometry),
@@ -4896,6 +4950,7 @@ namespace MaterialDraw {
 		if (c.firstPerson) WeaponMask::DrawBegin(device, c.pass ? c.pass->geometry : nullptr, weaponTag);
 		GearWeather::DrawState gearTag;	// UNOFFICIAL 2026-11-15 GearWeather (core/GearWeather.h): the part's id into the stencil's low bits
 		if (c.firstPerson) GearWeather::DrawBegin(device, c.pass ? c.pass->geometry : nullptr, weaponTag.tagged, gearTag);
+		if (c.firstPerson && ViewModelMotion::InFirstPerson) ViewModelMotion::NoteDraw(device, c.pass ? c.pass->geometry : nullptr, true);
 		PartitionNext[Site](renderer, edx, buffer, partition, unused);
 		GearWeather::DrawEnd(device, gearTag);
 		WeaponMask::DrawEnd(device, weaponTag);
@@ -4912,6 +4967,7 @@ namespace MaterialDraw {
 		if (c.firstPerson) WeaponMask::DrawBegin(device, geometry, weaponTag);
 		GearWeather::DrawState gearTag;	// UNOFFICIAL 2026-11-15 GearWeather (core/GearWeather.h): the part's id into the stencil's low bits
 		if (c.firstPerson) GearWeather::DrawBegin(device, geometry, weaponTag.tagged, gearTag);
+		if (c.firstPerson && ViewModelMotion::InFirstPerson) ViewModelMotion::NoteDraw(device, geometry, false);
 		StillNext[Slot](renderer, edx, geometry);
 		GearWeather::DrawEnd(device, gearTag);
 		WeaponMask::DrawEnd(device, weaponTag);
@@ -4924,10 +4980,11 @@ namespace MaterialDraw {
 
 // After the cloth / Pip-Boy fit hooks (Hooks.cpp): ours on top, calling on theirs
 void InstallMaterialDrawHooks() {
+	ViewModelMotion::InstallCameraHook();	// UNOFFICIAL 2026-11-21: 1st-person jitter & exact camera snapshot inside RenderFirstPerson
 	const bool rtActors = TheSettingManager->GetSettingI("Main.Main.RayTracing", "Actors") != 0;
 	// UNOFFICIAL 2026-11-09 WeaponMask: the RT weapon reflections tag the weapon's draws through these hooks too
 	const bool rtWeapon = TheSettingManager->GetSettingI("Shaders.Reflections.RT", "Enabled") != 0 && TheSettingManager->GetSettingF("Shaders.Reflections.RT", "Weapon") > 0.0f;
-	if (!ReflMaterial::CompiledIn() && !rtActors && !rtWeapon && !GearWeather::WantedAtStartup()) return;	// (2026-11-15 + GearWeather's part ids)
+	if (!ReflMaterial::CompiledIn() && !rtActors && !rtWeapon && !GearWeather::WantedAtStartup() && !ViewModelMotion::WantedAtStartup()) return;	// (2026-11-15 + GearWeather + ViewModelMotion)
 	static const UInt32 kSites[2] = { 0x00B992E3, 0x00B99339 };
 	const bool callsThere = *(const UInt8*)kSites[0] == 0xE8 && *(const UInt8*)kSites[1] == 0xE8;
 	if (callsThere) {
@@ -5339,6 +5396,10 @@ static void ResolveViewModelDepth() {
 	TheRenderManager->ResolveDepthBuffer(TheTextureManager->DepthTextureViewModel);
 }
 void __fastcall RenderWorldSceneGraphHook(Main* This, UInt32 edx, Sun* SkySun, UInt8 IsFirstPerson, UInt8 WireFrame, UInt8 Arg4) {
+	if (gMenu3DDepth > 0) {
+		RenderWorldSceneGraph(This, SkySun, IsFirstPerson, WireFrame, Arg4);
+		return;
+	}
 	SessionLog::StageScope stage("the world");
 	EndPreSceneTimer();
 	WorldRenderedThisFrame = true;
@@ -5381,7 +5442,8 @@ void __fastcall RenderWorldSceneGraphHook(Main* This, UInt32 edx, Sun* SkySun, U
 		ReflMaterial::BeginWorld(TheRenderManager->renderState, TheRenderManager->device, ReflMaterial::CompiledIn() && TheSettingManager->GetSettingI("Shaders.Reflections.Main", "MaterialAware") > 0);
 		// UNOFFICIAL 2026-11-03 SmoothCutouts (core/AlphaHash.h): alpha-tested objects hashed while TAA / FSR / DLSS jitter this scene.
 		UINT ahW = 0, ahH = 0; D3DXVECTOR2 ahJitter(0.0f, 0.0f);	// (2026-11-16 HashStyle auto: an upscaler resolves this scene)
-		AlphaHash::BeginWorld(TheRenderManager->device, FrameWorldCalls == 1, TAA && TAA->IsJitterActive(), TAA ? TAA->WorldMipBias() : 0.0f, TAAEffect::WorldDrawnSmall(ahW, ahH, ahJitter));	// (2026-11-16 FarCoverage: + the mip bias)
+		const bool ahUpscaler = TAA && (TAAEffect::WorldDrawnSmall(ahW, ahH, ahJitter) || TAA->UsesUpscaler());
+		AlphaHash::BeginWorld(TheRenderManager->device, FrameWorldCalls == 1, TAA && TAA->IsJitterActive(), TAA ? TAA->WorldMipBias() : 0.0f, ahUpscaler);	// (2026-11-16 FarCoverage: + the mip bias)
 		RenderWorldSceneGraph(This, SkySun, IsFirstPerson, WireFrame, Arg4);
 		AlphaHash::EndWorld(TheRenderManager->device);
 		ReflMaterial::EndWorld(TheRenderManager->renderState, TheRenderManager->device);
@@ -5415,11 +5477,14 @@ void __fastcall RenderWorldSceneGraphHook(Main* This, UInt32 edx, Sun* SkySun, U
 
 	static GpuTimer depthResolveTimer("Depth resolves");
 	GpuProfileScope gpuResolve(depthResolveTimer, TheRenderManager->device);
+	const bool depthFresh = FrameWorldCalls == 1 && DeferredDepth::SharedWithWorld && DeferredDepth::Ready() &&
+		CapturedNormals::Hooked && !SharedDrawState::DepthWrittenSinceCopy && !TAAEffect::UpscaledBeforeEffects();
+	SharedDrawState::WatchingDepth = false;
 	if (!pipboyOpen || pipboyLive) {
 		// UNOFFICIAL 2026-11-04 SkyCoverage (core/SkyCoverage.h): with the game's MSAA, each pixel's sky share from the world's depth samples,
 		// after every world draw (the distant land and objects come after the main list) and before the resolve below.
 		if (FrameWorldCalls == 1) SkyCoverage::Draw(TheRenderManager->device);
-		TheRenderManager->ResolveDepthBuffer(TheTextureManager->DepthTexture);	// the world buffer is left alone while the Pip-Boy is out
+		if (!depthFresh) TheRenderManager->ResolveDepthBuffer(TheTextureManager->DepthTexture);	// the world buffer is left alone while the Pip-Boy is out
 		// UNOFFICIAL 2026-10-30 ReactiveMask (core/ReactiveMask.h): what was drawn over the main list, now that this frame's world depth is
 		// readable (before the first-person weapon and the RenderScale v2 upscale; a v1 upscale has read FSR's inputs already)
 		if (FrameWorldCalls == 1) ReactiveMask::Build(TheRenderManager->device);
@@ -5437,6 +5502,10 @@ void __fastcall RenderWorldSceneGraphHook(Main* This, UInt32 edx, Sun* SkySun, U
 using RenderFirstPersonMethod = void(__thiscall*)(Main*, NiDX9Renderer*, NiGeometry*, Sun*, BSRenderedTexture*);
 RenderFirstPersonMethod RenderFirstPerson = reinterpret_cast<RenderFirstPersonMethod>(Hooks::RenderFirstPerson);
 void __fastcall RenderFirstPersonHook(Main* This, UInt32 edx, NiDX9Renderer* Renderer, NiGeometry* Geo, Sun* SkySun, BSRenderedTexture* RenderedTexture) {
+	if (gMenu3DDepth > 0) {
+		RenderFirstPerson(This, Renderer, Geo, SkySun, RenderedTexture);
+		return;
+	}
 	SessionLog::StageScope stage("first person");
 	// Clear the depth buffer before rendering first person model to prevent clipping with world objects & other artefacts
 	static GpuTimer firstPersonTimer("First person (game)");
@@ -5483,13 +5552,63 @@ void __fastcall RenderFirstPersonHook(Main* This, UInt32 edx, NiDX9Renderer* Ren
 	// tracer to light it (core/CapturedNormals.h BeginViewModelSpan; nothing unless the path tracer asked for it this frame)
 	// UNOFFICIAL 2026-11-15 DeferredFirstPerson (core/DeferredFirstPerson.h; off: nothing): the same span for the deferred renderer's view model
 	DeferredFirstPerson::Begin(TheRenderManager->device, This->camera, viewModelShadows, nativeLayer);	// (fd-batch8: forward while FirstPersonNativeScale's layer takes the pass)
+	// UNOFFICIAL 2026-11-20: keep forward 1st-person multi-pass light/specular sums in linear light (same as the world main list),
+	// eliminating gamma-space additive ONLY_SPECULAR desaturation and 1-pass vs multi-pass brightness snaps when crossing light boundaries.
+	const bool fpLinear = !DeferredFirstPerson::Decided;
+	if (fpLinear) LinearScene::BeginSpan(TheRenderManager->device);
 	CapturedNormals::BeginViewModelSpan(TheRenderManager->device);
 	DeferredFirstPerson::SpanOpened(TheRenderManager->device);
-	// UNOFFICIAL 2026-11-07 perf-mirrorfix: the arms and gun write their own alpha over the world's materials (core/ReflMaterial.h)
-	ReflMaterial::BeginFirstPerson(TheRenderManager->renderState, TheRenderManager->device, ReflMaterial::CompiledIn() && TheSettingManager->GetSettingI("Shaders.Reflections.Main", "MaterialAware") > 0);
+	// UNOFFICIAL 2026-11-07/20 perf-mirrorfix: the arms and gun write their own alpha over the world's materials (core/ReflMaterial.h);
+	// only subtract last frame's reflection coverage from the gun's env map when RT weapon reflections are actually active.
+	ReflectionsEffect* reflEff = TheShaderManager->Effects.Reflections;
+	ReflMaterial::BeginFirstPerson(TheRenderManager->renderState, TheRenderManager->device,
+		ReflMaterial::CompiledIn() && TheSettingManager->GetSettingI("Shaders.Reflections.Main", "MaterialAware") > 0,
+		reflEff && reflEff->RtWeaponActive());
+	{
+		bool vmCapture = false, vmJitter = false;
+		float vmJx = 0.0f, vmJy = 0.0f;
+		UINT vmW = 0, vmH = 0;
+		if (TAAEffect* taa = TheShaderManager->Effects.TAA) taa->GetViewModelAAState(vmCapture, vmJitter, vmJx, vmJy, vmW, vmH);
+		ViewModelMotion::BeginPass(TheRenderManager->device, nativeLayer, vmCapture, vmJitter, vmJx, vmJy, vmW, vmH);
+	}
+	bool swappedFpInvProj = false;
+	D3DXMATRIX savedInvProj;
+	if (This && This->camera && TheRenderManager && TheRenderManager->device) {
+		const NiFrustum& f = This->camera->Frustum;
+		const float width = f.Right - f.Left, height = f.Top - f.Bottom;
+		if (!f.Ortho && width > 1.0e-6f && height > 1.0e-6f && f.Near > 0.0f && f.Far > f.Near) {
+			const bool reversed = NiDX9Renderer::GetSingleton()->m_fZClear < 1.0f;
+			const float step = 1.0f / (f.Far - f.Near);
+			const float zTerm = reversed ? -(f.Near * step) : f.Far * step;
+			const float wTerm = reversed ? f.Near * f.Far * step : -(f.Near * f.Far * step);
+			D3DXMATRIX fpProj(
+				2.0f / width, 0.0f, 0.0f, 0.0f,
+				0.0f, 2.0f / height, 0.0f, 0.0f,
+				-(f.Right + f.Left) / width, -(f.Top + f.Bottom) / height, zTerm, 1.0f,
+				0.0f, 0.0f, wTerm, 0.0f);
+			D3DXMATRIX fpInvProj;
+			if (D3DXMatrixInverse(&fpInvProj, nullptr, &fpProj)) {
+				savedInvProj = TheRenderManager->InvProjMatrix;
+				TheRenderManager->InvProjMatrix = fpInvProj;
+				// Upload directly to VS SHADOW_INVPROJ_REG slots (c100 default, c240 ObjectTemplate/SkinTemplate/SM3003-4)
+				// so an already-bound vertex shader whose SetCT() is skipped (BoundHandle == ShaderHandle) gets fpInvProj immediately.
+				TheRenderManager->device->SetVertexShaderConstantF(100, (const float*)&fpInvProj, 4);
+				TheRenderManager->device->SetVertexShaderConstantF(240, (const float*)&fpInvProj, 4);
+				swappedFpInvProj = true;
+			}
+		}
+	}
+	if (TheRenderManager) ClothWind::ForceZero(TheRenderManager->device);
 	RenderFirstPerson(This, Renderer, Geo, SkySun, RenderedTexture);
+	if (swappedFpInvProj) {
+		TheRenderManager->InvProjMatrix = savedInvProj;
+		TheRenderManager->device->SetVertexShaderConstantF(100, (const float*)&savedInvProj, 4);
+		TheRenderManager->device->SetVertexShaderConstantF(240, (const float*)&savedInvProj, 4);
+	}
+	ViewModelMotion::EndCapture();
 	ReflMaterial::EndFirstPerson(TheRenderManager->renderState, TheRenderManager->device);
 	CapturedNormals::EndViewModelSpan(TheRenderManager->device, TheFrameRateManager->FrameNumber);
+	if (fpLinear) LinearScene::EndSpan(TheRenderManager->device);
 	DeferredFirstPerson::End(TheRenderManager->device);	// UNOFFICIAL 2026-11-15: the gear's weather and the light passes on the view model (before its sun map's constants go back)
 	PbrPop::ActorPasses::FirstPersonNow = 0;
 	WeaponMask::End(TheRenderManager->device, TheFrameRateManager->FrameNumber);	// UNOFFICIAL 2026-11-09: the stencil's tags into TESR_WeaponMask (core/WeaponMask.h)
@@ -5507,6 +5626,11 @@ void __fastcall RenderFirstPersonHook(Main* This, UInt32 edx, NiDX9Renderer* Ren
 	ShaderSplit::EndContext();
 	FirstPersonNative::End();	// UNOFFICIAL 2026-11-13 FirstPersonNativeScale: coverage into the layer's alpha, the scene target back, depth cleared
 	ResolveViewModelDepth();
+	if (ViewModelMotion::CaptureWanted) {
+		static GpuTimer vmMotionTimer("Viewmodel motion");
+		GpuProfileScope gpuVm(vmMotionTimer, TheRenderManager->device);
+		ViewModelMotion::Render(TheRenderManager->device, TheTextureManager->DepthTextureViewModel);
+	}
 	ViewModelDepthClearedFrames = 0;	// UNOFFICIAL: the next third-person frame resolves the cleared buffer again
 }
 
@@ -5659,7 +5783,7 @@ void __cdecl ProcessImageSpaceShadersHook(NiDX9Renderer* Renderer, BSRenderedTex
 		FlushRenderScale(SourceTarget);
 		ProcessImageSpaceShaders(Renderer, SourceTarget, DestinationTarget);
 	};
-	if (LockPickMenu::GetSingleton() && InterfaceManager->IsActive(Menu::kMenuType_LockPick) && !TheSettingManager->GetSettingI("Main.Main.Misc", "LockpickEffects")) {
+	if (LockPickMenu::GetSingleton() && InterfaceManager->IsOpen(Menu::kMenuType_LockPick) && !TheSettingManager->GetSettingI("Main.Main.Misc", "LockpickEffects")) {
 		lockpickSkipToggle = false;
 		gameImageSpaceOnly();
 		return;

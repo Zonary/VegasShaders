@@ -15,6 +15,7 @@ layout(set = 1, binding = 6) uniform texture2D t_in1;
 layout(set = 1, binding = 7) uniform texture2D t_in2;
 layout(set = 1, binding = 8) uniform texture2D t_in3;
 layout(set = 1, binding = 9) uniform texture2D t_avg;      // the 8 x 8 average (1/8 size)
+layout(set = 1, binding = 10) uniform texture2D t_vmMotion; // TESR_ViewModelMotionBuffer (full size) or a stand-in
 
 layout(push_constant) uniform Push {
     mat4 reproject;     // camera-relative world now -> last frame's clip space (shifted by -lastJitter on CPU)
@@ -27,10 +28,11 @@ layout(push_constant) uniform Push {
     vec4 params2;       // x core, y debug view, z ours: blur radius (grid px at roughness 1), w ours: hit-distance share for contact
     vec4 params3;       // x ours: anti-lag sigma, y ours: max history at the mirror limit (frames), z ours: firefly clamp, w the frame (0-63)
     vec4 rect;          // xy curScale, zw lastScale (RenderRect sub-rect scales; 1, 1 when native)
-    vec4 activeSize;    // xy activeW, activeH (grid pixels drawn), z MirrorJitter code (0 off), w unused
+    vec4 activeSize;    // xy activeW, activeH (grid pixels drawn), z MirrorJitter code (0 off), w weaponFovScale
     uint linearIndex;   // LINEAR / CLAMP
     uint pointIndex;    // POINT / CLAMP
-    uint pad0, pad1;
+    uint vmMotionValid; // 1 = t_vmMotion holds ViewModelMotionBuffer
+    uint pad1;
 } pc;
 
 #define LINEAR_S NVR_SAMPLER(pc.linearIndex)
@@ -63,6 +65,11 @@ Surface SurfaceAt(ivec2 p) {
 vec3 PointAt(vec2 rectUv, float z) {
     vec2 s = (rectUv + pc.fullUv.xy) / max(pc.rect.xy, vec2(1.0e-4)) + pc.fullUv.zw;
     return (pc.forward.xyz + pc.right.xyz * (2.0 * s.x - 1.0) - pc.up.xyz * (2.0 * s.y - 1.0)) * z;
+}
+vec3 PointAtSurface(vec2 rectUv, float z, bool weapon) {
+    vec2 s = (rectUv + pc.fullUv.xy) / max(pc.rect.xy, vec2(1.0e-4)) + pc.fullUv.zw;
+    float invFov = (weapon && pc.activeSize.w > 1.0e-3) ? (1.0 / pc.activeSize.w) : 1.0;
+    return (pc.forward.xyz + (pc.right.xyz * (2.0 * s.x - 1.0) - pc.up.xyz * (2.0 * s.y - 1.0)) * invFov) * z;
 }
 // Camera-only reprojection into last frame's sub-rect grid UV; checks frustum bounds against normalized [0, 1] sPrev
 vec3 ToLast(vec3 p, out bool inFrustum) {

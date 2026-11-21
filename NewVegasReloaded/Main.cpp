@@ -141,6 +141,7 @@ extern "C" {
 			return;
 		case Msg::kMessage_PreLoadGame:
 			TheSettingManager->GameLoading = true;
+			if (TheShaderManager && TheShaderManager->Effects.WaterLens) TheShaderManager->Effects.WaterLens->Reset();
 			SessionLog::OnEvent("loading a save");	// UNOFFICIAL 2026-11-01 (SessionLog.h; the save's name and path are never logged)
 			return;
 		case Msg::kMessage_PostLoadGame: {
@@ -155,9 +156,11 @@ extern "C" {
 			SessionLog::OnEvent("game saved");
 			return;
 		case Msg::kMessage_NewGame:
+			if (TheShaderManager && TheShaderManager->Effects.WaterLens) TheShaderManager->Effects.WaterLens->Reset();
 			SessionLog::OnEvent("new game");
 			return;
 		case Msg::kMessage_ExitToMainMenu:
+			if (TheShaderManager && TheShaderManager->Effects.WaterLens) TheShaderManager->Effects.WaterLens->Reset();
 			SessionLog::OnEvent("exit to the main menu");
 			return;
 		// UNOFFICIAL 2026-11-07 (rt-shutdown): the RT helper's shutdown first (RtCore::Shutdown: no GPU wait left for a value it never

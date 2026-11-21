@@ -3,6 +3,7 @@
 #include "RegisterClash.h"	// UNOFFICIAL 2026-10-31
 #include "CapturedNormals.h"	// UNOFFICIAL 2026-10-28 CapturedNormals (TESR_CapturedNormalsData)
 #include "ObjectMotion.h"	// UNOFFICIAL 2026-10-29 ObjectMotion (TESR_ObjectMotionData)
+#include "ViewModelMotion.h"	// UNOFFICIAL 2026-11-21 ViewModelMotion (TESR_ViewModelMotionData)
 #include "TemporalBackbone.h"	// UNOFFICIAL 2026-11-01 the temporal backbone (TESR_FrameNoise, [Main.Main.Quality] SharedNoise)
 #include "AlphaHash.h"	// UNOFFICIAL 2026-11-03 SmoothCutouts (TESR_AlphaHash)
 #include "Diagnostics.h"	// UNOFFICIAL 2026-11-01 the report burst's VL stages (Diagnostics::VLCapturing)
@@ -218,6 +219,7 @@ void ShaderManager::Initialize() {
 		{ "TESR_AlbedoBufferData", &CapturedNormals::AlbedoData },	// UNOFFICIAL 2026-10-31 AlbedoBuffer
 		{ "TESR_BackDepthData", &BackDepth::Data },	// UNOFFICIAL 2026-10-31 BackDepth
 		{ "TESR_ObjectMotionData", &ObjectMotion::Data },	// UNOFFICIAL 2026-10-29 ObjectMotion
+		{ "TESR_ViewModelMotionData", &ViewModelMotion::Data },	// UNOFFICIAL 2026-11-21 ViewModelMotion
 		{ "TESR_FrameNoise", &TemporalBackbone::Constant },	// UNOFFICIAL 2026-11-01 the temporal backbone
 		{ "TESR_AlphaHash", &AlphaHash::Constant },	// UNOFFICIAL 2026-11-03 SmoothCutouts
 		{ "TESR_FogData", &sm->ShaderConst.fogData },
@@ -543,6 +545,7 @@ void ShaderManager::EndExtraCamera() {
 
 void ShaderManager::InitializeConstants() {
 	ShaderConst.pWeather = nullptr;	// no weather seen yet
+	if (Effects.WaterLens) Effects.WaterLens->Reset();	// UNOFFICIAL 2026-11-20: clear WaterLens state on save load / init
 
 	// x, y: one pixel in uv; z: the aspect ratio; w: kept for the field of view (0 until set).
 	const float w = (float)TheRenderManager->width, h = (float)TheRenderManager->height;
@@ -617,31 +620,33 @@ void ShaderManager::UpdateConstants() {
 	// Menus and overlays.
 	auto* const ui = InterfaceManager;
 	GameState.PipBoyIsOn = ui->IsPipBoyOpen();
-	GameState.VATSIsOn = ui->IsActive(Menu::kMenuType_VATS);
-	GameState.FaceMenuIsOn = ui->IsActive(Menu::kMenuType_RaceSex) || ui->IsActive(Menu::kMenuType_CharGen);	// UNOFFICIAL 2026-11-09 (GameShadersInMenus)
+	GameState.VATSIsOn = ui->IsOpen(Menu::kMenuType_VATS);
+	// UNOFFICIAL 2026-11-09 (GameShadersInMenus)
+	GameState.FaceMenuIsOn = ui->IsOpen(Menu::kMenuType_RaceSex) || ui->IsOpen(Menu::kMenuType_CharGen) || ui->IsOpen(Menu::kMenuType_Surgery);
 
-	// A game menu counts as open when it is active and, if the live menu API is there, paused.
+	// A game menu counts as open when it is on the stack and, if the live menu API is there, paused.
 	const bool hasLiveMenus = TheGameMenuManager->IsLiveMenu != nullptr;
 	auto menuPaused = [&](auto menuType) {
 		return !hasLiveMenus || TheGameMenuManager->IsLiveMenu(menuType, false, false) == GameMenuManager::MENU_PAUSED;
 	};
-	const bool terminalOpen = (ui->IsActive(Menu::kMenuType_Computers) && menuPaused(Menu::kMenuType_Computers)) ||
-		(ui->IsActive(Menu::kMenuType_Hacking) && menuPaused(Menu::kMenuType_Hacking));
-	const bool lockpickOpen = LockPickMenu::GetSingleton() && menuPaused(Menu::kMenuType_LockPick);
+	const bool terminalOpen = (ui->IsOpen(Menu::kMenuType_Computers) && menuPaused(Menu::kMenuType_Computers)) ||
+		(ui->IsOpen(Menu::kMenuType_Hacking) && menuPaused(Menu::kMenuType_Hacking));
+	const bool lockpickOpen = LockPickMenu::GetSingleton() && ui->IsOpen(Menu::kMenuType_LockPick) && menuPaused(Menu::kMenuType_LockPick);
 	// Full-screen game menus over a still world (the effects are skipped under them); asked in this order, first hit wins.
 	static const UInt32 overlayMenus[] = { Menu::kMenuType_Surgery, Menu::kMenuType_SlotMachine, Menu::kMenuType_Blackjack,
 		Menu::kMenuType_Roulette, Menu::kMenuType_Caravan };
 	bool overlay = terminalOpen || lockpickOpen;
-	for (UInt32 menu : overlayMenus) overlay = overlay || ui->IsActive(menu);
+	for (UInt32 menu : overlayMenus) overlay = overlay || ui->IsOpen(menu);
 	GameState.OverlayIsOn = overlay;
-	GameState.isDialog = ui->IsActive(Menu::kMenuType_Dialog);
-	GameState.isPersuasion = ui->IsActive(Menu::kMenuType_Persuasion);
-	// UNOFFICIAL 2026-11-01 LockpickEffects (user: the lock is black in the lockpick view; "it's pbr"): while the lockpick screen is open the
-	// objects are drawn with the game's own shaders, as the menu's PBR switch does (the lock is lit by the menu's own light, which NVR's
-	// object shaders do not light it with). Back as they were when it closes. LockpickEffects = true: as before.
+	GameState.isDialog = ui->IsOpen(Menu::kMenuType_Dialog);
+	GameState.isPersuasion = ui->IsOpen(Menu::kMenuType_Persuasion);
+	// UNOFFICIAL 2026-11-01 LockpickEffects (fallback only when per-draw 3D menu isolation in Render.cpp is unavailable/off):
+	// while GameShadersInMenus + Menu3DGuardInstalled handle Lockpick per-draw, the global Shaders.PBR list stays enabled so
+	// live-menu backgrounds keep PBR; if either is unavailable/off, fall back to disabling Shaders.PBR while Lockpick is open.
 	{
 		static bool pbrHeld = false;
-		const bool lockOpen = LockPickMenu::GetSingleton() && InterfaceManager->IsActive(Menu::kMenuType_LockPick) &&
+		const bool needPbrFallback = !GameShadersInMenus || !Menu3DGuardInstalled;
+		const bool lockOpen = needPbrFallback && LockPickMenu::GetSingleton() && ui->IsOpen(Menu::kMenuType_LockPick) &&
 			!TheSettingManager->GetSettingI("Main.Main.Misc", "LockpickEffects");
 		if (lockOpen != pbrHeld && Shaders.PBR && Shaders.PBR->Enabled) {
 			for (auto& ps : Shaders.PBR->PixelShaderList) ps->Enabled = !lockOpen;
@@ -2379,32 +2384,88 @@ void ShaderManager::RenderEffectToRT(IDirect3DSurface9* renderTarget, EffectReco
 
 // UNOFFICIAL 2026-10-27 RenderScale v2: the chain's first step on its own, so TAAEffect::UpscaleAfterEffects can redraw both at full
 // size after its upscale. In a rect frame (RenderRect::On) both draw into the rect (EffectRecord / ApplyViewport).
-void ShaderManager::RenderDepthAndNormals(IDirect3DSurface9* RenderTarget) {
+bool ShaderManager::PostTonemapNeedsNormals() {
+	auto renders = [](EffectRecord* e) { return e && e->Enabled && e->Effect && e->ShouldRender(); };
+	if (renders(Effects.Debug)) return true;
+	if (renders(Effects.Snow) && Effects.Snow->Technique() == 2) return true;
+	return false;
+}
+
+bool ShaderManager::PostTonemapNeedsViewModelDepth() {
+	VolumetricSmoke::SyncFrame();
+	if (Effects.VolumetricSmoke && Effects.VolumetricSmoke->Effect && Effects.VolumetricSmoke->ShouldRender() &&
+		TheSettingManager->GetSettingI("Main.GunFX.Main", "VolumetricSmokeTest") != 4)
+		return true;
+	auto renders = [](EffectRecord* e) { return e && e->Enabled && e->Effect && e->ShouldRender(); };
+	if (renders(Effects.Snow) && Effects.Snow->Technique() == 2) return true;
+	return false;
+}
+
+bool ShaderManager::PostUpscaleNeedsDepth(bool beforeLuma) {
+	if (beforeLuma && avglumaRequired) return true;
+	if (PostTonemapNeedsNormals() || PostTonemapNeedsViewModelDepth()) return true;
+	auto renders = [](EffectRecord* e) { return e && e->Enabled && e->Effect && e->ShouldRender(); };
+	if (renders(Effects.Rain) || renders(Effects.Snow) || GpuParticles::Wanted() ||
+		renders(Effects.HeatHaze) || renders(Effects.BarrelHaze) || renders(Effects.DepthOfField) ||
+		renders(Effects.Bodycam))
+		return true;
+	if (renders(Effects.Sharpening) && Effects.Sharpening->Constants.Data.z > 0.0f) return true;
+	if (renders(Effects.SkyDither) && Effects.SkyDither->Constants.Data.y > 0.0f) return true;
+	if (renders(Effects.SMAA) && Effects.SMAA->Settings.Main.EdgeDetection >= SMAAEffect::INPUT_DEPTH) {
+		bool runsWithTaa = !Effects.TAA || !Effects.TAA->Enabled;
+		if (!runsWithTaa) {
+			SettingManager::Configuration::ConfigNode node;
+			runsWithTaa = TheSettingManager->Config.FillNode(&node, "Shaders.SMAA.Main", "WithTAA") && node.BoolValue;
+		}
+		if (runsWithTaa) return true;
+	}
+	return false;
+}
+
+void ShaderManager::RenderDepthAndNormals(IDirect3DSurface9* RenderTarget, bool needNormals) {
 	IDirect3DDevice9* const Device = TheRenderManager->device;
 	static GpuTimer depthTimer("Depth combine");
 	static GpuTimer normalsTimer("Normal reconstruction");
 	auto bindFrameQuad = [&] { Device->SetStreamSource(0, FrameVertex, 0, sizeof(FrameVS)); };
 	bindFrameQuad();
 	Device->SetFVF(FrameFVF);	// the full-screen quad for both passes
+	NormalsEffect* const normals = Effects.Normals;
+	CombineDepthEffect* const depth = Effects.CombineDepth;
+	if (!needNormals) {
+		{
+			GpuProfileScope gpu(depthTimer, Device);
+			RenderEffectToRT(depth->Textures.CombinedDepthSurface, depth, false);
+		}
+		Device->SetRenderTarget(0, RenderTarget);
+		if (RenderRect::Active()) bindFrameQuad();
+		return;
+	}
+	const bool mergeWanted = CapturedNormals::MergeWanted() && !TAAEffect::UpscaledBeforeEffects();
+	const bool smoothOn = TheSettingManager->SettingsMain.Main.SmoothNormals > 0 && normals->Enabled && normals->Effect && normals->ShouldRender();
+	const bool allowInlineMerge = mergeWanted && !smoothOn;
 	// When the normals pass would run anyway, try producing depth and normals in one draw.
 	bool mergedNormals = false;
+	bool inlineMerged = false;
 	{
 		GpuProfileScope gpu(depthTimer, Device);
-		NormalsEffect* Normals = Effects.Normals;
-		CombineDepthEffect* const depth = Effects.CombineDepth;
-		if (Normals->Enabled && Normals->Effect && Normals->ShouldRender())
-			mergedNormals = depth->RenderWithNormals(Device, Normals->Textures.NormalsSurface);
+		if (normals->Enabled && normals->Effect && normals->ShouldRender())
+			mergedNormals = depth->RenderWithNormals(Device, normals->Textures.NormalsSurface, allowInlineMerge, &inlineMerged);
 		if (!mergedNormals) RenderEffectToRT(depth->Textures.CombinedDepthSurface, depth, false);
 	}
 	{
 		GpuProfileScope gpu(normalsTimer, Device);
-		NormalsEffect* const normals = Effects.Normals;
-		if (!mergedNormals) RenderEffectToRT(normals->Textures.NormalsSurface, normals, false);
+		if (!mergedNormals) {
+			normals->inlineMergeAllowed = allowInlineMerge;
+			normals->inlineMerged = false;
+			RenderEffectToRT(normals->Textures.NormalsSurface, normals, false);
+			inlineMerged = normals->inlineMerged;
+			normals->inlineMergeAllowed = false;
+		}
 		// UNOFFICIAL 2026-10-23 (sharednormals; [Main.Main.Quality] SmoothNormals): the buffer smoothed in place, once, for every reader.
 		Effects.Normals->RenderSmooth(Device);
 		// UNOFFICIAL 2026-10-28 [Main.Main.Quality] CapturedNormals (core/CapturedNormals.h): the surfaces' own smooth normals written into
 		// the buffer, for every reader. Not after an upscale to the screen (the normals were drawn at the internal resolution).
-		if (CapturedNormals::MergeWanted() && !TAAEffect::UpscaledBeforeEffects())
+		if (mergeWanted && !inlineMerged)
 			CapturedNormals::MergeIntoNormals(Device, Effects.Normals->Textures.NormalsSurface, Effects.CombineDepth->Textures.CombinedDepthTexture);
 		Device->SetRenderTarget(0, RenderTarget);	// the caller's target back
 	}
@@ -2532,7 +2593,7 @@ static void LogActiveSwitches(bool force) {
 void ShaderManager::RenderEffects(IDirect3DSurface9* RenderTarget) {
 	SharedDrawState::OwnPass ownPass;	// UNOFFICIAL 2026-11-11 (as RenderEffectsPreTonemapping: the effects' constants are their own)
 	SkyProjection::Join();	// UNOFFICIAL 2026-11-03 SkyOnWorker (as RenderEffectsPreTonemapping)
-	VolumetricSmoke::FrameNumber++;   // the smoke is fetched once a frame (VolumetricSmoke::Fetch)
+	VolumetricSmoke::SyncFrame();   // the smoke is fetched once a frame (VolumetricSmoke::Fetch)
 	SessionLog::OnFrame();	// UNOFFICIAL 2026-11-01: heartbeat, cell / weather / loading lines, setting changes, the frame journal switch (SessionLog.h)
 	{	// UNOFFICIAL 2026-10-31 register-clash guard: the total once, 300 frames into the first loaded game (the startup shaders are in; core/RegisterClash.h)
 		static unsigned clashFrames = 0;

@@ -410,6 +410,12 @@
         #define ENV_NO_MASK
     #endif
 #endif
+// UNOFFICIAL 2026-11-20: roughness-damped grazing F90 (Lagarde 2014, matching DeferredSun.hlsl / DeferredLamps.hlsl) on forward
+// passes (including the 1st-person viewmodel), preventing rough weapon surfaces turned toward a light from losing diffuse saturation
+// under full white F90 = 1.0 grazing Fresnel. Guarded by !NVR_SLOT_TIGHT for the 6-lamp SLS2035 slot budget.
+#if defined(PS) && !defined(NVR_SLOT_TIGHT)
+    #define PBR_ROUGH_F90 1
+#endif
 #include "includes/Object.hlsl"
 // UNOFFICIAL 2026-11-09 the eye variant (open report "eyes of default races black"; [Shaders.PBR.Main] GameShaderEyes, EyeShaderOld; the
 // records are made by Render.cpp GameEyes::RecordFor, from this file with NVR_EYE and no sun / lamp shadow code, and put on the device
@@ -1603,6 +1609,14 @@ PS_OUTPUT main(PS_INPUT IN) {
         BridgeSetup(normal.a, Toggles.z);	// UNOFFICIAL 2026-11-05 VanillaBridge (Object.hlsl): the authored highlight, before the roughness
     #endif
     float rough = getRoughness(normal.a);
+    #ifdef HAIR
+        // Keep unmapped hair matte enough not to look like glossy plastic (bright/DXT1 normal alpha).
+        #ifdef RMAOS
+            if (!RMAOS_ACTIVE) rough = max(rough, 0.58f);
+        #else
+            rough = max(rough, 0.58f);
+        #endif
+    #endif
 
     // Geometric specular AA -- see the comment on SpecularAA itself. Unconditional: this is a
     // quality fix for high-frequency normal maps (hair chief among them), not a debug toggle,
@@ -1702,7 +1716,13 @@ PS_OUTPUT main(PS_INPUT IN) {
             // (2026-11-16 fd-directlight) with the vertex normal (SmoothObjectNormals): a triangle seen from behind records its front's normal,
             // as this shader lights it (Includes/CapturedNormals.hlsl CapturedDerivNormalFront); with the flat face normal, as before.
             #ifdef OBJ_VERTEX_NORMAL
-                const float3 gbShadingNormal = SHADOW_VS_PRESENT(IN.shadowWorldPos.w) ? CapturedDerivNormalFront(IN.shadowWorldPos.xyz, IN.uv.xy, OBJ_VERTEX_NORMAL, normal.xyz) : 0.0f;
+                #ifdef HAIR
+                    #define OBJ_ALLOW_BACK true
+                #else
+                    #define OBJ_ALLOW_BACK (NVR_MATERIAL_CLASS > 2.5f || AmbientColor.a < 0.99f)
+                #endif
+                const float3 gbShadingNormal = SHADOW_VS_PRESENT(IN.shadowWorldPos.w) ? CapturedDerivNormalFront(IN.shadowWorldPos.xyz, IN.uv.xy, OBJ_VERTEX_NORMAL, normal.xyz, OBJ_ALLOW_BACK) : 0.0f;
+                #undef OBJ_ALLOW_BACK
             #else
                 const float3 gbShadingNormal = SHADOW_VS_PRESENT(IN.shadowWorldPos.w) ? CapturedDerivNormal(IN.shadowWorldPos.xyz, IN.uv.xy, faceNormal, normal.xyz) : 0.0f;
             #endif
@@ -2285,10 +2305,13 @@ PS_OUTPUT main(PS_INPUT IN) {
         // says "far away", so the light pass does not light it a second time. Its colour, material and normal stay.
         [flatten] if (FLASH_BEAM_ON && SHADOW_VS_PRESENT(IN.shadowWorldPos.w) && pout.capturedNormal.a > 0.5f) pout.capturedNormal.b = FLASH_BEAM_FAR;
     #endif
-    #if defined(FD_SV_RECORD) && !defined(DIFFUSE) && !defined(ONLY_SPECULAR) && !defined(OBJ_LAMP_FIRST) && !defined(NVR_EYE)
-        // UNOFFICIAL 2026-11-16 fd-sunvis (Includes/DeferredPixel.hlsl FDSunVisCode): what this record's sun would have had besides the cascades,
-        // for DeferredSun: the canopy shadow / STBB (sunAndProj: the cascades are compiled out of this record) x the micro-shadow, and the F0
-        pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, FDSunVisCanopy(sunAndProj) * FDSunVisMicro(normal.xyz, IN.lightDir.xyz), FD_SV_F0, NVR_SpecFade.z);
+    #if defined(FD_SV_RECORD) && !defined(DIFFUSE) && !defined(ONLY_SPECULAR) && !defined(NVR_EYE)
+        // UNOFFICIAL 2026-11-16 / 2026-11-21 fd-sunvis (Includes/DeferredPixel.hlsl FDSunVisCode): sun vis (besides cascades) and non-metal F0 (OBJ_LAMP_FIRST records F0 with vis 1.0f for DeferredLamps / FlashlightDeferred)
+        #ifdef OBJ_LAMP_FIRST
+            pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, 1.0f, FD_SV_F0, NVR_SpecFade.z);
+        #else
+            pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, FDSunVisCanopy(sunAndProj) * FDSunVisMicro(normal.xyz, IN.lightDir.xyz), FD_SV_F0, NVR_SpecFade.z);
+        #endif
     #endif
     #if defined(NVR_LIGHT_DEFERRED) && CAPTURED_NORMALS_ON >= 3 && !defined(DIFFUSE) && !defined(ONLY_SPECULAR)
         // UNOFFICIAL 2026-11-14 the lighting-free record's COLOR1.a, its one writer (Includes/DeferredPixel.hlsl FD_LF_CODE, both layouts): the
@@ -2894,9 +2917,13 @@ PS_OUTPUT main(PS_INPUT IN) {
         // UNOFFICIAL 2026-11-12 HairAndEyes (as in the LIGHTS < 4 variant): recorded as far away while the eye takes the beam itself
         [flatten] if (FLASH_BEAM_ON && SHADOW_WP_VALID(IN) && pout.capturedNormal.a > 0.5f) pout.capturedNormal.b = FLASH_BEAM_FAR;
     #endif
-    #if defined(FD_SV_RECORD) && !defined(OPT) && !defined(NVR_EYE)
-        // UNOFFICIAL 2026-11-16 fd-sunvis (as in the LIGHTS < 4 variant; this family has no canopy shadow): the micro-shadow and the F0
-        pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, FDSunVisMicro(normal.xyz, IN.lightDir.xyz), FD_SV_F0, NVR_SpecFade.z);
+    #if defined(FD_SV_RECORD) && !defined(NVR_EYE)
+        // UNOFFICIAL 2026-11-16 / 2026-11-21 fd-sunvis (as in the LIGHTS < 4 variant; OPT records F0 with vis 1.0f for DeferredLamps / FlashlightDeferred)
+        #ifdef OPT
+            pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, 1.0f, FD_SV_F0, NVR_SpecFade.z);
+        #else
+            pout.capturedNormal.a = FDSunVisCode(pout.capturedNormal.a, FDSunVisMicro(normal.xyz, IN.lightDir.xyz), FD_SV_F0, NVR_SpecFade.z);
+        #endif
     #endif
     // UNOFFICIAL 2026-11-12 CapturedCoverage (Includes/CapturedNormals.hlsl; as in the LIGHTS < 4 variant): x 1 on an opaque draw.
     // Not in the slot-tight six-lamp shader (it sits at the slot count drivers refuse): it records the whole polygon, as before.

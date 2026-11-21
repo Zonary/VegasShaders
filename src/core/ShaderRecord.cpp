@@ -864,7 +864,8 @@ ShaderRecord* ShaderRecord::LoadShader(const char* Name, const char* SubPath, Sh
 						// UNOFFICIAL 2026-10-28 CapturedNormals (core/CapturedNormals.h): the pixel shaders that write the normal target (COLOR3).
 						const char* capturedOn = lastDefinition(Template, "CAPTURED_NORMALS_ON");
 						const bool writes = capturedOn && (!strcmp(capturedOn, "1") || !strcmp(capturedOn, "2") || !strcmp(capturedOn, "3") || !strcmp(capturedOn, "4"));	// (3: 2026-10-31 AlbedoBuffer; 4: 2026-11-14 GBufferV2)
-						if (writes) CapturedNormals::NoteWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
+						const bool writesNormal = writes && !hasDefine(Template, "DIFFUSE") && !hasDefine(Template, "ONLY_SPECULAR") && !hasDefine(Template, "NVR_SLOT_TIGHT");
+						if (writesNormal) CapturedNormals::NoteWriter(static_cast<ShaderRecordPixel*>(record)->ShaderHandle);
 						if (writes) CapturedNormals::ViewEnsure(TheRenderManager->device);	// UNOFFICIAL 2026-11-14 GBufferView: compiled here, at record load (GBufferV2 only)
 						// UNOFFICIAL 2026-10-29 MaterialBuffer: Object / Parallax / Terrain write it on COLOR2 (the skin templates' COLOR2 is the skin blur's)
 						if (writes && Template.Name && (!strcmp(Template.Name, "ObjectTemplate") || !strcmp(Template.Name, "ParallaxTemplate") || !strcmp(Template.Name, "TerrainTemplate"))) {
@@ -1210,7 +1211,10 @@ void ShaderRecord::SetCT() {
 		IDirect3DSurface9* current = TheRenderManager->currentRTGroup->RenderTargets[0]->data->Surface;
 		TheRenderManager->device->StretchRect(current, NULL, TheTextureManager->RenderedSurface, NULL, D3DTEXF_NONE);
 	}
-	if (HasDepthBuffer) TheRenderManager->ResolveDepthBuffer(TheTextureManager->DepthTexture);
+	if (HasDepthBuffer) {
+		TheRenderManager->ResolveDepthBuffer(TheTextureManager->DepthTexture);
+		if (SharedDrawState::WatchingDepth) SharedDrawState::DepthWrittenSinceCopy = true;
+	}
 	// UNOFFICIAL terrain blending: before the constants below are uploaded (it sets whether this draw blends), and the
 	// first land bind of the world scene copies the depth drawn so far.
 	if (HasTerrainBlendDepth && TheShaderManager->Shaders.Terrain) TheShaderManager->Shaders.Terrain->PrepareBlending();
