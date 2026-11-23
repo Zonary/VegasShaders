@@ -59,7 +59,7 @@ template <> std::string SettingManager::ToString<int>(const int number) {
 }
 
 // The user config's [_Unofficial] SettingsVersion this build brings it up to (UpdateOldDefaults, below).
-static const int UnofficialSettingsVersion = 94;  // (94, 2026-11-21: [Shaders.PBR.Main] VanillaBridgeDielectricMax 0.08 -> 0.04; 93, 2026-11-19: a New Vegas Reloaded settings file gets LegacyFog + LegacyAs441, FormsNear -> Forms, and no terrain sky fill or ShadowBounce; 92, 2026-11-19: HelperWait 1, RideMainExchange + FollowRenderScale + ReplaceForward + ReflectionsOwnPuddles on, SunGI/RoomGI/AmbientReplace/HiZ/FFX retired; 91, 2026-11-18: [Shaders.PBR.Rmaos] MetalFromMap on, _rmaos maps decide metal; 90, 2026-11-18: old defaults of fixes that a Cartographer / Atlas / old preset batch left in the saved file move once, when 5 or more are found; 89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
+static const int UnofficialSettingsVersion = 96;  // (96, 2026-11-22: [Shaders.ShadowsExteriors.Deferred] MatchSunDisc true -> false; 95, 2026-11-21: [Main.Main.RayTracing] ActorFlushPerSpace false -> true; 94, 2026-11-21: [Shaders.PBR.Main] VanillaBridgeDielectricMax 0.08 -> 0.04; 93, 2026-11-19: a New Vegas Reloaded settings file gets LegacyFog + LegacyAs441, FormsNear -> Forms, and no terrain sky fill or ShadowBounce; 92, 2026-11-19: HelperWait 1, RideMainExchange + FollowRenderScale + ReplaceForward + ReflectionsOwnPuddles on, SunGI/RoomGI/AmbientReplace/HiZ/FFX retired; 91, 2026-11-18: [Shaders.PBR.Rmaos] MetalFromMap on, _rmaos maps decide metal; 90, 2026-11-18: old defaults of fixes that a Cartographer / Atlas / old preset batch left in the saved file move once, when 5 or more are found; 89, 2026-11-17: DeferredTransparents on (glass; the silver-bottle fix is in); 88, 2026-11-16: DeferredSkin (+ SSS 2), DeferredHair on (DeferredTransparents held off on 11-17, on again in 89); 87, 2026-11-16: [Shaders.TAA.Cutouts] Enabled on (Smooth Cutouts with TAA); 86: SMAA and DitherBuster off; 85, 2026-11-15: DeferredRenderer 0 -> 2, the deferred renderer on by default; 84: FlashDetect, BeatDetect, HistoryWatch off; 83: RT sun shadows Mode 1 (replace) + RT grass on; 82: GameShaderPairRepair on; 81: CapturedGrass on, for path tracing; 80: the daylight look, only where it was never touched; 79: rain LightingScale; 78: RT defaults replaced since 1.0.5 now reach saved configs; 77: ptaaa-firstperson, FirstPersonBody on again) 53 was an enhanced-water step, since removed
 
 // UNOFFICIAL 2026-10-30: a setting is read only when the defaults file lists it (FillNode), so a line in the user's toml that
 // this build does not know (a key from a newer or an older build, a typo) silently did nothing. Each one is logged once per
@@ -1011,6 +1011,24 @@ void SettingManager::Configuration::UpdateOldDefaults() {
 	// saved configs move once).
 	if (version < 94) {
 		replace("Shaders.PBR.Main", "VanillaBridgeDielectricMax", 0.08, 0.04, false);
+	}
+	// 95 (2026-11-21): [Main.Main.RayTracing] ActorFlushPerSpace false -> true (avoids flushing and rebuilding all actors on every
+	// exterior cell crossing; flushes only on worldspace/interior change or >8192 unit camera jumps).
+	if (version < 95) {
+		tomlValue* saved = UserSection("Main.Main.RayTracing");
+		if (saved && saved->contains("ActorFlushPerSpace") && saved->at("ActorFlushPerSpace").is_boolean() && !saved->at("ActorFlushPerSpace").as_boolean()) {
+			(*saved)["ActorFlushPerSpace"] = true;
+			changed += std::string(changed.empty() ? "" : ", ") + "Main.Main.RayTracing.ActorFlushPerSpace false -> true";
+		}
+	}
+	// 96 (2026-11-22): [Shaders.ShadowsExteriors.Deferred] MatchSunDisc true -> false (matching vanilla FNV sun direction avoids
+	// flattening terrain normal/parallax relief when the sky sun sits high around midday/afternoon).
+	if (version < 96) {
+		tomlValue* saved = UserSection("Shaders.ShadowsExteriors.Deferred");
+		if (saved && saved->contains("MatchSunDisc") && saved->at("MatchSunDisc").is_boolean() && saved->at("MatchSunDisc").as_boolean()) {
+			(*saved)["MatchSunDisc"] = false;
+			changed += std::string(changed.empty() ? "" : ", ") + "Shaders.ShadowsExteriors.Deferred.MatchSunDisc true -> false";
+		}
 	}
 	if (!changed.empty())
 		Logger::Log("UNOFFICIAL settings: old defaults saved by an earlier build moved to the new defaults: %s. "
