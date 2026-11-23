@@ -460,23 +460,4 @@ New work since 1.0.9, to credit when it ships:
 - Conor (mrfury97): the RT GI review series (`claude/fd-furyrtgi`).
 - Deferred renderer: Christensen & Burley 2015 (skin SSS v2) and Community Shaders' kernel generator for deferred skin.
 
-Decisions and fixes for the owner before the Nexus release:
-1. **NVIDIA credit vs. our earlier rule.** The DLSS SDK licence *requires* a public release to credit NVIDIA's DLSS SDK
-   (splash/about/credits) and to include the DLSS Programming Guide's section 9.5/9.6 third-party notices, which are
-   not in the repo yet. A memory note says no NVIDIA credit line without NVIDIA's written OK; the licence asks for
-   approval for names/marks used beyond that credit. Both can hold: credit the SDK in plain text (above), use no
-   logo, and notify NVIDIA before any commercial release. Owner's call.
-2. **Inigo Quilez noise under CC BY-NC-SA 3.0: resolved 2026-11-15** (`claude/fd-noiselicence` b51de1e24, picks cleanly
-   onto `claude/fd-batch8`). The value noise in `SnowAccumulation.fx.hlsl`, `VolumetricFog.fx.hlsl`, `SKYSHORIZFADE.pso.hlsl`
-   and the Vulkan ports (`Compute/SnowAccumulation.frag`, `Compute/VolumetricFog.glsl`, 45 .spv rebuilt) is now our own on
-   Dave Hoskins' hash13 (MIT), same range and scale; offline statistics match. Ships once that commit is merged.
-4. **Origins to confirm**: `hud_raindrops.dds`, the Lottes gists' licence, the NVR Depth Bridge and Terrain Blending
-   - NVSE links. (`fx_weather_snow01.dds` is settled: macintroll's, may ship with credit.)
-8. **Bethesda-derived meshes**: the GunFX smoke meshes (from vanilla `fxlightsmoke.nif`) and the RT test kit's
-   `vs_mirror01.nif` (from vanilla `nv_ul_wallscreen01.nif`) are modified game assets.
-   The owner should decide whether they ship in the Nexus preview.
-5. **Polyphony / PixelsSquared** credit is already in README and About; keep it.
-6. The 2011 SMAA header asks binaries to reproduce its copyright line: done by the paste block above.
-7. Release notes credit people (Balebandro's PRs, Conor, WallSoGB) but no release note credits AMD, NVIDIA's SDK,
-   DXVK or the libraries: the README block covers them; add one line "Third-party credits: see README" to future
-   notes.
+
