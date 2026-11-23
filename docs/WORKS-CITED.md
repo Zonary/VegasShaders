@@ -411,53 +411,6 @@ Conditional ReSTIR, neural radiance caching, MegaLights and others) are not cite
 
 ---
 
-## 8. Gaps: what the public README / release notes do not credit yet
 
-Ready to paste into the README "Credits" (after the existing list):
-
-```
-- AMD FidelityFX: FSR 2.2.1 and the FSR 3.1 upscaler (FidelityFX SDK 1.1.4), the FidelityFX Shadows and
-  Reflections Denoisers (MIT, Copyright (c) 2021-2024 Advanced Micro Devices, Inc.).
-- DXVK by Philip Rebohle (zlib), the base of the optional d3d9.dll fork.
-- Dear ImGui (Omar Cornut, MIT), toml11 (Toru Niina, MIT), Microsoft Detours (MIT), ReShade add-on API
-  (Patrick Mours, BSD-3), NVAPI (NVIDIA), Bink (RAD Game Tools).
-- SMAA: Uses SMAA. Copyright (C) 2011 by Jorge Jimenez, Jose I. Echevarria, Tiago Sousa, Belen Masia,
-  Fernando Navarro and Diego Gutierrez.
-- Separable SSS by Jorge Jimenez and Diego Gutierrez; Playdead's ClipAABB (MIT); MJP's MSAAFilter (MIT);
-  Stephen Hill's ACES fit; Dave Hoskins' "hash without sine" (MIT).
-- pr0bability (Vanilla Plus Particles, GPL-3.0): particle size and soft particles.
-- Zenteon (ZN_FX, GPL-3.0): the NeonSpill method.
-- NVR Depth Bridge contributors (MIT): the ReShade near-depth remap and menu guard.
-- acidpointer (psycho): facts behind the IO worker.
-- Ascii1457 (Screen Space Shaders): the HUD raindrops technique; Terrain Blending - NVSE: the terrain-blending method.
-- Oblivion Reloaded (arafuse/tes-reloaded) for the TAA lineage.
-- The research papers and talks the effects are built on: see docs/WORKS-CITED.md.
-```
-
-Existing README lines that are narrower than what ships (suggested replacements):
-
-```
-- Conor (mrfury97): terrain shadow sweep, terrain variation, many lamps (and one-pass lamps), skin scattering,
-  the TAA, FoldFog, Pip-Boy fit, the game MSAA block, ray traced sun GI, AmbientReplace, ExteriorBalance, Puddles.
-- macintroll: snow accumulation and the snow look, world-space snow and its flake sheet, captured normals, lens and
-  underwater shaders, WetWorld2 (with Boomstick), terrain-blending height edges.
-- Balebandro (Physically-Based-Reloaded): Sandstorm, HeatHaze, terrain erosion, HUD raindrops and wetness
-  reflections ports, PBR weather scales, the grass size fade, and GitHub PRs #5 and #6 (MO2 DXVK loader,
-  deferred flashlight, skin, soft particles, shadow and MSAA fixes).
-- Community Shaders team: add Wetness Effects, the Separable SSS skin kernel, the Terrain Blending and Complex
-  Parallax Materials methods.
-- New Vegas Reloaded original shader authors still in the code: Boomstick and Mac (WetWorld).
-```
-
-Pending owner decision (do not paste until decided, see item 1 below):
-
-```
-- NVIDIA DLSS SDK (optional DLSS helper). This software contains source code provided by NVIDIA Corporation.
-  NVIDIA and DLSS are trademarks and/or registered trademarks of NVIDIA Corporation in the U.S. and other countries.
-```
-
-New work since 1.0.9, to credit when it ships:
-- Conor (mrfury97): the RT GI review series (`claude/fd-furyrtgi`).
-- Deferred renderer: Christensen & Burley 2015 (skin SSS v2) and Community Shaders' kernel generator for deferred skin.
 
 
