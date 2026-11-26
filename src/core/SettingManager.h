@@ -339,6 +339,10 @@ public:
 	void					SetSettingS(const char* section, const char* key, const char* value);	// from text, any type
 	void					SetSettingF(const char* section, const char* key, float value);	// from a number, any type; reloads
 	void					SetSetting(Configuration::ConfigNode* node);
+	// 2026-11-26 (unsaved marks): every unsaved setting put at its saved value for a moment (no log, no revision, no unsaved list),
+	// so the menu can work out what a control showed when last saved; PeekSavedEnd puts the live values back.
+	std::vector<Configuration::ConfigNode>	PeekSavedBegin();
+	void					PeekSavedEnd(const std::vector<Configuration::ConfigNode>& live);
 	void					Increment(const char* section, const char* key);
 	void					Decrement(const char* section, const char* key);
 	void					SetSettingWeather(const char* section, const char* key, float value);

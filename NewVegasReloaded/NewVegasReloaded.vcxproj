@@ -288,6 +288,7 @@
     <ClInclude Include="..\src\core\FlashRule.h" />
     <ClInclude Include="..\src\core\RenderScaleGuardRule.h" />
     <ClInclude Include="..\src\core\SettingChanges.h" />
+    <ClInclude Include="..\src\core\UnsavedSettings.h" />
     <ClInclude Include="..\src\base\PluginVersion.h" />
     <ClInclude Include="..\src\base\SafeWrite.h" />
     <ClInclude Include="..\src\base\Types.h" />

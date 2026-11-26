@@ -5,6 +5,7 @@
 #include "SettingForce.h"	// UNOFFICIAL 2026-11-14 full deferred renderer: its prerequisites read as forced
 #include "StalePresetValues.h"	// UNOFFICIAL 2026-11-18: settings step 90 moves the old defaults presets and scripts saved
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: a release build reads [Shaders.ShadowsInteriors.Capsules] Enabled as off
+#include "UnsavedSettings.h"	// 2026-11-25 (unsaved marks): which settings the menu marks as not saved yet
 
 // A settings file in <game>\Data\NVSE\Plugins (the game folder is read once, Paths::GameRoot: common-dialog calls can change the
 // current directory later). 2026-11-02 Vegas Shaders: forWrite gives the new name (VegasShaders.toml...); a read takes the new
@@ -1793,6 +1794,7 @@ void SettingManager::SaveSettings() {
 	}
 
 	hasUnsavedChanges = false;
+	UnsavedSettings::Clear();	// 2026-11-25 (unsaved marks)
 	SessionLog::OnEvent("Vegas Shaders settings saved to the toml");	// UNOFFICIAL 2026-11-01
 }
 
@@ -1815,6 +1817,7 @@ void SettingManager::RevertSettings() {
 	}
 
 	hasUnsavedChanges = false;	// what is live is what is on disk again
+	UnsavedSettings::Clear();	// 2026-11-25 (unsaved marks)
 }
 
 void SettingManager::SaveSettingsTo(const char* path) {
@@ -2022,11 +2025,26 @@ static std::string LogValue(const SettingNode& node) {
 	}
 }
 
+// 2026-11-25 (unsaved marks): a node's whole value as text (LogValue cuts long strings and rounds floats), so UnsavedSettings can
+// tell a setting that is back at its saved value from one that is not
+static tomlValue s_peekMaxQuality, s_peekMaxQualityUser;	// 2026-11-26 (unsaved marks): PeekSavedBegin's copies
+static bool s_peekMaxQualityChanged = false;
+
+static std::string WholeValue(const SettingNode& node) {
+	typedef SettingManager::Configuration::NodeType Type;
+	char text[32];
+	switch (node.Type) {
+	case Type::Boolean: return node.BoolValue ? "true" : "false";
+	case Type::Integer: sprintf_s(text, "%d", node.IntValue); return text;
+	case Type::Float: sprintf_s(text, "%.9g", node.FloatValue); return text;
+	default: return node.LongValue.empty() ? std::string(node.Value) : node.LongValue;
+	}
+}
+
 /*
 * Stores a node's value in the settings (the user's table, or Max Quality's layer).
 */
 void SettingManager::SetSetting(Configuration::ConfigNode* node) {
-	hasUnsavedChanges = true;
 	SettingsRevision++;
 
 	// UNOFFICIAL 2026-11-01: every change goes to the log as old -> new (SessionLog: coalesced while a slider is dragged, rate-limited)
@@ -2034,6 +2052,58 @@ void SettingManager::SetSetting(Configuration::ConfigNode* node) {
 	const bool known = Config.FillNode(&before, node->Section, node->Key);
 	Config.SetValue(node);
 	if (known) SessionLog::OnSettingChanged(node->Section, node->Key, LogValue(before).c_str(), LogValue(*node).c_str());
+	if (known) UnsavedSettings::Changed(node->Section, node->Key, WholeValue(before), WholeValue(*node));	// 2026-11-25 (unsaved marks)
+	else UnsavedSettings::Changed(node->Section, node->Key, UnsavedSettings::kNoValue, WholeValue(*node));	// 2026-11-25: not a setting of this build: unsaved until Save
+	// 2026-11-25: was "true" on every change, so a setting changed and changed back (nothing to save) kept the menu bar's "Unsaved",
+	// the amber Save and the status bar's "Unsaved changes" until Save. Now they say what the unsaved list says.
+	hasUnsavedChanges = UnsavedSettings::Any();
+}
+
+// 2026-11-26 (unsaved marks): the unsaved settings at their saved values, written straight into the tables (Config.SetValue, as
+// SetSetting does, but with no log, no revision and no unsaved list), so the menu can ask a mode picker what it showed when last
+// saved. Max Quality's two tables and its changed flag are kept as they were (SetValue writes into both while it is on).
+std::vector<SettingManager::Configuration::ConfigNode> SettingManager::PeekSavedBegin() {
+	using Kind = Configuration::NodeType;
+	std::vector<SettingNode> live;
+	for (const auto& section : UnsavedSettings::All())
+		for (const auto& key : section.second) {
+			if (key.second == UnsavedSettings::kNoValue) continue;
+			SettingNode now;
+			if (!Config.FillNode(&now, section.first.c_str(), key.first.c_str())) continue;
+			live.push_back(now);
+		}
+	if (live.empty()) return live;
+	if (Config.MaxQualityActive) {	// put back by PeekSavedEnd
+		s_peekMaxQuality = Config.MaxQualityConfig;
+		s_peekMaxQualityUser = Config.MaxQualityUser;
+		s_peekMaxQualityChanged = Config.MaxQualityUserChanged;
+	}
+	SettingsRevision++;	// 2026-11-26: GetSetting* keep what they read until this changes (SettingsCache): read the saved values
+	for (const SettingNode& now : live) {
+		SettingNode saved = now;
+		const std::string& text = UnsavedSettings::All()[now.Section][now.Key];
+		PutNodeText(saved.Value, text.c_str());
+		if (saved.Type == Kind::String) saved.LongValue = text;
+		else if (saved.Type == Kind::Integer) saved.IntValue = atoi(text.c_str());
+		else if (saved.Type == Kind::Float) saved.FloatValue = (float)atof(text.c_str());
+		else if (saved.Type == Kind::Boolean) saved.BoolValue = text == "true";
+		Config.SetValue(&saved);
+	}
+	return live;
+}
+
+void SettingManager::PeekSavedEnd(const std::vector<Configuration::ConfigNode>& live) {
+	if (live.empty()) return;
+	for (const SettingNode& now : live) {
+		SettingNode node = now;
+		Config.SetValue(&node);
+	}
+	if (Config.MaxQualityActive) {
+		Config.MaxQualityConfig = s_peekMaxQuality;
+		Config.MaxQualityUser = s_peekMaxQualityUser;
+		Config.MaxQualityUserChanged = s_peekMaxQualityChanged;
+	}
+	SettingsRevision++;	// and the live ones again
 }
 
 // Increment and Decrement share one step: +1 (Increment) or -1 (Decrement) for the setting's type. A boolean goes only to the side
