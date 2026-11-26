@@ -36,6 +36,9 @@
 #include "ShelvedEffects.h"	// UNOFFICIAL 2026-11-16: shelved effects have no page, row or search entry in a release build
 #include "SettingForce.h"	// UNOFFICIAL 2026-11-16: keys the deferred renderer sets (on or off) show greyed, at the value in effect
 #include "CompileProgress.h"	// UNOFFICIAL 2026-11-20: close startup shader-compile overlay once the first frame arrives
+#include "DistantLandProto.h"	// UNOFFICIAL 2026-11-25 device reset release
+#include "DistantLandTerrain.h"	// UNOFFICIAL 2026-11-25 device reset release
+#include "MaterialSSSProto.h"	// UNOFFICIAL 2026-11-25 device reset release
 #include "DxvkLoader.h"
 
 // The settings overlay (ImGui on the game's D3D9 device). Layout, top to bottom: a menu bar (File / View / Tools and the
@@ -543,7 +546,12 @@ static void FeedMouseAndStepKeys() {
 static bool FollowDeviceState() {
 	const HRESULT state = TheRenderManager->device->TestCooperativeLevel();
 	if (state == D3DERR_DEVICELOST || state == D3DERR_DEVICENOTRESET) {
-		if (!gOverlay.deviceLost) ImGui_ImplDX9_InvalidateDeviceObjects();
+		if (!gOverlay.deviceLost) {
+			ImGui_ImplDX9_InvalidateDeviceObjects();
+			DistantLandTerrain::OnDeviceLost();
+			DistantLandProto::ReleaseDefaultPool();
+			MaterialSSSProto::ReleaseDefaultPool();
+		}
 		gOverlay.deviceLost = true;
 		return false;
 	}
@@ -676,6 +684,7 @@ static const RestartSetting kRestartSettings[] = {
 	{ "Shaders.PBR.Rmaos",                    "Enabled",            RestartRule::Changed },
 	{ "Shaders.PBR.Rmaos",                    "SpecularFromMap",    RestartRule::Changed },	// RMAOS_SPEC_OFF (2026-11-02)
 	{ "Shaders.Reflections.Main",             "MaterialAware",      RestartRule::TurnOn },	// REFL_MATERIAL_ON (core/ReflMaterial.h)
+	{ "Shaders.Reflections.Main",             "CubeResolution",     RestartRule::Changed },	// live cube textures made at start (Reflections.cpp)
 	{ "Shaders.Reflections.Main",             "ReflectAdd",         RestartRule::TurnOn },	// REFL_ADD_ON (Reflections.fx.hlsl)
 	{ "Shaders.Reflections.Main",             "SpecularOcclusion",  RestartRule::TurnOn },	// REFL_SPECOCC_ON (Reflections.fx.hlsl)
 	{ "Shaders.PBR.Linear",                   "Enabled",            RestartRule::TurnOn },	// off at runtime = Gamma 1
@@ -974,6 +983,17 @@ static const char* InactiveReason(const char* section, const char* key) {
 			if (strcmp(key, "GearWeather") != 0 && NumericSetting("Main.Main.Quality", "GearWeather") == 0.0f)
 				return "Only used while GearWeather is on.";
 		}
+	}
+	if (sec.rfind("Shaders.WorldSurface.", 0) == 0) {
+		const bool defOff = NumericSetting("Main.Main.Quality", "DeferredRenderer") < 1.0f ||
+			NumericSetting("Main.Main.Misc", "ForceMSAA") != 0.0f;
+		if (defOff)
+			return "Requires DeferredRenderer to be enabled (and ForceMSAA off; restart).";
+		if (sec != "Shaders.WorldSurface.Status" && NumericSetting("Shaders.WorldSurface.Status", "Enabled") == 0.0f)
+			return "Only used while WorldSurface is enabled.";
+		if (sec != "Shaders.WorldSurface.Main" && sec != "Shaders.WorldSurface.Status" &&
+			strcmp(key, "Enabled") != 0 && NumericSetting(sec.c_str(), "Enabled") == 0.0f)
+			return "Only used while this layer is enabled.";
 	}
 
 	// Skin: ScreenSpace blur takes over from per-pixel Scattering; Main/Scattering apply outdoors, Interiors applies indoors
@@ -1497,6 +1517,8 @@ static const ConflictRule kConflictRules[] = {
 		"SMAA is on too: both smooth the edges, which costs more and softens the picture. Turn one of them off." },
 	{ "Shaders.SMAA.Status", "Enabled", "true", []() { return SettingOn("Main.Main.ReducedQuality", "FXAA"); },
 		"FXAA is on too: both smooth the edges, which costs more and softens the picture. Turn one of them off." },
+	{ "Shaders.HDR.Main", "Enabled", "true", nullptr,
+		"HDR output currently causes freezes for some players. A fix is being researched." },
 };
 
 static bool SameValue(const char* a, const std::string& b) {
@@ -1618,7 +1640,7 @@ static const SimpleRow kSimpleRows[] = {
 		"Shiny only: MaxRoughness=0.35 | Shiny and satin: MaxRoughness=0.5 | Most surfaces: MaxRoughness=0.75",
 		"How rough a surface can be and still get ray-traced reflections; rougher ones keep the screen-space reflections. Wet ground counts "
 		"by Reflections' WetRoughness: if it is rougher than this, puddles get no rays." },
-	{ "Shaders.Reflections.RT", "Weapon", "Weapon reflections", nullptr, "Your gun reflects the world around it: lamps, signs, the sky. Strongest on metal parts." },
+	{ "Shaders.Reflections.RT", "Weapon", "Weapon reflections", nullptr, "Your first-person weapon reflects its surroundings (the live 360-degree cube on all DXVK GPUs, or ray-traced hits when RT reflections are on). Strongest on metal parts." },
 	{ "Shaders.Reflections.RT", "WeaponHands", "Hands and arms reflect too", nullptr, "Off: only the gun reflects. On: your hands, gloves and arms reflect like the gun (the whole first-person model)." },
 	{ "Shaders.Reflections.RT", "Water", "Ray-traced water reflections", nullptr, "Water reflects the world with rays instead of the old reflection map." },
 	// Light shafts and fog (UNOFFICIAL 2026-11-07 ptaaa-fog)
@@ -1780,6 +1802,8 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.PBR.Main", "Saturation", "Colour saturation", nullptr, "How vivid the colours of lit objects are." },
 	{ "Shaders.PBR.Main", "SkylightingScale", "Sky colour in shade", nullptr, "Adds the colour of the sky to shaded areas. 0 turns it off." },
 	{ "Shaders.PBR.Main", "SkylightingSaturation", "Sky colour strength in shade", nullptr, "How vivid the sky colour in shaded areas is. 0 is grey, 1 matches the sky." },
+	{ "Shaders.PBR.Main", "DecoupleGlowMaps", "Decouple glow maps from lighting", nullptr, "Prevents sun and ambient scales from washing out emissive glow maps like weapon sights." },
+	{ "Shaders.PBR.Main", "GlowScale", "Glow map brightness", nullptr, "Adjusts brightness of self-illuminated glow maps when decoupled from lighting." },
 	// PBR (Rain)
 	{ "Shaders.PBR.Rain", "Roughness", "Surface roughness", nullptr, "Lower gives small bright highlights and clear reflections; higher gives a broad faint sheen." },
 	{ "Shaders.PBR.Rain", "AmbientScale", "Ambient light strength", nullptr, "How bright the general ambient light is on objects." },
@@ -1863,6 +1887,9 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.Reflections.Main", nullptr, "Quality",
 		"Low: Steps=12 | Medium: Steps=24 | High: Steps=40",
 		"Higher gives steadier reflections with fewer gaps, and costs more." },
+	{ "Shaders.Reflections.Main", "CubeMode", "Environment reflections mode", nullptr, "How the live surroundings cube fills: 0 captures screen view only while Reflections is on, 1 keeps it updated for PBR metal/chrome too and fills unseen directions with sky and light grid, 2 (default) also renders a staggered 3D world cubemap so weapons, metal, and glass reflect overhead and behind you." },
+	{ "Shaders.Reflections.Main", "CubeResolution", "Environment cube resolution", nullptr, "Resolution per face for the live surroundings cubemap (64, 128, or 256). Higher gives sharper reflections on chrome and glossy surfaces. Needs a restart." },
+	{ "Shaders.Reflections.Main", "CubeDistance", "Environment cube distance", nullptr, "Maximum capture distance for 3D objects and point lamps in world-cubemap mode (mode 2)." },
 	// Sun shadows (Main)
 	{ "Shaders.ShadowsExteriors.Main", "Enabled", "Sun shadows", nullptr, "Turns the shadows cast by the sun on or off outdoors." },
 	{ "Shaders.ShadowsExteriors.Main", "Darkness", "Shadow darkness", nullptr, "How dark sun shadows are. Lower gives pale shadows, higher gives near-black ones." },
@@ -2314,7 +2341,7 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.LocalExposure.Main", "Interiors", "Also indoors", nullptr, "Also applies the effect indoors." },
 	{ "Shaders.LocalExposure.Main", "Exteriors", "Also outdoors", nullptr, "Also applies the effect outdoors." },
 	// HDR (Main)
-	{ "Shaders.HDR.Main", "Enabled", "HDR output", nullptr, "Sends a true HDR picture to your display, with brighter highlights. Needs an HDR screen with HDR on in Windows and the DXVK fork." },
+	{ "Shaders.HDR.Main", "Enabled", "HDR output", nullptr, "Sends a true HDR picture to your display, with brighter highlights. Needs an HDR screen with HDR on in Windows and the DXVK fork. Warning: currently causes freezes for some players; a fix is being researched." },
 	{ "Shaders.HDR.Main", nullptr, "HDR format",
 		"HDR10: Mode=1 | scRGB: Mode=2",
 		"HDR10 is what most HDR games use. Try the other only if HDR10 looks wrong." },
@@ -2435,6 +2462,8 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.DepthOfField.FirstPersonView", "Enabled", "Depth of field (background blur)", nullptr, "Blurs things in front of and behind what you look at." },
 	{ "Shaders.DepthOfField.FirstPersonView", "BaseBlurRadius", "Blur strength", nullptr, "How strong the blur is." },
 	{ "Shaders.DepthOfField.FirstPersonView", "Radius", "Blur size", nullptr, "How large the blur is." },
+	{ "Shaders.DepthOfField.FirstPersonView", "DistantBlur", "Distant blur", nullptr, "Softens the far distance and mountain horizons to hide LOD edges." },
+	{ "Shaders.DepthOfField.FirstPersonView", "DistantBlurStrength", "Distant blur strength", nullptr, "How strong the distant blur is (0 = off, 1 = default)." },
 	{ "Shaders.DepthOfField.FirstPersonView", nullptr, "When it applies",
 		"Always: Mode=0 | Not in dialogue: Mode=1 | Only in dialogue: Mode=2",
 		"Whether the blur also applies while you talk to someone." },
@@ -2442,6 +2471,8 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.DepthOfField.ThirdPersonView", "Enabled", "Depth of field (background blur)", nullptr, "Blurs things in front of and behind what you look at." },
 	{ "Shaders.DepthOfField.ThirdPersonView", "BaseBlurRadius", "Blur strength", nullptr, "How strong the blur is." },
 	{ "Shaders.DepthOfField.ThirdPersonView", "Radius", "Blur size", nullptr, "How large the blur is." },
+	{ "Shaders.DepthOfField.ThirdPersonView", "DistantBlur", "Distant blur", nullptr, "Softens the far distance and mountain horizons to hide LOD edges." },
+	{ "Shaders.DepthOfField.ThirdPersonView", "DistantBlurStrength", "Distant blur strength", nullptr, "How strong the distant blur is (0 = off, 1 = default)." },
 	{ "Shaders.DepthOfField.ThirdPersonView", nullptr, "When it applies",
 		"Always: Mode=0 | Not in dialogue: Mode=1 | Only in dialogue: Mode=2",
 		"Whether the blur also applies while you talk to someone." },
@@ -2449,6 +2480,8 @@ static const SimpleRow kSimpleRows[] = {
 	{ "Shaders.DepthOfField.VanityView", "Enabled", "Depth of field (background blur)", nullptr, "Blurs things in front of and behind what you look at." },
 	{ "Shaders.DepthOfField.VanityView", "BaseBlurRadius", "Blur strength", nullptr, "How strong the blur is." },
 	{ "Shaders.DepthOfField.VanityView", "Radius", "Blur size", nullptr, "How large the blur is." },
+	{ "Shaders.DepthOfField.VanityView", "DistantBlur", "Distant blur", nullptr, "Softens the far distance and mountain horizons to hide LOD edges." },
+	{ "Shaders.DepthOfField.VanityView", "DistantBlurStrength", "Distant blur strength", nullptr, "How strong the distant blur is (0 = off, 1 = default)." },
 	{ "Shaders.DepthOfField.VanityView", nullptr, "When it applies",
 		"Always: Mode=0 | Not in dialogue: Mode=1 | Only in dialogue: Mode=2",
 		"Whether the blur also applies while you talk to someone." },
@@ -2571,6 +2604,29 @@ static const SimpleRow kSimpleRows[] = {
 		"Low: Steps=12 MaxDistance=800.0 | Medium: Steps=24 MaxDistance=1500.0 | High: Steps=40 MaxDistance=2500.0",
 		"Higher finds more distant things and looks finer, but costs more frame rate." },
 	{ "Shaders.WetnessEffects.Reflections", "MaxCameraDistance", "Reflection range", nullptr, "Wet surfaces farther away than this show no scene reflections." },
+	// First-person gear weather (Main.Main.Quality)
+	{ "Main.Main.Quality", "DeferredFirstPerson", "Deferred 1st-person viewmodel", nullptr, "Routes 1st-person hands and weapons through the deferred renderer (required for First-person gear weather; restart)." },
+	{ "Main.Main.Quality", "GearWeather", "Gear weather enabled", nullptr, "Accumulates snow/frost, animated melting snowflakes, sandstorm dust/grit, rain wetness, and mud on your 1st-person weapon, hands, and arms." },
+	{ "Main.Main.Quality", "GearWeatherStrength", "Strength", nullptr, "Overall strength of all first-person gear weather effects." },
+	{ "Main.Main.Quality", "GearWeatherFrost", "Frost & snowflakes", nullptr, "Strength of cold metal frost rime and animated melting snowflakes in snow." },
+	{ "Main.Main.Quality", "GearWeatherSand", "Sandstorm dust & grit", nullptr, "Strength of sandstorm dust and fine sand particles across weapon, hands, and sleeves." },
+	{ "Main.Main.Quality", "GearWeatherWet", "Rain wetness", nullptr, "Strength of the rain wetness film on arms and weapons." },
+	{ "Main.Main.Quality", "GearWeatherMud", "Mud splash", nullptr, "Strength of mud splashed while moving over wet ground." },
+	{ "Main.Main.Quality", "GearWeatherSpeed", "Buildup / fade speed", nullptr, "How fast weather effects build up outdoors and melt, dry, or wear off." },
+	{ "Main.Main.Quality", "GearWeatherSkin", "Bare skin share", nullptr, "How strongly frost, snowflakes, sand dust, and mud cling to bare skin." },
+	{ "Main.Main.Quality", "GearWeatherScale", "Pattern scale", nullptr, "Blotch size in game units for broad frost, sand, and mud layers." },
+	// World surface detail & weathering (Shaders.WorldSurface.*)
+	{ "Shaders.WorldSurface.Main", "Strength", "Overall strength", nullptr, "Overall multiplier for all World surface detail & weathering layers." },
+	{ "Shaders.WorldSurface.Main", "Detail", "Micro-detail grain", nullptr, "High-frequency surface bump and roughness variation on close-up concrete, stone, metal, and terrain." },
+	{ "Shaders.WorldSurface.Main", "Distance", "Fade distance", nullptr, "Distance from the camera (game units) at which world surface overlays fade out." },
+	{ "Shaders.WorldSurface.Dust", "Enabled", "Enabled", nullptr, "Enables settled Mojave silt outdoors and aged crevice dust indoors." },
+	{ "Shaders.WorldSurface.Dust", "Strength", "Dust strength", nullptr, "Settled Mojave silt outdoors and aged crevice dust indoors in seams and on upward ledges." },
+	{ "Shaders.WorldSurface.Rust", "Enabled", "Enabled", nullptr, "Enables exposed metal tarnish patina and patchy iron-oxide rust." },
+	{ "Shaders.WorldSurface.Rust", "Strength", "Rust strength", nullptr, "Patchy oxidation and matte iron-oxide rust along crevices and exposed faces of metallic objects." },
+	{ "Shaders.WorldSurface.Waterline", "Enabled", "Enabled", nullptr, "Enables capillary water darkening, shoreline mud, and damp algae just above water level." },
+	{ "Shaders.WorldSurface.Waterline", "Strength", "Waterline strength", nullptr, "Dark capillary water wicking, glossy wet rims, mud, and algae just above water level." },
+	{ "Shaders.WorldSurface.Moss", "Enabled", "Enabled", nullptr, "Enables patchy green moss and lichen on shaded rocks, ruins, and damp stone outdoors." },
+	{ "Shaders.WorldSurface.Moss", "Strength", "Moss strength", nullptr, "Patchy green moss and lichen on shaded/upward rocks, ruins, and damp stone outdoors." },
 };
 
 static const char* SimpleTip(const char* section, const char* key) {
@@ -3989,7 +4045,7 @@ static const MenuGroup kMenuGroups[] = {
 		"VisibleNormals, RayReuse, ReuseRoughness, ContactSharpness, ContactSpread, RoughShare, RoughReach",
 		FogType::None, false, "Blurred reflections on worn tiles, satin metal and wet stone: how sharp they stay and how cheap they are.", nullptr },
 	{ "Shaders.Reflections.RT", "Weapon", "Weapon, WeaponHands, WeaponMetal, WeaponRoughness",
-		FogType::None, false, "Your first-person weapon reflects the ray traced scene.", nullptr },
+		FogType::None, false, "Your first-person weapon reflects the live surroundings cube (or the ray-traced scene when RT is on).", nullptr },
 	{ "Shaders.Reflections.RT", "Water", "Water, WaterSkipPlanar, WaterPlanarRefresh, WaterRoughness",
 		FogType::None, false, "Water reflects the ray traced scene instead of the game's own water reflection.", nullptr },
 
@@ -4302,6 +4358,12 @@ static void RenderPageHeader(const std::string& section) {
 	ImGui::TextDisabled("%s", path.c_str());
 	ImGui::Separator();
 	ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+	if (section == "Shaders.HDR.Main") {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(kRestartOrange, "Warning: HDR output currently causes freezes for some players. A fix is being researched.");
+		ImGui::PopTextWrapPos();
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.4f));
+	}
 	DrawPtNote(section);	// UNOFFICIAL 2026-11-12: what this effect does while path tracing replaces the scene (nothing otherwise)
 }
 
@@ -4580,6 +4642,7 @@ static bool IsMovedShaderEntry(const std::string& name) {
 // UNOFFICIAL 2026-10-27: the menu name of a Shaders entry where its internal name (its settings sections, kept for the users'
 // settings files) says less than it does (user: "change the taa menu to say taa / fsr / dlss"). The ## part keeps ImGui's ID the name.
 static std::string MenuEntryLabel(const std::string& name) {
+	if (name == "HDR") return "HDR (freeze warning)##HDR";
 	if (name == "TAA") return "TAA / FSR / DLSS##TAA";
 	if (name == "SunFar") return "SunFar (mountain and flat-cloud shadow pass)##SunFar";
 	// UNOFFICIAL 2026-11-07 (user: "why is the exterior setting underneath interior"): the two shadow effects are named after the game's
@@ -4587,6 +4650,7 @@ static std::string MenuEntryLabel(const std::string& name) {
 	// ShadowsExteriors the sun's; the sections keep their names in the settings files
 	if (name == "ShadowsInteriors") return "Lamp shadows (ShadowsInteriors)##ShadowsInteriors";
 	if (name == "ShadowsExteriors") return "Sun shadows (ShadowsExteriors)##ShadowsExteriors";
+	if (name == "WorldSurface") return "World surface detail##WorldSurface";
 	return name;
 }
 // The same for a page in the sidebar (by its full path; the section keeps its name in the settings files).
@@ -5301,6 +5365,7 @@ static const DebugViewKey kDebugViews[] = {
 	{ "Main.Main.Quality", "GBufferView", "G-buffer" },
 	{ "Main.Main.Quality", "FirstPersonNativeDebug", "First-person native scale" },
 	{ "Main.Main.Quality", "GearWeatherDebug", "Gear weather" },
+	{ "Shaders.WorldSurface.Main", "DebugView", "World surface detail" },
 	{ "Shaders.ShadowsExteriors.Deferred", "DebugView", "Deferred sun" },
 	{ "Shaders.ShadowsExteriors.ScreenSpace", "BendDebug", "Bend contact shadows" },
 	{ "Shaders.Skin.SSS", "DebugView", "Skin SSS" },
@@ -5792,7 +5857,7 @@ static void RenderDeferredRendererPage() {
 		static const char* const kFpKeys[] = {
 			"DeferredFirstPerson", "GearWeather", "GearWeatherStrength", "GearWeatherWet",
 			"GearWeatherFrost", "GearWeatherSand", "GearWeatherMud", "GearWeatherSpeed",
-			"GearWeatherSkin", "GearWeatherScale"
+			"GearWeatherSkin", "GearWeatherScale", "GearWeatherForce"
 		};
 		for (const char* k : kFpKeys) DrawSettingKey("Main.Main.Quality", k);
 	}
@@ -5853,6 +5918,7 @@ static void RenderDebugSettingsPage() {
 		{ "Main.Main.Quality", "MsaaEdgeDebugView", "MSAA edge fix (MsaaEdgeDebugView)", DbgKind::IntZero },
 		{ "Main.Main.Quality", "FirstPersonNativeDebug", "1st-person native (FirstPersonNativeDebug)", DbgKind::IntZero },
 		{ "Main.Main.Quality", "GearWeatherDebug", "Gear weather (GearWeatherDebug)", DbgKind::IntZero },
+		{ "Shaders.WorldSurface.Main", "DebugView", "World surface detail (DebugView)", DbgKind::IntZero },
 		{ "Main.Main.ReducedQuality", "SunLayersDebug", "Sun layers (SunLayersDebug)", DbgKind::IntZero },
 		{ "Main.Main.Misc", "PassFamilyView", "Pass family (PassFamilyView)", DbgKind::IntZero },
 	};
@@ -6242,6 +6308,20 @@ static void DrawSimpleEffectCard(const char* shader, const char* title, std::ini
 	ImGui::PushID(shader);
 	bool on = false;
 	DrawCategoryEffectHeader(shader, title, on);
+	if (!strcmp(shader, "HDR")) {
+		ImGui::PushTextWrapPos(0.0f);
+		ImGui::TextColored(kRestartOrange, "Warning: HDR currently causes freezes for some players. A fix is being researched.");
+		ImGui::PopTextWrapPos();
+	}
+	if (!strcmp(shader, "WorldSurface")) {
+		const int defMode = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredRenderer");
+		const bool msaa = TheSettingManager->GetSettingI("Main.Main.Misc", "ForceMSAA") != 0;
+		if (defMode < 1 || msaa) {
+			ImGui::PushTextWrapPos(0.0f);
+			ImGui::TextColored(kRestartOrange, "Requires DeferredRenderer (and ForceMSAA off; restart).");
+			ImGui::PopTextWrapPos();
+		}
+	}
 	if (on) {
 		DrawPtNote(shader);
 		if (embedLut) RenderLutPage();
@@ -6383,6 +6463,9 @@ static void RenderCatLighting() {
 			if (reflMode > 0) {
 				s_inCategoryPage = true;
 				DrawVisualItem({ "Shaders.Reflections.Main", nullptr, nullptr }, false);
+				if (reflMode == 1 && MenuWidgets::SubHeader("Weapon reflections###cat_refl_weapon", true)) {
+					DrawVisualItem({ "Shaders.Reflections.RT", "Weapon, WeaponHands, WeaponMetal, WeaponRoughness", nullptr }, false);
+				}
 				if (reflMode == 2 && MenuWidgets::SubHeader("Ray-traced reflections###cat_refl_rt", true)) {
 					DrawRtStatusLine("Status", RtReflectionsLine());
 					DrawVisualItem({ "Shaders.Reflections.RT", nullptr, nullptr }, false);
@@ -6568,6 +6651,50 @@ static void RenderCatWeather() {
 		DrawSimpleEffectCard("Water", "Water", { "Default", "Interiors", "Placed" }, "Water clarity, waves, caustics and reflections.");
 		DrawSimpleEffectCard("Underwater", "Underwater", {}, "Underwater depth tint and distortion.");
 		DrawSimpleEffectCard("WaterLens", "Water drops on screen", { "Main" }, "Dripping water on the camera when leaving water.");
+
+		ImGui::PushID("GearWeatherCard");
+		ImGui::PushStyleColor(ImGuiCol_Text, MenuSkin::Heading(0.25f));
+		MenuWidgets::Title("First-person gear weather", 1.08f);
+		ImGui::PopStyleColor();
+		ImGui::Separator();
+		DrawSettingKey("Main.Main.Quality", "GearWeather", false);
+		{
+			const int defMode = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredRenderer");
+			const bool fpOn = TheSettingManager->GetSettingI("Main.Main.Quality", "DeferredFirstPerson") != 0;
+			const bool msaa = TheSettingManager->GetSettingI("Main.Main.Misc", "ForceMSAA") != 0;
+			if (defMode < 1 || msaa || !fpOn) {
+				ImGui::PushTextWrapPos(0.0f);
+				ImGui::TextColored(kRestartOrange, "Requires DeferredRenderer and DeferredFirstPerson (restart).");
+				ImGui::PopTextWrapPos();
+				DrawSettingKey("Main.Main.Quality", "DeferredFirstPerson", false);
+			}
+		}
+		if (TheSettingManager->GetSettingI("Main.Main.Quality", "GearWeather") != 0) {
+			static const char* const kGwKeys[] = {
+				"GearWeatherStrength", "GearWeatherFrost", "GearWeatherSand",
+				"GearWeatherWet", "GearWeatherMud", "GearWeatherSpeed",
+				"GearWeatherSkin", "GearWeatherScale"
+			};
+			for (const char* k : kGwKeys) DrawSettingKey("Main.Main.Quality", k, false);
+			static const char* const kGwPreview[] = {
+				"Auto (live weather)", "Wet (rain)", "Frost & snowflakes", "Sandstorm dust & grit", "Mud splash", "All layers"
+			};
+			const int forceVal = std::clamp(TheSettingManager->GetSettingI("Main.Main.Quality", "GearWeatherForce"), 0, 5);
+			ImGui::PushID("gw_preview");
+			const float pw = MenuWidgets::RowBegin("Preview mode", MenuWidgets::ResetSlotWidth());
+			ImGui::SetNextItemWidth(pw);
+			const int pickedPreview = NamePicker("##gw_prev", kGwPreview[forceVal], kGwPreview, 6, forceVal);
+			if (ImGui::IsItemHovered() || MenuWidgets::RowLabelHovered())
+				WrappedTooltip("Live preview override for inspecting first-person frost/snowflakes, sandstorm grit, rain wetness, or mud in any weather.");
+			ImGui::PopID();
+			if (pickedPreview >= 0 && pickedPreview != forceVal) {
+				TheSettingManager->SetSetting("Main.Main.Quality", "GearWeatherForce", pickedPreview);
+				TheSettingManager->LoadSettings();
+			}
+		}
+		ImGui::Dummy(ImVec2(0.0f, ImGui::GetStyle().ItemSpacing.y * 0.9f));
+		ImGui::PopID();
+
 		ImGui::EndTable();
 	}
 	CategoryFooter();
@@ -6579,6 +6706,7 @@ static void RenderCatGround() {
 	if (BeginCategoryColumns()) {
 		ImGui::TableNextColumn();
 		DrawSimpleEffectCard("Terrain", "Terrain", { "Blending", "Variation", "Macro", "Parallax", "Displacement" }, "Ground blending, anti-tiling and tessellation.");
+		DrawSimpleEffectCard("WorldSurface", "World surface detail & weathering", { "Main", "Dust", "Rust", "Waterline", "Moss" }, "World-space micro-detail grain, crevice dust, metal rust, waterline dampness, and moss.");
 		DrawSimpleEffectCard("POM", "Parallax occlusion & rock tessellation", { "Main", "Displacement" }, "3D depth on stone, brick and cliff textures.");
 
 		ImGui::TableNextColumn();
@@ -6633,7 +6761,7 @@ static void RenderCatCamera() {
 		DrawSimpleEffectCard("Exposure", "Exposure", { "Main", "Interiors", "Night" }, "Auto-exposure brightness adaptation.");
 		DrawSimpleEffectCard("LocalExposure", "Local exposure", { "Main" }, "Keeps bright skies and dark corners balanced together.");
 		if (DxvkCompute::Available())
-			DrawSimpleEffectCard("HDR", "HDR output", { "Main" }, "High dynamic range output settings.");
+			DrawSimpleEffectCard("HDR", "HDR output (freeze warning)", { "Main" }, "High dynamic range output settings.");
 		else if (MenuWidgets::SubHeader("HDR output (requires Vegas Shaders DXVK)###cat_hdr_nodxvk", false))
 			ImGui::TextDisabled("HDR output is inactive on native D3D9 / stock DXVK (Windows Auto HDR is controlled in Windows Display settings).");
 		DrawSimpleEffectCard("Bloom", "Bloom", { "Main", "Night", "Interiors" }, "Soft glow around bright lights and skies.");
@@ -7042,7 +7170,7 @@ static const EffectGroup kEffectGroups[] = {
 	{ "Ray tracing", nullptr },
 	{ "Sky and atmosphere", "Sky, VolumetricClouds, VolumetricFog, VolumetricLight, GodRays, SunGlare, Sandstorm, HeatHaze" },
 	{ "Weather and water", "Precipitations, Snow, SnowAccumulation, WetnessEffects, Puddles, WetWorld, Water, Underwater, WaterLens" },
-	{ "Ground and plants", "Terrain, POM, Grass, Plants" },
+	{ "Ground and plants", "Terrain, WorldSurface, POM, Grass, Plants" },
 	{ "Characters", "Skin, Cloth, PipboyFit, HandBlood" },
 	{ "Camera and colour", "Tonemapping, Exposure, HDR, Bloom, BloomLegacy, Lens, LUT, Coloring, ImageAdjust, Cinema, Bodycam, DepthOfField, MotionBlur, LowHF" },
 	{ "Anti-aliasing and sharpening", "TAA, SMAA, Sharpening, DitherBuster, SkyDither" },

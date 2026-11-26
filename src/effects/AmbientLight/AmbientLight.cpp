@@ -114,7 +114,18 @@ void AmbientLightEffect::UpdateSettings() {
 		sunGiForced = sunGi && !status;
 		roomGiForced = roomGi && !status;	// UNOFFICIAL 2026-11-12 RoomGI: the same for the interior switch (ShouldRender keeps each to its own side of the door)
 		// the runtime Enabled flag follows a live change of the key (load and revert: SettingManager::GetMenuShaderEnabled)
-		if (IsLoaded()) { if ((sunGi || roomGi) && !Enabled) Enabled = true; else if (!sunGi && !roomGi && wasForced) Enabled = false; }
+		if ((sunGi || roomGi) && !Enabled) {
+			if (IsLoaded()) Enabled = true;
+			else if (PendingLazyLoad) {
+				Enabled = true;
+				LazyLoadQueued = true;
+				if (TheShaderManager) TheShaderManager->LazyEffectLoadQueued = true;
+			}
+		}
+		else if (!sunGi && !roomGi && wasForced && !status) {
+			Enabled = false;
+			if (!IsLoaded()) LazyLoadQueued = false;
+		}
 		settingsOutdoors = TheShaderManager->GameState.isExterior;
 		const bool on = sunGi && settingsOutdoors;
 		CapturedNormals::SunGIWantsAlbedo = on;
@@ -1637,6 +1648,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 					drawn = ExtDraw(ExtReduce, targets, 1, textures, 0, balanceViewport);
 				}
 				else {
+					if (!ExtOn() && ExtOnRect()) Device->SetRenderTarget(1, nullptr);
 					// Stage 8 (DebugView 8, 12) as below; stage 7 is only read indoors (NVR_ALBalance).
 					IDirect3DBaseTexture9* waveStage = Constants.Data2.w > 11.5f && gridValid ? gridGeometry : gridScreenValid ? gridScreen[gridScreenIndex] : nullptr;
 					IDirect3DBaseTexture9* balance = interiorMode ? balanceTexture[balanceRuns ? balanceWrite : balanceRead] : nullptr;
@@ -1781,6 +1793,7 @@ void AmbientLightEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Ren
 	Device->SetDepthStencilSurface(depthSurface);
 	if (depthSurface) depthSurface->Release();
 	if (SUCCEEDED(result)) {
+		EffectStatus::Note(StatusSlot, Name, EffectStatus::Drawn);
 		if (chained) chain.Commit();
 		else Device->StretchRect(RenderTarget, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
 		shadowApplied = shadow;

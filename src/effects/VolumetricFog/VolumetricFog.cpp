@@ -99,8 +99,8 @@ void VolumetricFogEffect::UpdateConstants() {
 	// shader's own nightFactor (isExterior term), so this has no effect regardless.
 	TimeGlobals* clock = TimeGlobals::Get();
 	const float daysPassed = clock->GameDaysPassed ? clock->GameDaysPassed->data : 1.0f;
-	const auto phaseLength = Tes->sky->firstClimate->phaseLength;
-	float phase = (fmod(daysPassed, 8 * phaseLength & 0x3F)) / (phaseLength & 0x3F);	// 0..8 through the moon's cycle
+	const int phaseDays = (Tes->sky && Tes->sky->firstClimate) ? (int)(Tes->sky->firstClimate->phaseLength & 0x3F) : 0;
+	float phase = (phaseDays > 0) ? (fmodf(daysPassed, 8.0f * (float)phaseDays) / (float)phaseDays) : 0.0f;	// 0..8 through the moon's cycle
 	phase = std::lerp(-D3DX_PI, D3DX_PI, phase / 8) - D3DX_PI / 4;
 	Constants.Global.z = std::lerp(0.0f, nightMinDarkness, cosf(phase) * 0.5f + 0.5f);
 
@@ -924,7 +924,7 @@ bool VolumetricFogEffect::RenderDedicated(IDirect3DDevice9* Device, IDirect3DSur
 		// RenderedSurface is only written by the final copy, so it still holds the input.
 		Device->StretchRect(RenderedSurface, NULL, RenderTarget, NULL, D3DTEXF_NONE);
 		dedicatedFogFailed = true;
-		Logger::Log("Dedicated volumetric fog failed (%08lx); using packed path until restart.", result);
+		Logger::Log("Dedicated volumetric fog failed (%08lx); using plain full-resolution path until restart.", result);
 		return false;
 	}
 	compositeApplied = composite;
@@ -1064,67 +1064,13 @@ void VolumetricFogEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* Re
 	// The caller must apply deferred shadows/AO before retrying ordinary fog.
 	if (compositeShadow || compositeAO || compositeInteriorShadow) return;
 
-	D3DXHANDLE technique = PackedTechnique();
-	D3DXTECHNIQUE_DESC description = {};
-	D3DVIEWPORT9 original = {};
-	D3DSURFACE_DESC target = {}, scratch = {};
-	if (packedFogFailed || !technique || !RenderedSurface || !SourceBuffer ||
-		FAILED(Effect->GetTechniqueDesc(technique, &description)) || description.Passes != 2 ||
-		FAILED(Device->GetViewport(&original)) || FAILED(RenderTarget->GetDesc(&target)) ||
-		FAILED(RenderedSurface->GetDesc(&scratch)) || original.X || original.Y ||
-		target.MultiSampleType != D3DMULTISAMPLE_NONE || scratch.MultiSampleType != D3DMULTISAMPLE_NONE ||
-		original.Width != target.Width || original.Height != target.Height ||
-		target.Width != scratch.Width || target.Height != scratch.Height ||
-		(target.Width & 1) || (target.Height & 1) ||
-		RenderRect::Active()) {	// UNOFFICIAL 2026-10-27 RenderScale v2: the packed layout assumes the whole screen; the plain pass instead
-		EffectRecord::Render(Device, RenderTarget, RenderedSurface, PlainTechniqueIndex(techniqueIndex), ClearRenderTarget, SourceBuffer);
-		return;
-	}
-
-	auto timer = TimeLogger();
-	TheShaderManager->Chain.Sync(); // the packed path reads the render target itself
-	RenderedSurface = TheTextureManager->RenderedSurface;
-	D3DVIEWPORT9 reduced = original;
-	reduced.Width /= 2;
-	reduced.Height /= 2;
-	RECT packed = {0, 0, (LONG)reduced.Width, (LONG)reduced.Height};
-	HRESULT result = Device->StretchRect(RenderTarget, NULL, SourceBuffer, NULL, D3DTEXF_NONE);
-	if (SUCCEEDED(result)) result = Effect->SetTechnique(technique);
-	if (SUCCEEDED(result)) SetCT();
-	UINT passes = 0;
-	if (SUCCEEDED(result)) result = Effect->Begin(&passes, 0);
-	if (SUCCEEDED(result)) {
-		for (UINT p = 0; p < passes && SUCCEEDED(result); ++p) {
-			const bool combine = p == passes - 1;
-			result = Device->SetViewport(combine ? &original : &reduced);
-			if (FAILED(result)) break;
-			result = Effect->BeginPass(p);
-			if (FAILED(result)) break;
-			result = Device->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
-			HRESULT endResult = Effect->EndPass();
-			if (SUCCEEDED(result)) result = endResult;
-			if (SUCCEEDED(result)) result = Device->StretchRect(RenderTarget, combine ? NULL : &packed,
-				RenderedSurface, combine ? NULL : &packed, D3DTEXF_NONE);
-		}
-		Effect->End();
-	}
-	Device->SetViewport(&original);
-
-	if (FAILED(result)) {
-		Device->StretchRect(SourceBuffer, NULL, RenderTarget, NULL, D3DTEXF_NONE);
-		Device->StretchRect(SourceBuffer, NULL, RenderedSurface, NULL, D3DTEXF_NONE);
-		packedFogFailed = true;
-		Logger::Log("Packed volumetric fog failed (%08lx); using legacy path until restart.", result);
-		EffectRecord::Render(Device, RenderTarget, RenderedSurface, PlainTechniqueIndex(techniqueIndex), ClearRenderTarget, SourceBuffer);
-		return;
-	}
-	static bool reported = false;
-	if (!reported) {
-		Logger::Log("UNOFFICIAL packed volumetric fog active: %ux%u -> %ux%u.",
-			original.Width, original.Height, reduced.Width, reduced.Height);
-		reported = true;
-	}
-	renderTime = timer.LogTime("VolumetricFog::PackedRender");
+	// (2026-11-24) The dedicated path declined (ReShade loaded or ReShadeDepthCompat on, or it could not run here): the plain
+	// full-resolution pass, as RenderDedicated's ReShade note always said (EffectRecord::Render: the Vulkan port, VolumetricFogApply mode
+	// 4, when NvrDxvkPasses is on, else the D3D9 technique). The PackedFog / PackedFogLegacy fallback that stood here drew the whole
+	// FINISHED picture into a half-size quarter of the target and stretched it back up (PackedFogEstimate returns the fogged colour, not
+	// fog terms), so with ReShade at RenderScale 1 (DLAA) every frame came out at half resolution: "softer than RenderScale 0.5" (player
+	// handoff 2026-11-23; renaming those techniques away in the shader made it sharp again). A rect frame already took this pass.
+	EffectRecord::Render(Device, RenderTarget, RenderedSurface, PlainTechniqueIndex(techniqueIndex), ClearRenderTarget, SourceBuffer);
 }
 
 // ---- UNOFFICIAL 2026-10-25 (NVR DXVK): the fog as Vulkan passes (see VolumetricFog.h) ----
@@ -1380,8 +1326,8 @@ bool VolumetricFogEffect::ExtShadowAO(IDirect3DDevice9* Device, IDirect3DSurface
 }
 
 /*
-* The full-resolution techniques EffectRecord::Render draws (ClassicLook 2, and the fallback when neither the dedicated nor the
-* packed path can run): VolumetricFog, VolumetricFogLegacy and VolumetricFogClassic, read by name. The rest stay D3D9.
+* The full-resolution techniques EffectRecord::Render draws (ClassicLook 2, and the fallback when the dedicated path declines or fails):
+* VolumetricFog, VolumetricFogLegacy and VolumetricFogClassic, read by name. The rest stay D3D9.
 */
 bool VolumetricFogEffect::ExtRender(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTarget, IDirect3DSurface9* RenderedSurface, UINT techniqueIndex, bool ClearRenderTarget, IDirect3DSurface9* SourceBuffer) {
 	if (ClearRenderTarget || (SourceBuffer && SourceBuffer == RenderTarget)) return false;

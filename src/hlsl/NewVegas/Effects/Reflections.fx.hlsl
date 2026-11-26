@@ -357,9 +357,13 @@ float3 WetSkyReflectionLinearFx(float3 r) {
 
 // The sky along a world direction: the weather's horizon and zenith colours (as Specular reads it). Below the horizon,
 // nothing (the ground there is not on screen, and the sky would light it up).
-float3 SkyAlong(float3 worldDir) {
+// (2026-11-24 review) SkyGradientAlong: the same, not faded at the horizon; shared with the cube's backdrop (CubeBackdropFx).
+float3 SkyGradientAlong(float3 worldDir) {
 	float up = saturate(worldDir.z);
-	return lerp(linearize(TESR_HorizonColor.rgb), linearize(TESR_SkyColor.rgb), sqrt(up)) * smoothstep(0.0, 0.15, worldDir.z);
+	return lerp(linearize(TESR_HorizonColor.rgb), linearize(TESR_SkyColor.rgb), sqrt(up));
+}
+float3 SkyAlong(float3 worldDir) {
+	return SkyGradientAlong(worldDir) * smoothstep(0.0, 0.15, worldDir.z);
 }
 
 // Karis's reversible compression for averaging HDR samples: c / (1 + luminance), and back.
@@ -466,11 +470,52 @@ float4 GridAlong(float3 start, float3 worldR) {
 	return float4(radiance, share);
 }
 
+// CubeMode 1 and 2: what a direction the screen has not shown holds (Compute/ReflectionsCapture.frag CubeBackdrop, the same but for
+// its Vulkan-only sky panorama and CloudSky clouds).
+float3 CubeBackdropFx(float3 ndir) {
+	[branch] if (SkyFallback > 0.0) {
+		float3 horizonLin = linearize(TESR_HorizonColor.rgb);
+		float3 skyCol = SkyGradientAlong(ndir);
+		[branch] if (TESR_SunAmount.x > 0.02 && TESR_SunPosition.z > 0.0) {
+			float3 sunPos = normalize(TESR_SunPosition.xyz);
+			float sunCos = max(dot(ndir, sunPos), 0.0);
+			float corona = pow(sunCos, 48.0) * 0.35 + smoothstep(0.9985, 0.9998, sunCos) * 2.5;
+			skyCol += linearize(TESR_SunDiskColor.rgb) * (corona * saturate(TESR_SunAmount.x * 2.0) * smoothstep(0.0, 0.1, sunPos.z));
+		}
+		float3 groundLin = horizonLin * lerp(0.45, 0.18, saturate(-ndir.z * 2.0));
+		float3 env = lerp(groundLin, skyCol, smoothstep(-0.08, 0.06, ndir.z));
+		[branch] if (GridOn > 0.5) {
+			float4 g = GridAlong(0.0.xxx, ndir);
+			env = lerp(env, g.rgb, saturate(g.a));
+		}
+		return env;
+	}
+	float3 fallbackLin = linearize(TESR_HorizonColor.rgb) * 0.15;
+	[branch] if (GridOn > 0.5) {
+		float4 g = GridAlong(0.0.xxx, ndir);
+		return lerp(fallbackLin, g.rgb, saturate(g.a));
+	}
+	return fallbackLin;
+}
+
 // ---- 5: Capture, one cube face per draw ----
 float4 CapturePS(VSOUT IN, float2 vpos : VPOS) : COLOR0 {
 	float2 st = (vpos + 0.5) / CubeSize * 2.0 - 1.0;
 	float3 dir = FaceDirection(CubeFace, st);
-	float4 result = CubeReset > 0.0 ? 0.0 : texCUBElod(TESR_ReflectionsCapture, float4(dir, 0.0)) * (1.0 - CubeFade);
+	float4 result;
+	[branch] if (CubeOn >= 1.5) {
+		float3 ndir = normalize(dir);
+		float3 baseEnv = CubeBackdropFx(ndir);
+		[branch] if (CubeOn > 2.5) {
+			float4 world = texCUBElod(TESR_ReflectionsEnv, float4(ndir, 0.0));
+			baseEnv = lerp(baseEnv, world.rgb, saturate(world.a));
+		}
+		float decay = CubeOn > 2.5 ? max(CubeFade * 20.0, 0.12) : CubeFade;
+		float4 prev = texCUBElod(TESR_ReflectionsCapture, float4(dir, 0.0));
+		result = CubeReset > 0.0 ? float4(baseEnv, 1.0) : lerp(prev, float4(baseEnv, 1.0), decay);
+	} else {
+		result = CubeReset > 0.0 ? 0.0 : texCUBElod(TESR_ReflectionsCapture, float4(dir, 0.0)) * (1.0 - CubeFade);
+	}
 
 	float3 view = WorldToViewDir(dir);
 	[branch] if (view.z > 0.05) {
@@ -515,10 +560,12 @@ float4 FilterPS(VSOUT IN, float2 vpos : VPOS) : COLOR0 {
 	[unroll] for (int y = 0; y < 4; y++) {
 		[unroll] for (int x = 0; x < 4; x++) {
 			float2 offset = (float2(x, y) - 1.5) / 4.0 * 1.5 * texel;
-			sum += texCUBElod(TESR_ReflectionsCaptureNew, float4(FaceDirection(CubeFace, st + offset), 0.0));
+			float4 s = texCUBElod(TESR_ReflectionsCaptureNew, float4(FaceDirection(CubeFace, st + offset), 0.0));
+			sum += float4(Tame(s.rgb), s.a);
 		}
 	}
-	return sum / 16.0;
+	float4 avg = sum / 16.0;
+	return float4(Untame(avg.rgb), avg.a);
 }
 
 // ---- 1: Trace, half resolution ----
@@ -878,8 +925,7 @@ technique Capture {
 	pass {
 		VertexShader = compile vs_3_0 FrameVS();
 		PixelShader = compile ps_3_0 CapturePS();
-		Texture[9] = <NoTexture>;   // writes the new capture cube; reads last frame's at s8
-		Texture[10] = <NoTexture>;
+		Texture[9] = <NoTexture>;   // writes the new capture cube; reads last frame's at s8 and world cube at s10
 	}
 }
 

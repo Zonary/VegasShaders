@@ -98,6 +98,21 @@ public:
 	bool					Sm6Covers(UINT techniqueIndex);
 
 	bool					IsLoaded();	// an ID3DXEffect is there
+	bool					PendingLazyLoad = false;	// UNOFFICIAL 2026-11-23 Lazy legacy shader compilation: deferred until first enable
+	bool					LazyLoadQueued = false;		// UNOFFICIAL 2026-11-23: load queued for end-of-frame outside BeginScene/ImGui
+	static bool IsLazyEligibleName(const char* name) {
+		if (!name) return false;
+		static const char* const kEligible[] = {
+			"BloomLegacy", "Coloring", "LUT", "Cinema", "DepthOfField", "Debug", "GodRays",
+			"ImageAdjust", "Lens", "SunGlare", "LowHF", "MotionBlur", "Precipitations",
+			"Sharpening", "BounceLight", "PointShadows2", "Specular", "Snow", "WaterLens",
+			"HeatHaze", "Sandstorm", "VolumetricLight", "SkyDither", "Bodycam", "Dream",
+			"DitherBuster", "SMAA", "FXAA", "DustMotes"
+		};
+		for (const char* k : kEligible) if (strcmp(name, k) == 0) return true;
+		return false;
+	}
+	virtual bool			LazyLoadAllowed() const { return IsLazyEligibleName(Name); }
 	bool					Enabled;	// the effect's menu switch
 	bool					usesSourceBuffer = true; // false when the effect declares no TESR_SourceBuffer sampler
 	// True when a pass can leave destination pixels unwritten or depends on their contents

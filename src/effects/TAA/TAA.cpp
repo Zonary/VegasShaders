@@ -579,7 +579,7 @@ void TAAEffect::Render(IDirect3DDevice9* Device, IDirect3DSurface9* RenderTarget
 
 	// UNOFFICIAL 2026-10-26 (NVR DXVK): FSR 2 as the resolve when [Shaders.TAA.FSR] Enabled and the extension is there. Each path
 	// keeps its own history, so switching between them starts from scratch.
-	const bool useFSR = !afterUpscale && FSRWanted();	// (SmoothEffects: TAA's own resolve, the upscaler already ran)
+	const bool useFSR = !afterUpscale && !RenderScaleTempSkipped() && FSRWanted();	// (SmoothEffects / temporary RenderScale skip: TAA's own resolve avoids reallocating native FSR buffers)
 	const bool hadHistory = historyValid;	// UNOFFICIAL 2026-11-01 (Diag)
 	if (useFSR != lastPathFSR || lastPathPreTonemap) { if (historyValid) SessionLog::HistoryReset("TAA", "path switch (TAA / FSR)"); historyValid = false; }
 

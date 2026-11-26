@@ -209,13 +209,16 @@ void main() {
                 float pMax = max(pCol.r, max(pCol.g, pCol.b));
                 vec3 rawHue = pMax > 1.0e-4 ? pCol / pMax : vec3(1.0);
                 vec3 hue = mix(vec3(1.0), rawHue, smoothstep(0.08, 0.35, pMax));
-                weaponTint = hue * mix(0.22, 0.85, pMax);
+                float brightMetal = smoothstep(0.22, 0.72, pMax);
+                weaponTint = hue * (pMax * mix(0.18, 0.90, brightMetal));
             } else {
                 vec3 litColour = linearize(color.rgb);
                 float top = max(litColour.r, max(litColour.g, litColour.b));
                 vec3 rawHue = top > 1.0e-4 ? saturate(litColour / top) : vec3(1.0);
                 vec3 hue = mix(vec3(1.0), rawHue, smoothstep(0.03, 0.20, top));
-                weaponTint = hue * mix(0.25, 0.80, sqrt(saturate(top)));
+                float pMax = sqrt(saturate(top));
+                float brightMetal = smoothstep(0.22, 0.72, pMax);
+                weaponTint = hue * (pMax * mix(0.18, 0.90, brightMetal));
             }
             metalF0 = ReflMetalF0(weaponTint, roughness);
         } else if (albedoKnown) {
@@ -233,8 +236,8 @@ void main() {
     }
     vec3 reflected = Untame(reflection.rgb / max(reflection.a, 1.0e-4));
     if (any(isnan(reflected)) || any(isinf(reflected)) || isnan(reflection.a)) { o_color = color; return; }
-    // REFL_SPECOCC_ON: SpecularOcclusion (world floor attenuation + mild roughness-aware occlusion on shadowed weapons).
-    float specOcc = pixelWeapon ? cb.data4.w * 0.4 * smoothstep(0.15, 0.65, roughness) : cb.data4.w * (1.0 - SurfaceMirror);
+    // REFL_SPECOCC_ON: SpecularOcclusion (world floor attenuation + roughness-aware occlusion on shadowed weapons).
+    float specOcc = pixelWeapon ? cb.data4.w * 0.75 * smoothstep(0.08, 0.45, roughness) : cb.data4.w * (1.0 - SurfaceMirror);
     if (SpecOccOn && specOcc > 0.0) {
         float surfaceLight = luma(linearize(color.rgb));
         float reflectedLight = max(luma(reflected) * cb.layoutData.z, 1.0e-6);
@@ -266,7 +269,8 @@ void main() {
     float nonMetal = clamp(1.0 - SurfaceMetal, 0.0, 1.0);
     vec3 diffuseCeiling = albedoKnown ? max(albedoSample.rgb * 2.0, vec3(0.25)) : vec3(1.0);
     vec3 bodyToDim = mix(min(lin, diffuseCeiling), lin, SurfaceMirror);
-    vec3 attenShare = share * mix(nonMetal, 1.0, SurfaceMirror) * (1.0 - reflectAdd);
+    float bodyFactor = pixelWeapon ? max(nonMetal, SurfaceMetal * 0.85) : mix(nonMetal, 1.0, SurfaceMirror);
+    vec3 attenShare = share * bodyFactor * (1.0 - reflectAdd);
     lin = (lin - bodyToDim * attenShare) + reflected * share;
     if (SurfaceMirror > 0.0) lin += FlashlightHighlight(surfPos, N, roughness, f0) * attenShare;
     o_color = vec4(delinearize(lin), color.a);

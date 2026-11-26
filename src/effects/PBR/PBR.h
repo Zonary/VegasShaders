@@ -206,7 +206,10 @@ public:
 	D3DXVECTOR4	MaterialRough = D3DXVECTOR4(-1.0f, -1.0f, 0.0f, 0.0f);	// TESR_MaterialRough (c198): z DebugView
 	D3DXVECTOR4	MaterialTint = D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);		// TESR_MaterialTint (c199)
 
+	bool	FirstPersonActive = false;
+	bool	FirstPersonWeapon = false;
 	void	BeginFirstPerson(IDirect3DDevice9* Device);
+	void	SetFirstPersonWeapon(IDirect3DDevice9* Device, bool isWeapon);
 	void	EndFirstPerson(IDirect3DDevice9* Device);
 	// UNOFFICIAL: the current SkylightingSaturation (day/night/interior and rain blended like the other values);
 	// SkyShaders::UpdateConstants applies it to the skylight's spherical-harmonic coefficients.
@@ -227,6 +230,8 @@ public:
 		float Gamma = 1.0f, NightGamma = 0.0f, FalloffMatch = 1.0f;
 	};
 	LinearSettingsStruct	LinearSettings;
+	bool		DecoupleGlowMaps = true;	// UNOFFICIAL 2026-11-23 [Shaders.PBR.Main] DecoupleGlowMaps (TESR_LinearScales.w)
+	float		GlowScale = 1.0f;			// UNOFFICIAL 2026-11-23 [Shaders.PBR.Main] GlowScale
 	void	ApplyLinearGamma();
 
 	// UNOFFICIAL 2026-10-21 [Shaders.PBR.LampFalloff] (Includes/LampFalloff.hlsl): the lamps' physically shaped falloff (Exterior outdoors,

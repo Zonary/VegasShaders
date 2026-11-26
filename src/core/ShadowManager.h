@@ -60,6 +60,8 @@ public:
 	bool					RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightIndex, CubeLayer Layer = CubeLayer::All);	// false: MovingOnto's copy failed, nothing drawn
 	void					RenderShadowSpotlight(NiSpotLight** Spots, UInt32 Index);
 	void					RenderShadowMaps();	// every map of the frame (the hook on the game's shadow render calls it)
+	void					RenderReflectionCubeFace(ShadowSceneLight** castLamps, NiPointLight** nearLamps);	// Tier 2 staggered 3D world cubemap face(s)
+	void					RenderReflectionCubeAlone(ShadowSceneLight** castLamps, NiPointLight** nearLamps);	// the same on a frame without shadow maps (2026-11-24)
 	// UNOFFICIAL 2026-10-23 CharacterShadowMap (docs/next/CHARACTER-SHADOW-MAP-DESIGN.md): the player's own small sun shadow map, drawn
 	// after the sun cascades from the same sun direction; actors only (the player, optionally other actors inside it). Sets
 	// Constants.CharacterData.w = 1 when the map holds this frame's draw.
@@ -89,6 +91,8 @@ public:
 	// UNOFFICIAL: ShadowMap.pso / ShadowCubeMap.pso without the alpha-test discard, for opaque casters (early-Z).
 	ShaderRecordPixel*		ShadowMapOpaquePixel;
 	ShaderRecordPixel*		ShadowGridColorPixel = nullptr;	// UNOFFICIAL 2026-10-14: light grid sun map, depth + colour (optional)
+	ShaderRecordVertex*		ReflCubeVertex = nullptr;		// UNOFFICIAL 2026-11-24: Tier 2 dynamic 3D world cubemap shaders
+	ShaderRecordPixel*		ReflCubePixel = nullptr;
 	ShaderRecordPixel*		ShadowCubeMapOpaquePixel;
 	ShaderRecordVertex*		ShadowMapBlurVertex = nullptr;
 	ShaderRecordPixel*		ShadowMapBlurPixel = nullptr;

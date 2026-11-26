@@ -7,6 +7,7 @@
 #include "../../core/RtSunShadows.h"	// UNOFFICIAL 2026-10-28 RT sun shadows
 #include "../../core/SunFadeDeferred.h"	// UNOFFICIAL 2026-11-15 fd-smoothsun (the deferred renderer's sun steps)
 #include "../../core/BendContact.h"	// UNOFFICIAL 2026-11-06 forward Bend contact shadows (fork port 2026-11-13)
+#include "../../core/DeferredLamps.h"	// UNOFFICIAL 2026-11-23 deferred exterior night lamp shadows via ShadowAtlas
 
 // UNOFFICIAL 2026-10-16 lamp contact shadows (PointShadows.fx LampContactPS, technique 2; drawn by ShaderManager after the lamp
 // pass): every number the shader needs (see the constants' comments there). Kept out of ShadowsExterior.h (widely included).
@@ -40,8 +41,8 @@ void ShadowsExteriorEffect::UpdateConstants() {
 
 	Constants.ShadowFade.x = 0; // Fade 1.0 == no shadows
 	if (TheShaderManager->GameState.isExterior) {
-		// the sun's shadows fade to 0 around sunrise and sunset
-		Constants.ShadowFade.x = smoothStep(0.5f, 0.1f, abs(TheShaderManager->GameState.dayLight - 0.5f));
+		// the sun's shadows fade to 0 around sunrise and sunset (tightened deadband keeps early-night moonlight shadows crisp)
+		Constants.ShadowFade.x = smoothStep(0.32f, 0.08f, abs(TheShaderManager->GameState.dayLight - 0.5f));
 
 		TimeGlobals* timeGlobals = TimeGlobals::Get();
 		const float daysPassed = timeGlobals->GameDaysPassed ? timeGlobals->GameDaysPassed->data : 1.0f;
@@ -77,8 +78,11 @@ void ShadowsExteriorEffect::UpdateConstants() {
 		}
 
 		// The point-light shadows' enabled flag goes into ShadowFade.z every frame (not only when the day/night state changes).
+		// When DeferredLamps handles exterior point shadows per-lamp from ShadowAtlas, keep ShadowFade.z off so the screen-space
+		// pass and AmbientLight do not apply screen-wide darkening.
 		const bool usePointLights = (TheShaderManager->GameState.isDayTime > 0.5) ? Settings.Exteriors.UsePointShadowsDay : Settings.Exteriors.UsePointShadowsNight;
-		Constants.ShadowFade.z = usePointLights;
+		const bool deferredExtPointShadows = usePointLights && DeferredLamps::Live && !RtLampShadows::ExteriorReplacing();
+		Constants.ShadowFade.z = (usePointLights && !deferredExtPointShadows) ? 1.0f : 0.0f;
 		Constants.ShadowFade.y = Settings.Exteriors.Enabled && Enabled;
 		Constants.ShadowFade.w = Constants.ShadowMapRadius.w;	// furthest distance for point lights shadows
 		// UNOFFICIAL 2026-10-27 FitToDepth: the lamp shadows' reach stays the unfitted one (the fit may end the cascades sooner).
@@ -188,7 +192,8 @@ void ShadowsExteriorEffect::UpdateLightColors() {
 	const float dimmer = *bHDR ? sun->Dimmer : (std::min)(sun->Dimmer, 1.0f);
 	D3DXVECTOR3 ambient(sun->Amb.r * dimmer, sun->Amb.g * dimmer, sun->Amb.b * dimmer);
 	if (*fMinAmbient > 0.0f) {
-		const float luminance = ambient.x * 0.33f + ambient.y * 0.34f + ambient.z * 0.33f;
+		// Matches BSShaderLightingProperty::SetLight1x2x (0x00B70A04..0x00B70A30): 0.33R + 0.34G + B + 0.33.
+		const float luminance = ambient.x * 0.33f + ambient.y * 0.34f + ambient.z + 0.33f;
 		if (luminance > 0.0f) {
 			const float boost = luminance <= *fMinAmbient ? *fMinAmbient / luminance : 1.0f;
 			ambient = (ambient + D3DXVECTOR3(0.1f, 0.1f, 0.1f)) * boost;
@@ -1454,7 +1459,7 @@ bool ShadowsExteriorEffect::GetCharacterViewProj(const D3DXVECTOR3& sunDir, D3DX
 	CharacterTargetNode = nullptr;
 	if (!Player) return false;
 	Character* target = (Character*)Player;
-	if (!Player->isThirdPerson) {
+	if (!Player->IsDrawnThirdPerson()) {
 		if (TheSettingManager->GetSettingI("Shaders.ShadowsExteriors.ShadowMaps", "CharacterShadowMapTarget") != 1) return false;
 		target = CharacterMapNpc(max(TheSettingManager->GetSettingF("Shaders.ShadowsExteriors.ShadowMaps", "CharacterShadowMapNpcDistance"), 0.0f));
 		if (!target) return false;
@@ -2038,7 +2043,7 @@ D3DXMATRIX ShadowsExteriorEffect::GetCascadeViewProj(ShadowMapSettings* ShadowMa
 	// UNOFFICIAL 2026-10-23 PlayerInNear ([Shaders.ShadowsExteriors.ShadowMaps], world units, live, 0 = off). In third person the Near
 	// sphere grows to the smallest one holding both its slice and the player's head (24 units round the head, plus the hand-over band),
 	// while the camera is within PlayerInNear of the head. Its texels grow with the sphere; the radius is rounded up to 16 units.
-	if (Settings.ShadowMaps.PlayerInNear > 0.0f && ShadowMap == &ShadowMaps[MapNear] && Player && Player->isThirdPerson &&
+	if (Settings.ShadowMaps.PlayerInNear > 0.0f && ShadowMap == &ShadowMaps[MapNear] && Player && Player->IsDrawnThirdPerson() &&
 		Player->ActorSkinInfo && Player->ActorSkinInfo->HeadNode) {
 		const NiPoint3& h = Player->ActorSkinInfo->HeadNode->m_worldTransform.pos;
 		const D3DXVECTOR3 head(h.x - cameraPos.x, h.y - cameraPos.y, h.z - cameraPos.z);	// camera-relative, as the corners

@@ -2,6 +2,7 @@
 #include "ClothWind.h"	// UNOFFICIAL 2026-11-21: sync c248 tracking across ViewModelShadowMap constant restore
 #include "SunFadeDeferred.h"	// UNOFFICIAL 2026-11-21: static/dynamic split during DeferredFade
 #include "ShadowFaceCull.h"
+#include "PortalVisibility.h"	// UNOFFICIAL 2026-11-24: skip occluded-room refs in interior reflections and spot/fallback shadows
 #include "../effects/Puddles/PuddleMap.h"	// 2026-11-12 Puddles map mode
 #include "PointShadowSchedule.h"
 #include "PointShadowForward.h"
@@ -12,6 +13,7 @@
 #include "../effects/CoverMap/CoverMap.h"	// UNOFFICIAL 2026-10-27 Persistent wetness and snow: CoverMapOrthoFrame
 #include "DisplaceShadows.h"	// UNOFFICIAL 2026-10-27 displacement shadows: the land drawn with its bumps into the sun cascades
 #include "ShadowAtlas.h"	// UNOFFICIAL 2026-10-30 ShadowAtlas (INTERIOR-SHADOWS-MODERN step 1)
+#include "DeferredLamps.h"	// UNOFFICIAL 2026-11-23 deferred exterior night lamp shadows via ShadowAtlas
 #include "CapsuleShadows.h"	// UNOFFICIAL 2026-10-31 CapsuleShadows (steps 2-3): DropActors
 #include "PipboyFit.h"	// UNOFFICIAL 2026-11-04 ViewModelShadows: its object cleared before the viewmodel map
 #include "NpcCharacterMaps.h"	// UNOFFICIAL 2026-11-08 CharacterShadowMapNpcs
@@ -619,6 +621,10 @@ void ShadowManager::Initialize() {
 	// UNOFFICIAL 2026-10-14: the light grid's sun map with colours; missing, the grid's bounce takes one ground colour.
 	sm.ShadowGridColorPixel = (ShaderRecordPixel*)ShaderRecord::LoadShader("ShadowGridColor.pso", shadowDir);
 	if (sm.ShadowGridColorPixel) sm.ShadowGridColorPixel->ClearSamplers = false;
+	sm.ReflCubeVertex = (ShaderRecordVertex*)ShaderRecord::LoadShader("ReflCube.vso", shadowDir);
+	sm.ReflCubePixel = (ShaderRecordPixel*)ShaderRecord::LoadShader("ReflCube.pso", shadowDir);
+	if (sm.ReflCubeVertex) sm.ReflCubeVertex->ClearSamplers = false;
+	if (sm.ReflCubePixel) sm.ReflCubePixel->ClearSamplers = false;
 	// A missing copy falls back to the clip shader: the same image, only the early-Z gain is lost.
 	if (!sm.ShadowMapOpaquePixel) {
 		sm.ShadowMapOpaquePixel = sm.ShadowMapPixel;
@@ -1467,12 +1473,22 @@ void ShadowManager::RenderShadowSpotlight(NiSpotLight** Lights, UInt32 LightInde
 	// Every reference of the player's cell that lies in front of the light and within its reach adds its casters.
 	// UNOFFICIAL 2026-11-04 but not the player: the flashlight is held by (or worn on) them, and the hands and gun at the light cast
 	// bars across whatever it lights (third person, AttachToWeapon).
+	PortalVisibility::RoomSet portalRooms;
+	if (!TheShaderManager->GameState.isExterior) portalRooms.Build(SceneNode);
 	TList<TESObjectREFR>::Entry* entry = &Player->parentCell->objectList.First;
 	while (entry) {
 		NiNode* refNode = entry->item == Player ? nullptr : GetRefNode(entry->item, &interiors->Forms);
 		if (!refNode) {
 			entry = entry->next;
 			continue;
+		}
+		if (portalRooms.active) {
+			const bool hidden = portalRooms.IsNodeHidden(refNode);
+			PortalVisibility::NoteSpotRef(hidden);
+			if (hidden) {
+				entry = entry->next;
+				continue;
+			}
 		}
 
 		// Detect if the object is in front of the light in the direction of the current face
@@ -1597,7 +1613,9 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 	fx->Constants.Data.z = cubeRange;
 	D3DXMATRIX faceView, faceProj;
 	D3DXVECTOR3 lookAt, upDir, camDir;
-	D3DXMatrixPerspectiveFovRH(&faceProj, D3DXToRadian(90.0f), 1.0f, 0.1f, cubeRange);
+	// UNOFFICIAL: clip geometry touching an embedded outdoor light origin (<= 8 units) without clipping burn barrels or nearby props.
+	const float cubeNear = TheShaderManager->GameState.isExterior ? (std::min)(8.0f, cubeRange * 0.05f) : 0.1f;
+	D3DXMatrixPerspectiveFovRH(&faceProj, D3DXToRadian(90.0f), 1.0f, cubeNear, cubeRange);
 	// UNOFFICIAL CubeFaceViewCull: the faces that can be seen this frame (all six unless culling applies to this draw)
 	unsigned char viewFaces = 63;
 	if (cullFaces) {
@@ -1671,8 +1689,8 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 			if (!intCfg->Forward.LampGlassShadows && LampFixtures::LampPart(geo))
 				continue;
 			// UNOFFICIAL OwnGlassDistance (2026-10-30): the light's own glass (a lamp part it sits in or next to) casts nothing into its map
-			// (Vault 21's floor lamps lost their floor pools to it once they had a shadow slot); other lamps' maps keep it.
-			if (!TheShaderManager->GameState.isExterior && LampFixtures::OwnGlass(geo, eyePos, intCfg->Forward.OwnGlassDistance))
+			// (Vault 21's floor lamps lost their floor pools to it once they had a shadow slot, and outdoor streetlamps/bulbs do too); other lamps' maps keep it.
+			if (LampFixtures::OwnGlass(geo, eyePos, intCfg->Forward.OwnGlassDistance))
 				continue;
 
 			// UNOFFICIAL InvisibleShadowFromLamp (2026-10-20): drawn from a lamp, that lamp (its model, and every glowing lamp part) is
@@ -1699,6 +1717,23 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 				fixtureSkipped++;
 				continue;
 			}
+			// UNOFFICIAL: O(1) exterior own-fixture exclusion (without a full-cell scan) so streetlamp hoods/bulbs do not shadow their own point light.
+			if (TheShaderManager->GameState.isExterior && intCfg->Forward.SkipOwnFixture && !geo->skinInstance) {
+				if (const NiBound* b = geo->GetWorldBound(); b && b->Radius > 0.0f && b->Radius <= LampFixtures::MaxLampModel) {
+					const float dx = b->Center.x - eyePos->x, dy = b->Center.y - eyePos->y, dz = b->Center.z - eyePos->z;
+					if (sqrtf(dx * dx + dy * dy + dz * dz) - b->Radius <= intCfg->Forward.OwnFixtureDistance) {
+						bool isLampFixture = false;
+						const NiAVObject* n = geo;
+						for (int depth = 0; n && depth < 5; depth++, n = n->m_parent) {
+							if (LampFixtures::LampName(n->m_pcName)) { isLampFixture = true; break; }
+						}
+						if (isLampFixture) {
+							fixtureSkipped++;
+							continue;
+						}
+					}
+				}
+			}
 
 			// The player's first-person model and third-person body carry their own shade flags.
 			const bool inFirstPerson = casterShade->m_usFlags.GetBit(NiShadeProperty::kFirstPerson);
@@ -1709,7 +1744,7 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 
 			// Never the first-person model; the body only as the switch for the current view allows.
 			if (inFirstPerson) continue;
-			if (inThirdPerson && !(Player->isThirdPerson ? intCfg->PlayerShadowThirdPerson : intCfg->PlayerShadowFirstPerson))
+			if (inThirdPerson && !(Player->IsDrawnThirdPerson() ? intCfg->PlayerShadowThirdPerson : intCfg->PlayerShadowFirstPerson))
 				continue;
 
 			// UNOFFICIAL PlayerInsideLamp (v3, 2026-10-07): a lamp inside the player's body leaves the player out of its
@@ -1877,11 +1912,14 @@ bool ShadowManager::RenderShadowCubeMap(ShadowSceneLight** Lights, UInt32 LightI
 	// "in front" test was computed and never used), so they are collected once per light instead of six times.
 	fallbackRefsScratch.clear();
 	if (!useGeometryList) {
+		PortalVisibility::RoomSet portalRooms;
+		if (!TheShaderManager->GameState.isExterior) portalRooms.Build(SceneNode);
 		// The player's cell's references that cast and whose bound reaches into the cube.
 		for (auto* it = &Player->parentCell->objectList.First; it != nullptr; it = it->next) {
 			TESObjectREFR* ref = it->item;
 			NiNode* refRoot = GetRefNode(ref, &intCfg->Forms);
 			if (refRoot == nullptr) continue;
+			if (portalRooms.active && portalRooms.IsNodeHidden(refRoot)) continue;
 			const bool inReach = refRoot->GetDistance(eyePos) <= cubeRange + refRoot->GetWorldBoundRadius();
 			if (inReach && !IsRefracting(ref)) fallbackRefsScratch.push_back(refRoot);
 		}
@@ -2423,6 +2461,12 @@ void ShadowManager::RenderShadowMaps() {
 	// UNOFFICIAL 2026-11-12 CubeReleaseSeconds: here, while no lamp is published, and before every early out (outdoors by day the cube
 	// loop below does not run at all, and that is when the interior's cube maps are idle).
 	ReleaseIdleCubeMaps(TheShaderManager->Effects.ShadowsExteriors);
+	const bool extUsePoint = TheShaderManager && TheShaderManager->GameState.isExterior && TheShaderManager->Effects.ShadowsExteriors &&
+		TheShaderManager->Effects.ShadowsExteriors->Enabled && DeferredLamps::Live && !RtLampShadows::ExteriorReplacing() &&
+		((TheShaderManager->GameState.isDayTime > 0.5f) ?
+			TheShaderManager->Effects.ShadowsExteriors->Settings.Exteriors.UsePointShadowsDay :
+			TheShaderManager->Effects.ShadowsExteriors->Settings.Exteriors.UsePointShadowsNight);
+	ShadowAtlas::TickExterior(TheShaderManager && TheShaderManager->GameState.isExterior && !extUsePoint);
 	if (!TheSettingManager->SettingsMain.Main.RenderEffects) return; // cancel out if rendering effects is disabled
 	// UNOFFICIAL SkinnedShadowFaceTest: skeleton bounds are rebuilt once per frame; forget meshes not seen for a while.
 	if ((++SkinnedBoundFrame & 1023) == 0) {
@@ -2470,7 +2514,11 @@ void ShadowManager::RenderShadowMaps() {
 		fx->Constants.CrossFade.x = 0.0f;
 	}
 	// early out in case shadow rendering is not required
+	const bool reflWorldCubeOn = TheShaderManager->Effects.Reflections && TheShaderManager->Effects.Reflections->WorldCubeWanted() && ReflCubeVertex && ReflCubePixel;
 	if (!sunShadowsOn && !lampShadowsOn && !flashlightMapOn && !TheShaderManager->orthoRequired && !TheShaderManager->orthoSkyRequired || !ShadowShadersLoaded) {
+		// (2026-11-24 review) No shadow map is wanted this frame: the reflection world cubemap alone, through its own small setup,
+		// instead of running this whole pass's setup (scene, stencil, player flags, the lamp section) for one cube face.
+		if (reflWorldCubeOn && ShadowShadersLoaded && Player->parentCell) RenderReflectionCubeAlone(castLamps, nearLamps);
 		return;
 	}
 	if (!Player->parentCell) return;
@@ -3269,6 +3317,7 @@ void ShadowManager::RenderShadowMaps() {
 	speedTreePass->PixelShader = ShadowCubeMapPixel;
 
 	auto shadowMapTimer = TimeLogger();
+	const bool deferredExtLamps = exteriorCell && usePointLights && !RtLampShadows::ExteriorReplacing() && DeferredLamps::Live;
 	// (UNOFFICIAL 2026-10-29: outdoors no cube maps while the traced lamp mask stands in for them: RT lamp shadows Exteriors)
 	if ((exteriorCell && usePointLights && !RtLampShadows::ExteriorReplacing()) || (!exteriorCell && lampShadowsOn)) {
 		GpuProfileScope gpu(pointMapsTimer, dev);
@@ -3316,7 +3365,7 @@ void ShadowManager::RenderShadowMaps() {
 			bool anchored = false;
 			{
 				const float tolerance = TheSettingManager->SettingsMain.Main.LampShadowMoveTolerance;
-				if (tolerance > 0.0f && !exteriorCell && PointShadowForward::UsesAllSlots(exteriorCell) && ForwardWasActive &&
+				if (tolerance > 0.0f && ((!exteriorCell && PointShadowForward::UsesAllSlots(exteriorCell) && ForwardWasActive) || deferredExtLamps) &&
 					slots[i].valid && slots[i].light == shadowLight && slots[i].cell == now.cell && slots[i].radius == now.radius) {
 					const float dx = now.x - slots[i].x, dy = now.y - slots[i].y, dz = now.z - slots[i].z;
 					if ((dx != 0.0f || dy != 0.0f || dz != 0.0f) && dx * dx + dy * dy + dz * dz <= tolerance * tolerance) {
@@ -3587,6 +3636,10 @@ void ShadowManager::RenderShadowMaps() {
 			ForwardWasActive = PointShadowForward::Active;
 			PointShadowForward::FrameStats();
 		}
+		else if (deferredExtLamps) {
+			PointShadowForward::Publish(slots, castLamps, shadowedSlots, fx->Textures.ShadowCubeMapTexture);
+			ShadowAtlas::Update(dev, shadowedSlots);
+		}
 
 		if (GpuTimer::Enabled && ++statFrames >= 240) { // with the F10 profile: how much work the cubemaps really are
 			const float perFrame = 1.0f / statFrames;
@@ -3653,6 +3706,8 @@ void ShadowManager::RenderShadowMaps() {
 		}
 	}
 
+	if (reflWorldCubeOn) RenderReflectionCubeFace(castLamps, nearLamps);
+
 	// reset renderer to previous state
 	dataConst->x = worldQuality;	// UNOFFICIAL 2026-11-05 (above)
 	dataConst->y = worldDarkness;
@@ -3716,7 +3771,7 @@ static int CharacterMapActorNodes(NiNode** out, int max) {
 			if (end < begin || end - begin > 4096) continue;
 			for (UInt32 i = begin; i < end && n < max; i++) {
 				Actor* actor = data[i];
-				if (!actor || (TESObjectREFR*)actor == (TESObjectREFR*)Player || (actor->flags & 0x800) != 0) continue;	// 0x800: disabled
+				if (!actor || !actor->IsActor() || (TESObjectREFR*)actor == (TESObjectREFR*)Player || (actor->flags & 0x800) != 0) continue;	// 0x800: disabled
 				if (NiNode* node = actor->GetNode()) out[n++] = node;
 			}
 		}
@@ -3835,7 +3890,7 @@ void ShadowManager::RenderNpcCharacterMaps(const D3DXVECTOR3& SunDir) {
 		AccumChildren(node, &map->Forms, false, false, &map->ShadowMapFrustumPlanes);
 		// CharacterShadowMapOthers: the people (the player too) standing in this box shade this NPC sharply as well
 		if (otherCount) {
-			if (playerNode && playerNode != node && Player->isThirdPerson && !(playerNode->m_flags & NiAVObject::APP_CULLED) && playerNode->WithinFrustum(&map->ShadowMapFrustumPlanes))
+			if (playerNode && playerNode != node && Player->IsDrawnThirdPerson() && !(playerNode->m_flags & NiAVObject::APP_CULLED) && playerNode->WithinFrustum(&map->ShadowMapFrustumPlanes))
 				AccumChildren(playerNode, &map->Forms, false, false, &map->ShadowMapFrustumPlanes);
 			for (int i = 0; i < otherCount; i++) {
 				NiNode* other = others[i];
@@ -4305,4 +4360,319 @@ void ShadowManager::BlurShadowAtlas(unsigned cascadeMask) {
 	state->SetRenderState(D3DRS_SCISSORTESTENABLE, oldScissorEnabled, RenderStateArgs);
 	state->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE, RenderStateArgs);
 	state->SetRenderState(D3DRS_ZWRITEENABLE, D3DZB_TRUE, RenderStateArgs);
+}
+
+// (2026-11-24 review) The world cubemap on a frame without any shadow map: what RenderShadowMaps' setup gives the cube face pass (the
+// camera's place for the camera-relative transforms, a scene, the targets and viewport put back after), and nothing else.
+void ShadowManager::RenderReflectionCubeAlone(ShadowSceneLight** castLamps, NiPointLight** nearLamps) {
+	IDirect3DDevice9* dev = TheRenderManager->device;
+	if (!dev) return;
+	IDirect3DSurface9* savedDepth = nullptr;
+	IDirect3DSurface9* savedTarget = nullptr;
+	D3DVIEWPORT9 savedViewport = {};
+	dev->GetDepthStencilSurface(&savedDepth);
+	dev->GetRenderTarget(0, &savedTarget);
+	dev->GetViewport(&savedViewport);
+	TheRenderManager->UpdateSceneCameraData();
+	TheRenderManager->SetupSceneCamera();
+	dev->BeginScene();
+	RenderReflectionCubeFace(castLamps, nearLamps);
+	dev->EndScene();
+	dev->SetDepthStencilSurface(savedDepth);
+	dev->SetRenderTarget(0, savedTarget);
+	dev->SetViewport(&savedViewport);
+	if (savedDepth) savedDepth->Release();
+	if (savedTarget) savedTarget->Release();
+}
+
+// UNOFFICIAL 2026-11-24: Tier 2 staggered 3D world cubemap pass for Reflections / PBR metal / _m env-map shaders.
+void ShadowManager::RenderReflectionCubeFace(ShadowSceneLight** castLamps, NiPointLight** nearLamps) {
+	ReflectionsEffect* refl = TheShaderManager->Effects.Reflections;
+	if (!refl || !ReflCubeVertex || !ReflCubePixel || !Player || !Player->parentCell) return;
+	int faces[2] = {};
+	const int faceCount = refl->BeginWorldCubeFaces(faces);
+	if (faceCount <= 0) return;
+
+	IDirect3DDevice9* dev = TheRenderManager->device;
+	NiDX9RenderState* rs = TheRenderManager->renderState;
+	ShadowsExteriorEffect* fx = TheShaderManager->Effects.ShadowsExteriors;
+	if (!dev || !rs || !fx) return;
+	static GpuTimer reflCubeTimer("Reflection world cubemap");	// (2026-11-24 review: here, so both callers report under one name)
+	GpuProfileScope gpu(reflCubeTimer, dev);
+
+	struct PassGuard {
+		bool bindDiffuse, bindGlow, twoSided, lean, flipCull, skinnedAlpha;
+		float landDrop;
+		ShaderRecordVertex* vs[5];
+		ShaderRecordPixel* ps[5];
+		ShadowManager* sm;
+		ShadowsExteriorEffect* fx;
+		D3DXVECTOR4 savedData;
+		D3DXMATRIX savedViewProj;
+		PassGuard(ShadowManager* s, ShadowsExteriorEffect* f)
+			: bindDiffuse(RenderPass::BindDiffuse), bindGlow(RenderPass::BindGlow),
+			  twoSided(RenderPass::TwoSided), lean(RenderPass::Lean), flipCull(RenderPass::FlipCull),
+			  skinnedAlpha(SkinnedGeoShadowRenderPass::AlphaTest), landDrop(RenderPass::LandDrop),
+			  sm(s), fx(f), savedData(f->Constants.Data), savedViewProj(f->Constants.ShadowViewProj) {
+			vs[0] = sm->geometryPass->VertexShader;   ps[0] = sm->geometryPass->PixelShader;
+			vs[1] = sm->alphaPass->VertexShader;      ps[1] = sm->alphaPass->PixelShader;
+			vs[2] = sm->skinnedGeoPass->VertexShader; ps[2] = sm->skinnedGeoPass->PixelShader;
+			vs[3] = sm->speedTreePass->VertexShader;  ps[3] = sm->speedTreePass->PixelShader;
+			vs[4] = sm->terrainLODPass->VertexShader; ps[4] = sm->terrainLODPass->PixelShader;
+		}
+		~PassGuard() {
+			RenderPass::BindDiffuse = bindDiffuse;
+			RenderPass::BindGlow = bindGlow;
+			RenderPass::TwoSided = twoSided;
+			RenderPass::Lean = lean;
+			RenderPass::FlipCull = flipCull;
+			RenderPass::LandDrop = landDrop;
+			SkinnedGeoShadowRenderPass::AlphaTest = skinnedAlpha;
+			sm->geometryPass->VertexShader   = vs[0]; sm->geometryPass->PixelShader   = ps[0];
+			sm->alphaPass->VertexShader      = vs[1]; sm->alphaPass->PixelShader      = ps[1];
+			sm->skinnedGeoPass->VertexShader = vs[2]; sm->skinnedGeoPass->PixelShader = ps[2];
+			sm->speedTreePass->VertexShader  = vs[3]; sm->speedTreePass->PixelShader  = ps[3];
+			sm->terrainLODPass->VertexShader = vs[4]; sm->terrainLODPass->PixelShader = ps[4];
+			fx->Constants.Data = savedData;
+			fx->Constants.ShadowViewProj = savedViewProj;
+		}
+	} passGuard(this, fx);
+
+	struct StateGuard {
+		IDirect3DDevice9* dev;
+		NiDX9RenderState* rs;
+		DWORD colorWrite = 0xF, alphaBlend = FALSE, alphaTest = FALSE, zEnable = D3DZB_TRUE, zWrite = TRUE;
+		DWORD zFunc = D3DCMP_LESSEQUAL, cullMode = D3DCULL_CCW, stencilEnable = FALSE, scissorEnable = FALSE;
+		StateGuard(IDirect3DDevice9* d, NiDX9RenderState* r) : dev(d), rs(r) {
+			dev->GetRenderState(D3DRS_COLORWRITEENABLE, &colorWrite);
+			dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+			dev->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest);
+			dev->GetRenderState(D3DRS_ZENABLE, &zEnable);
+			dev->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+			dev->GetRenderState(D3DRS_ZFUNC, &zFunc);
+			dev->GetRenderState(D3DRS_CULLMODE, &cullMode);
+			dev->GetRenderState(D3DRS_STENCILENABLE, &stencilEnable);
+			dev->GetRenderState(D3DRS_SCISSORTESTENABLE, &scissorEnable);
+		}
+		~StateGuard() {
+			rs->SetTexture(0, nullptr);
+			rs->SetTexture(1, nullptr);
+			dev->SetRenderState(D3DRS_COLORWRITEENABLE, colorWrite);
+			rs->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlend, RenderStateArgs);
+			rs->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTest, RenderStateArgs);
+			rs->SetRenderState(D3DRS_ZENABLE, zEnable, RenderStateArgs);
+			rs->SetRenderState(D3DRS_ZWRITEENABLE, zWrite, RenderStateArgs);
+			rs->SetRenderState(D3DRS_ZFUNC, zFunc, RenderStateArgs);
+			rs->SetRenderState(D3DRS_CULLMODE, cullMode, RenderStateArgs);
+			rs->SetRenderState(D3DRS_STENCILENABLE, stencilEnable, RenderStateArgs);
+			rs->SetRenderState(D3DRS_SCISSORTESTENABLE, scissorEnable, RenderStateArgs);
+		}
+	} stateGuard(dev, rs);
+
+	// Skip the player directly during accumCellRefs below rather than mutating m_flags (UInt32).
+
+	RenderPass::BindDiffuse = true;
+	RenderPass::BindGlow = true;
+	RenderPass::TwoSided = true;
+	RenderPass::Lean = true;
+	RenderPass::FlipCull = false;
+	RenderPass::LandDrop = 0.0f;
+	SkinnedGeoShadowRenderPass::AlphaTest = true;
+
+	geometryPass->VertexShader   = ReflCubeVertex; geometryPass->PixelShader   = ReflCubePixel;
+	alphaPass->VertexShader      = ReflCubeVertex; alphaPass->PixelShader      = ReflCubePixel;
+	skinnedGeoPass->VertexShader = ReflCubeVertex; skinnedGeoPass->PixelShader = ReflCubePixel;
+	speedTreePass->VertexShader  = ReflCubeVertex; speedTreePass->PixelShader  = ReflCubePixel;
+	terrainLODPass->VertexShader = ReflCubeVertex; terrainLODPass->PixelShader = ReflCubePixel;
+
+	dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0x0F);
+	rs->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE, RenderStateArgs);
+	rs->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE, RenderStateArgs);
+	rs->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE, RenderStateArgs);
+	rs->SetRenderState(D3DRS_ZWRITEENABLE, TRUE, RenderStateArgs);
+	rs->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL, RenderStateArgs);
+	rs->SetRenderState(D3DRS_STENCILENABLE, FALSE, RenderStateArgs);
+	rs->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE, RenderStateArgs);
+
+	const bool exterior = TheShaderManager->GameState.isExterior;
+	const ShaderConstants& sc = TheShaderManager->ShaderConst;
+	const PBRShaders* pbr = TheShaderManager->Shaders.PBR;
+	const float G = (pbr && pbr->Constants.Linear.x > 1.0f) ? pbr->Constants.Linear.x : 2.2f;
+	const float linLight = pbr ? pbr->Constants.LinearScales.x : 1.0f;
+	const float linAmb = pbr ? pbr->Constants.LinearScales.y : 1.0f;
+	const float linSky = exterior ? (pbr ? pbr->Constants.LinearScales.z : 1.0f) : 0.0f;
+	auto decodeLin = [G](float v) { return powf((std::max)(v, 0.0f), G); };
+
+	D3DXVECTOR3 sunDir(sc.SunDir.x, sc.SunDir.y, sc.SunDir.z);
+	if (D3DXVec3LengthSq(&sunDir) > 1.0e-4f) D3DXVec3Normalize(&sunDir, &sunDir);
+	else sunDir = D3DXVECTOR3(0.0f, 0.0f, 1.0f);
+	RecalculateBillboardVectors(&sunDir);
+
+	const float fogStart = (std::max)(sc.fogData.x, 0.0f);
+	const float fogEnd = sc.fogData.y > fogStart + 100.0f ? sc.fogData.y : fogStart + 32768.0f;
+	const float invFogRange = 1.0f / (fogEnd - fogStart);
+
+	struct LampCand { float key; NiPointLight* light; float lod; };
+	LampCand bestLamps[4] = {};
+	int lampCount = 0;
+	const D3DXVECTOR4& camPos = TheRenderManager->CameraPosition;
+	const float cullDist = refl->Settings.CubeDistance;
+	auto tryLamp = [&](NiPointLight* light, float lod) {
+		if (!light || light->Spec.r <= 1.0f) return;
+		if ((light->Diff.r + light->Diff.g + light->Diff.b) * light->Dimmer <= 5.0f / 255.0f) return;
+		if (FlashlightLamp::Is(light)) return;
+		for (int i = 0; i < lampCount; i++) if (bestLamps[i].light == light) return;
+		const NiPoint3& p = light->m_worldTransform.pos;
+		const float dx = p.x - camPos.x, dy = p.y - camPos.y, dz = p.z - camPos.z;
+		const float key = sqrtf(dx * dx + dy * dy + dz * dz) - light->Spec.r;
+		if (key > cullDist) return;
+		int at = lampCount < 4 ? lampCount++ : 4;
+		if (at == 4) { if (key >= bestLamps[3].key) return; at = 3; }
+		while (at > 0 && bestLamps[at - 1].key > key) { bestLamps[at] = bestLamps[at - 1]; at--; }
+		bestLamps[at] = { key, light, lod };
+	};
+	if (castLamps) {
+		for (int i = 0; i < ShadowCubeMapsMax; i++)
+			if (castLamps[i] && castLamps[i]->sourceLight) tryLamp(castLamps[i]->sourceLight, castLamps[i]->fLODDimmer);
+	}
+	if (nearLamps) {
+		for (int i = 0; i < TrackedLightsMax; i++)
+			if (nearLamps[i]) tryLamp(nearLamps[i], 1.0f);
+	}
+
+	const bool hdr = *(const bool*)0x011F941E;
+	D3DXVECTOR4 psConsts[13] = {};
+	psConsts[0] = D3DXVECTOR4(sunDir.x, sunDir.y, sunDir.z, exterior ? (TheShaderManager->GameState.dayLight > 0.05f ? 1.0f : 0.45f) : 0.0f);
+	psConsts[1] = exterior
+		? D3DXVECTOR4(decodeLin(sc.sunColor.x) * linLight, decodeLin(sc.sunColor.y) * linLight, decodeLin(sc.sunColor.z) * linLight, fogStart)
+		: D3DXVECTOR4(0.0f, 0.0f, 0.0f, fogStart);
+	psConsts[2] = D3DXVECTOR4(decodeLin(sc.sunAmbient.x) * linAmb, decodeLin(sc.sunAmbient.y) * linAmb, decodeLin(sc.sunAmbient.z) * linAmb, invFogRange);
+	psConsts[3] = exterior
+		? D3DXVECTOR4(decodeLin(sc.skyColor.x) * linSky, decodeLin(sc.skyColor.y) * linSky, decodeLin(sc.skyColor.z) * linSky, 1.0f)
+		: D3DXVECTOR4(0.0f, 0.0f, 0.0f, 0.0f);
+	const D3DXVECTOR4& horSrc = exterior ? sc.horizonColor : sc.fogColor;
+	const float horScale = exterior ? linSky : 1.0f;
+	psConsts[4] = D3DXVECTOR4(decodeLin(horSrc.x) * horScale, decodeLin(horSrc.y) * horScale, decodeLin(horSrc.z) * horScale, (float)lampCount);
+	for (int i = 0; i < lampCount; i++) {
+		NiPointLight* light = bestLamps[i].light;
+		const NiPoint3& lp = light->m_worldTransform.pos;
+		const float r = (std::max)(light->Spec.r, 1.0f);
+		const float dimmer = hdr ? light->Dimmer : (std::min)(light->Dimmer, 1.0f);
+		const float colW = dimmer * bestLamps[i].lod;
+		psConsts[5 + i] = D3DXVECTOR4(lp.x - camPos.x, lp.y - camPos.y, lp.z - camPos.z, 1.0f / (r * r));
+		psConsts[9 + i] = D3DXVECTOR4(decodeLin(light->Diff.r * colW) * linLight, decodeLin(light->Diff.g * colW) * linLight, decodeLin(light->Diff.b * colW) * linLight, 0.0f);
+	}
+	dev->SetPixelShaderConstantF(1, (const float*)psConsts, 13);
+
+	dev->SetDepthStencilSurface(refl->Cubes.WorldDepth);
+	const D3DVIEWPORT9 vp = { 0, 0, refl->cubeSize, refl->cubeSize, 0.0f, 1.0f };
+	dev->SetViewport(&vp);
+
+	static const D3DXVECTOR3 FaceDir[6] = {
+		D3DXVECTOR3( 1.0f,  0.0f,  0.0f), D3DXVECTOR3(-1.0f,  0.0f,  0.0f),
+		D3DXVECTOR3( 0.0f,  1.0f,  0.0f), D3DXVECTOR3( 0.0f, -1.0f,  0.0f),
+		D3DXVECTOR3( 0.0f,  0.0f,  1.0f), D3DXVECTOR3( 0.0f,  0.0f, -1.0f)
+	};
+	static const D3DXVECTOR3 FaceUp[6] = {
+		D3DXVECTOR3(0.0f, 1.0f,  0.0f), D3DXVECTOR3(0.0f, 1.0f,  0.0f),
+		D3DXVECTOR3(0.0f, 0.0f, -1.0f), D3DXVECTOR3(0.0f, 0.0f,  1.0f),
+		D3DXVECTOR3(0.0f, 1.0f,  0.0f), D3DXVECTOR3(0.0f, 1.0f,  0.0f)
+	};
+
+	const float farDist = exterior ? (std::max)(cullDist, 16384.0f) : cullDist;
+	D3DXMATRIX faceProj, faceView;
+	D3DXMatrixPerspectiveFovLH(&faceProj, D3DX_PI * 0.5f, 1.0f, 16.0f, farDist);
+	const D3DXVECTOR3 zero(0.0f, 0.0f, 0.0f);
+
+	ShadowsExteriorEffect::FormsStruct reflForms = {};
+	reflForms.AlphaEnabled = true;
+	reflForms.Activators = true;
+	reflForms.Actors = true;
+	reflForms.Apparatus = true;
+	reflForms.Books = true;
+	reflForms.Containers = true;
+	reflForms.Doors = true;
+	reflForms.Furniture = true;
+	reflForms.Misc = true;
+	reflForms.Statics = true;
+	reflForms.Terrain = true;
+	reflForms.Trees = true;
+	reflForms.Lod = exterior;
+	reflForms.MinRadius = exterior ? 12.0f : 6.0f;
+	reflForms.OrigMinRadius = reflForms.MinRadius;
+
+	NiAVObject* const playerBody = Player->GetNode();
+	NiAVObject* const playerFP = Player->firstPersonNiNode;
+	PortalVisibility::RoomSet portalRooms;
+	if (!exterior) portalRooms.Build(SceneNode);
+
+	for (int fi = 0; fi < faceCount; fi++) {
+		const int f = faces[fi];
+		if (f < 0 || f >= 6 || !refl->Cubes.WorldFace[f]) continue;
+
+		dev->SetRenderTarget(0, refl->Cubes.WorldFace[f]);
+		dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
+
+		D3DXMatrixLookAtLH(&faceView, &zero, &FaceDir[f], &FaceUp[f]);
+		fx->Constants.ShadowViewProj = faceView * faceProj;
+
+		const NiPoint3 forward(FaceDir[f].x, FaceDir[f].y, FaceDir[f].z);
+		const NiPoint3 up(FaceUp[f].x, FaceUp[f].y, FaceUp[f].z);
+		const NiPoint3 right(
+			forward.y * up.z - forward.z * up.y,
+			forward.z * up.x - forward.x * up.z,
+			forward.x * up.y - forward.y * up.x);
+		NiTransform placement;
+		placement.pos = NiPoint3(camPos.x, camPos.y, camPos.z);
+		placement.rot = NiMatrix33(forward.x, up.x, right.x,
+								   forward.y, up.y, right.y,
+								   forward.z, up.z, right.z);
+		placement.scale = 1.0f;
+		NiFrustumPlanes planes;
+		planes.Set(NiFrustum(-1.0f, 1.0f, 1.0f, -1.0f, 16.0f, farDist, false), placement);
+		planes.SetActivePlaneState(63);
+
+		auto accumCellRefs = [&](TESObjectCELL* cell) {
+			if (!cell) return;
+			for (TList<TESObjectREFR>::Entry* it = &cell->objectList.First; it != nullptr; it = it->next) {
+				TESObjectREFR* ref = it->item;
+				if (!ref || ref == (TESObjectREFR*)Player) continue;
+				NiNode* refRoot = GetRefNode(ref, &reflForms);
+				if (!refRoot || refRoot == playerBody || refRoot == playerFP) continue;
+				if (!exterior && portalRooms.active) {
+					const bool hidden = portalRooms.IsNodeHidden(refRoot);
+					PortalVisibility::NoteReflRef(hidden);
+					if (hidden) continue;
+				}
+				if (!refRoot->WithinFrustum(&planes) || IsRefracting(ref)) continue;
+				const NiBound* b = refRoot->GetWorldBound();
+				if (b) {
+					const float dx = b->Center.x - camPos.x, dy = b->Center.y - camPos.y, dz = b->Center.z - camPos.z;
+					const float maxR = cullDist + b->Radius;
+					if (dx * dx + dy * dy + dz * dz > maxR * maxR) continue;
+				}
+				AccumChildren(refRoot, &reflForms, false, false, &planes);
+			}
+		};
+
+		if (exterior && Player->GetWorldSpace()) {
+			AccumChildren(BGSTerrainManager::GetRootLandLODNode(), &reflForms, true, true, &planes);
+			AccumChildren(BGSTerrainManager::GetRootObjectLODNode(), &reflForms, false, true, &planes);
+			if (GridCellArray* grid = Tes->gridCellArray) {
+				const UInt32 cellCount = grid->size * grid->size;
+				for (UInt32 c = 0; c < cellCount; ++c) {
+					TESObjectCELL* cell = grid->GetCell(c);
+					if (!cell || cell->IsInterior()) continue;
+					if (NiNode* landRoot = cell->GetChildNode(TESObjectCELL::kCellNode_Land))
+						AccumChildren(landRoot, &reflForms, true, false, &planes);
+					accumCellRefs(cell);
+				}
+			}
+		} else {
+			accumCellRefs(Player->parentCell);
+		}
+
+		RenderAccums();
+		refl->MarkWorldCubeFaceRendered(f);
+	}
 }

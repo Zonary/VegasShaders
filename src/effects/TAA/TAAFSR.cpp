@@ -336,6 +336,7 @@ bool TAAEffect::PreTonemapNativeAA(IDirect3DDevice9* Device, IDirect3DSurface9* 
 	if (!FSRSettings.PreTonemapHDR || !Enabled || !Effect || !ShouldRender()) return false;
 	if (!TheSettingManager->SettingsMain.Main.RenderPreTonemapping) return false;
 	if (Up.Upscaled || Up.Deferred || RenderRect::Active() || rrRanThisFrame) return false;
+	if (RenderScaleTempSkipped()) return false;
 	if (!FSRWanted()) return false;
 	FrameChain& chain = TheShaderManager->Chain;
 	if (!chain.Owns(RenderTarget, TheTextureManager->RenderedSurface)) return false;

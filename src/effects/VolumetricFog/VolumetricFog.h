@@ -102,12 +102,12 @@ public:
 	// cached from UpdateSettings (Shaders.ShadowsExteriors.Main/NightMinDarkness), consumed by
 	// UpdateConstants to drive the moon-phase night-ambient ceiling
 	float	nightMinDarkness;
-	bool	packedFogFailed = false;
 	bool	dedicatedFogFailed = false;
 	// UNOFFICIAL: technique and parameter handles, looked up once per loaded effect (EffectRecord::CachedHandle).
-	CachedHandle techCompositeFog, techDedicatedFog, techApplyShadowAO, techPackedFog, paramCompositeFlags, paramCompositeAOTexel, paramFogLayout;
+	// (2026-11-24: PackedFog / PackedFogLegacy are no longer drawn: they halved the whole picture's resolution; see Render.)
+	CachedHandle techCompositeFog, techDedicatedFog, techApplyShadowAO, paramCompositeFlags, paramCompositeAOTexel, paramFogLayout;
 	// Custom build: the same techniques with the legacy fog, used while LegacyFog is on.
-	CachedHandle techCompositeFogLegacy, techDedicatedFogLegacy, techPackedFogLegacy;
+	CachedHandle techCompositeFogLegacy, techDedicatedFogLegacy;
 	bool	IsLegacy() const { return Constants.Legacy.x > 0.5f; }
 	// UNOFFICIAL 2026-10-18 ClassicLook ([Shaders.VolumetricFog.Main] ClassicLook): the look of the original NVR fog (upstream
 	// master ab16e86c) with today's speed work, the *Classic techniques. 0 off (today's fog), 1 on, 2 on and worked out per
@@ -122,8 +122,8 @@ public:
 	CachedHandle techCompositeFogClassic, techDedicatedFogClassic, techCompositeFogInteriorClassic;
 	D3DXHANDLE	CompositeTechnique() { return IsLegacy() ? TechniqueHandle(techCompositeFogLegacy, "CompositeFogLegacy") : IsClassic() ? TechniqueHandle(techCompositeFogClassic, "CompositeFogClassic") : TechniqueHandle(techCompositeFog, "CompositeFog"); }
 	D3DXHANDLE	DedicatedTechnique() { return IsLegacy() ? TechniqueHandle(techDedicatedFogLegacy, "DedicatedFogLegacy") : IsClassic() ? TechniqueHandle(techDedicatedFogClassic, "DedicatedFogClassic") : TechniqueHandle(techDedicatedFog, "DedicatedFog"); }
-	// (ClassicLook: no packed technique; a failed dedicated path falls straight to the full-resolution VolumetricFogClassic.)
-	D3DXHANDLE	PackedTechnique() { return IsLegacy() ? TechniqueHandle(techPackedFogLegacy, "PackedFogLegacy") : IsClassic() ? NULL : TechniqueHandle(techPackedFog, "PackedFog"); }
+	// (A failed or declined dedicated path falls straight to the full-resolution technique: VolumetricFog, VolumetricFogLegacy or
+	// VolumetricFogClassic, PlainTechniqueIndex.)
 	// UNOFFICIAL 2026-10-18 InteriorShadowFold: the composite with the interior darkening in place of the sun shadows.
 	CachedHandle techCompositeFogInterior, techCompositeFogInteriorLegacy;
 	D3DXHANDLE	CompositeInteriorTechnique() { return IsLegacy() ? TechniqueHandle(techCompositeFogInteriorLegacy, "CompositeFogInteriorLegacy") : IsClassic() ? TechniqueHandle(techCompositeFogInteriorClassic, "CompositeFogInteriorClassic") : TechniqueHandle(techCompositeFogInterior, "CompositeFogInterior"); }
@@ -181,8 +181,8 @@ public:
 	// (Compute/VolumetricFog.glsl, VolumetricFogEstimate.frag, VolumetricFogApply.frag). ExtDedicated: the dedicated and composite
 	// techniques' two passes (RenderDedicated, after its own checks); ExtShadowAO: technique ApplyShadowAO (RenderShadowAO);
 	// ExtRender: the full-resolution techniques (VolumetricFog, VolumetricFogLegacy, VolumetricFogClassic). Each returns false,
-	// having drawn nothing into the frame, when it cannot run; the D3D9 technique then draws as before. PackedFog*, FogReference
-	// and HalfStoreProbe stay D3D9.
+	// having drawn nothing into the frame, when it cannot run; the D3D9 technique then draws as before. FogReference and
+	// HalfStoreProbe stay D3D9 (PackedFog* is no longer drawn, 2026-11-24).
 	struct ExtFogPush {
 		UInt32		pointIndex, linearIndex, wrapIndex, mode;	// the sampler heap indices (filled in by DXVK); the Apply shader's pass
 		UInt32		legacy, classic, interior, physicalSky;

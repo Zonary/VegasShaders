@@ -847,7 +847,7 @@ float4 Wet(VSOUT IN, uniform bool fast, uniform bool fixTrace, uniform bool pers
     float splashAlpha;
     float2 splashNXY;
     float4 splashSample = SampleSplash(splashXY, TESR_GameTime.z, (rainAmt * roofMask) * 0.395f, splashAlpha, splashNXY);
-    splashAlpha *= roofMask;
+    splashAlpha *= roofMask * (1.0f - vmMask);
 
     float splashStrength = 2.2f;
     splashStrength *= splashAlpha;
@@ -1081,18 +1081,10 @@ float4 Wet(VSOUT IN, uniform bool fast, uniform bool fixTrace, uniform bool pers
         float3 baseLin = linearize(baseColor).rgb;
         float3 rippleColor = lerp(baseLin, refrLin, viewRefr);
 
-        // First-person composition
+        // First-person composition: leave the 1st-person viewmodel untouched by ground puddle ripples and splashes
+        // (beaded weapon raindrops are handled separately by HudRaindrops).
         if (vmMask > 0.5f)
-        {
-            float2 vmRefrUV = saturate(IN.UVCoord + refrOff);
-            float vmSampleValid = GetViewModelMask(vmRefrUV);
-
-            float3 vmRefrLin = lerp(baseLin, refrLin, vmSampleValid);
-            float vmRippleBlend = saturate(LODfade * rippleMask) * viewRefr;
-            float3 vmWetLin = lerp(baseLin, vmRefrLin, vmRippleBlend);
-            float3 vmWetRGB = delinearize(float4(vmWetLin, 1.0f)).rgb;
-            return float4(WetOut(vmWetRGB + splashAdd), baseColor.a);
-        }
+            return float4(WetOut(baseColor.rgb), baseColor.a);
 
         // Puddle sky lighting
         float sunAmbient = max(luma(linearize(TESR_SunAmbient)), 0.0001f);
@@ -1289,19 +1281,10 @@ float4 Wet(VSOUT IN, uniform bool fast, uniform bool fixTrace, uniform bool pers
     // and have a puddle weight, a streak or an SSR trace (or are first-person).
     float3 baseLin = linearize(baseColor).rgb;
 
-    // First-person composition
+    // First-person composition: leave the 1st-person viewmodel untouched by ground puddle ripples and splashes.
     [branch]
     if (vmMask > 0.5f)
-    {
-        float3 vmRefrLinRaw = refrLinPre;
-        float vmSampleValid = vmSampleValidPre;
-
-        float3 vmRefrLin = lerp(baseLin, vmRefrLinRaw, vmSampleValid);
-        float vmRippleBlend = saturate(LODfade * rippleMask) * viewRefr;
-        float3 vmWetLin = lerp(baseLin, vmRefrLin, vmRippleBlend);
-        float3 vmWetRGB = delinearize(float4(vmWetLin, 1.0f)).rgb;
-        return float4(WetOut(vmWetRGB + splashAdd), baseColor.a);
-    }
+        return float4(WetOut(baseColor.rgb), baseColor.a);
 
     float sunAmbient = max(luma(linearize(TESR_SunAmbient)), 0.0001f);
     float4 shadows = shadowsPre;

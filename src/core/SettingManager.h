@@ -45,6 +45,8 @@ struct SettingsMainStruct
         bool    CubeFaceCopySkip; // [Main.Main.Performance] CubeFaceCopySkip (RedrawActorsOnly: a lamp cube face nobody moves in is not copied again while it still holds its static copy), live
         bool    SlimDepthBuffer; // [Main.Main.Performance] SlimDepthBuffer (read once at startup)
         bool    SkipRedundantConstants; // [Main.Main.Performance] SkipRedundantConstants (ConstantFilter.h), live
+        bool    BatchBoneUploads; // [Main.Main.Performance] BatchBoneUploads (BoneMatrixBatch.h), live
+        bool    FastConstantMapSort; // [Main.Main.Performance] FastConstantMapSort (ConstantMapSort.h), live
         bool    ShaderWarmUp; // [Main.Main.Performance] ShaderWarmUp (ShaderWarmUp.h: the driver compiles NVR shaders at the main menu)
         bool    SkinnedShadowFaceTest; // [Main.Main.Performance] SkinnedShadowFaceTest (ShadowManager.cpp: skeleton bounds for animated casters in lamp cube maps), live
         bool    HiddenObjectCulling; // [Main.Main.Performance] HiddenObjectCulling (HiddenObjectCulling.h: skip the extra passes of objects hidden a few frames ago), live
@@ -247,6 +249,7 @@ struct SettingsWeatherStruct {	// one weather
 	UInt8	WindSpeed, CloudSpeedLower, CloudSpeedUpper, TransDelta, SunGlare, SunDamage;
 	float	FogNearDay, FogNearNight, FogFarDay, FogFarNight;
 	TESWeather::ColorData	Colors[TESWeather::kNumColorTypes];	// per colour type, per time of day
+	UInt8	ColorTimeCount[TESWeather::kNumColorTypes] = {};	// how many times of day were loaded (4 legacy vs 6 full)
 	float	HDR[14];	// in WeatherHDRTypes order
 };
 

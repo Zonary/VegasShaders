@@ -207,24 +207,7 @@ void TextureManager::ForgetTarget(const std::string& Name, IDirect3DBaseTexture9
 	if (TheShaderManager) {
 		if (!Name.empty())
 			TheShaderManager->ClearShaderSamplers(Name.c_str(), Name.size() + 1);	// (+ 1: the whole name, not names that start with it)
-		if (Texture) {
-			auto forget = [&](ShaderProgram* program) {
-				if (!program) return;
-				for (UInt32 i = 0; i < program->TextureShaderValuesCount; i++) {
-					TextureRecord* record = program->TextureShaderValues[i].Texture;
-					if (record && record->Texture == Texture) record->Texture = nullptr;
-				}
-			};
-			for (const auto& named : TheShaderManager->EffectsNames) forget(named.second ? *named.second : nullptr);
-			for (const auto& named : TheShaderManager->ShaderNames) {
-				ShaderCollection* collection = named.second ? *named.second : nullptr;
-				if (!collection) continue;
-				for (auto& vertex : collection->VertexShaderList)
-					for (int kind = 0; vertex && kind < 3; kind++) forget(vertex->ShaderProg[kind]);	// Default / Exterior / Interior
-				for (auto& pixel : collection->PixelShaderList)
-					for (int kind = 0; pixel && kind < 3; kind++) forget(pixel->ShaderProg[kind]);
-			}
-		}
+		if (Texture) ShaderProgram::ForgetAllTexture(Texture);
 	}
 	if (device && Texture) {
 		for (DWORD stage = 0; stage < 16; stage++) {
@@ -296,6 +279,14 @@ int TextureManager::SwapTarget(OwnedTarget& Target, bool Park) {
 	ForgetTarget(Target.Name, old, oldSurface);
 	*Target.Texture = made;
 	*Target.Surface = madeSurface;
+	// Keep registered alias slots (e.g., TESR_CloudHistory -> HistoryRead) from holding the freed texture.
+	for (auto& named : TextureNames) {
+		if (named.second && *named.second == old) {
+			*named.second = made;
+			if (TheShaderManager)
+				TheShaderManager->ClearShaderSamplers(named.first.c_str(), named.first.size() + 1);
+		}
+	}
 	oldSurface->Release();
 	old->Release();
 	Target.Parked = Park;
@@ -412,8 +403,9 @@ IDirect3DBaseTexture9* TextureManager::GetTextureByName(std::string& samplerName
 
 // Loads a texture file of the given kind once; later calls (also after a failure) get the cached result.
 IDirect3DBaseTexture9* TextureManager::GetFileTexture(std::string TexturePath, TextureRecord::TextureRecordType Kind) {
-	IDirect3DBaseTexture9* loaded = GetCachedTexture(TexturePath);
-	if (loaded) return loaded;
+	auto cached = TextureCache.find(TexturePath);
+	if (cached != TextureCache.end()) return cached->second;
+	IDirect3DBaseTexture9* loaded = nullptr;
 
 	IDirect3DDevice9* dev = TheRenderManager->device;
 	const char* file = TexturePath.data();
